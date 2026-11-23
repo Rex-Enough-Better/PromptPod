@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-`PromptPod`（词舱）为专有软件（Copyright © 2026 Rex, All Rights Reserved），基于 Windows 10 / 11 系统原生图形与窗口接口构建，不打包任何第三方动态链接库或浏览器运行时。
+`词舱 PromptPod` 为专有软件（Copyright © 2026 Rex, All Rights Reserved），基于 Windows 10 / 11 系统原生图形与窗口接口构建，不打包任何第三方动态链接库或浏览器运行时。
 
 在编译生成可执行文件的过程中，静态链接了以下工具链的基础运行时启动与标准库组件，特此声明其原有许可：
 
