@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 下载最新版本（Releases）
+    url: https://github.com/Rex-Enough-Better/PromptPod/releases/latest
+    about: 前往官方发布页获取最新版单文件绿色版或压缩包
+  - name: 作者 X 主页 (@RexAIUniverse)
+    url: https://x.com/RexAIUniverse
+    about: 无 GitHub 账号时，欢迎通过 X 关注更新动态或留言交流

@@ -1,0 +1,44 @@
+name: Bug 问题反馈
+description: 反馈软件异常、界面显示错位、贴边消失或崩溃问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈 `词舱 PromptPod` 的问题！若你是从软件内「意见反馈」入口跳转而来，完整脱敏诊断信息已自动复制到剪贴板，可在下方直接 `Ctrl+V` 粘贴。
+  - type: input
+    id: version
+    attributes:
+      label: 软件版本
+      description: 可在「设置」或系统托盘右键菜单顶部查看
+      placeholder: 例如：v0.6.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: 操作系统与屏幕环境
+      description: Windows 版本、是否多屏或高分屏缩放（如 150%）
+      placeholder: 例如：Windows 11 (10.0.22631, x64)，双屏 2K 150%
+    validations:
+      required: false
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题现象与复现步骤
+      description: 请描述发生了什么、如何触发，也可直接拖拽截图到此处
+      placeholder: |
+        1. 我做了什么操作...
+        2. 实际发生了什么...
+        3. 预期应该怎样...
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 脱敏环境与诊断摘要（选填）
+      description: 仅包含版本号、显示拓扑与脱敏运行日志，请勿粘贴你的私人 Prompt 正文
+      placeholder: 可直接按 Ctrl+V 粘贴软件内复制的脱敏诊断信息
+    validations:
+      required: false

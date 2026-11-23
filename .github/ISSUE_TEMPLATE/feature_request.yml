@@ -1,0 +1,24 @@
+name: 功能建议
+description: 提出新功能构想、快捷键需求或体验优化建议
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        欢迎提出你对 `词舱 PromptPod` 的想法与建议！同类建议欢迎直接点赞 👍 帮助确定优先级。
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望功能与使用场景
+      description: 你希望解决什么高频痛点？理想中的交互方式是什么？
+      placeholder: 例如：希望能按全局快捷键直接呼出面板并用数字键快速复制...
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: 补充说明或参考案例（选填）
+      description: 可附上草图、截图或你喜欢的类似工具交互细节
+    validations:
+      required: false
