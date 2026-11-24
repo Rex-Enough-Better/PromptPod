@@ -1,9 +1,21 @@
-Copyright (c) 2026 Rex. All rights reserved.
+MIT License
 
-词舱 PromptPod 为专有软件，版权归作者 Rex 所有。
+Copyright (c) 2026 Rex
 
-允许用户免费下载并在个人设备上运行本软件官方分发的可执行程序。未经版权所有人书面许可，不得对本软件进行反编译、反向工程、修改、拆分、出租、出售，或去除软件中的版权与署名标识。
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-随可执行程序静态链接的底层编译器运行时组件各自适用其运行时豁免许可，详见 THIRD_PARTY_NOTICES.md。
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-本软件按「原样」（AS IS）提供，不附带任何明示或暗示的担保。在任何情况下，作者均不对因使用或无法使用本软件而产生的任何直接或间接损失承担责任。
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

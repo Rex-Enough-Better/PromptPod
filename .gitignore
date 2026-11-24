@@ -1,0 +1,34 @@
+# Temporary & local scratch
+.tmp/
+
+# Build & release artifacts
+build/
+dist/
+*.exe
+*.obj
+*.o
+*.res
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# AI local configs
+.claude/
+.cursor/
+.gemini/

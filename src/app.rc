@@ -1,0 +1,35 @@
+#include <windows.h>
+#include "version.h"
+
+#define IDI_APP_ICON 101
+
+IDI_APP_ICON ICON "../assets/app.ico"
+1 RT_MANIFEST "app.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     APP_VER_MAJOR,APP_VER_MINOR,APP_VER_PATCH,APP_VER_BUILD
+PRODUCTVERSION  APP_VER_MAJOR,APP_VER_MINOR,APP_VER_PATCH,APP_VER_BUILD
+FILEFLAGSMASK   0x3fL
+FILEFLAGS       0x0L
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      "词舱 PromptPod"
+            VALUE "FileDescription",  "词舱 PromptPod - Windows 超轻量贴边 Prompt 一键复制工具"
+            VALUE "FileVersion",      APP_VERSION_A
+            VALUE "InternalName",     APP_NAME_A
+            VALUE "OriginalFilename", "PromptPod.exe"
+            VALUE "ProductName",      "词舱 PromptPod"
+            VALUE "ProductVersion",   APP_VERSION_A
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END

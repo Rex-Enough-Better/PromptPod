@@ -1,0 +1,1835 @@
+#ifndef UNICODE
+#define UNICODE
+#endif
+#ifndef _UNICODE
+#define _UNICODE
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <windows.h>
+#include <shellapi.h>
+#include <objbase.h>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "version.h"
+#include "model.h"
+#include "theme.h"
+#include "d2d_ctx.h"
+#include "dark_menu.h"
+#include "updater.h"
+#include "vault_wnd.h"
+#include "dock_wnd.h"
+
+namespace pp {
+
+static constexpr UINT WM_TRAYICON             = WM_APP + 10;
+static constexpr UINT WM_REVEAL_POD           = WM_APP + 11;
+static constexpr UINT kTrayIconId             = 3;
+static constexpr UINT_PTR kTimerTrayRetry     = 8101;
+static constexpr UINT_PTR kTimerSilentUpdate  = 8102;
+
+#ifndef NIF_SHOWTIP
+#define NIF_SHOWTIP 0x00000080
+#endif
+#ifndef NOTIFYICON_VERSION_4
+#define NOTIFYICON_VERSION_4 4
+#endif
+#ifndef NIN_SELECT
+#define NIN_SELECT (WM_USER + 0)
+#endif
+#ifndef NIN_KEYSELECT
+#define NIN_KEYSELECT (WM_USER + 1)
+#endif
+
+inline uint64_t HashPathFnv1a64(const std::wstring& s) {
+    uint64_t h = 14695981039346656037ULL;
+    for (wchar_t c : s) {
+        h ^= (uint64_t)(uint16_t)c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+inline uint32_t PackAppVersion(uint32_t major, uint32_t minor, uint32_t patch) {
+    return ((major & 0x3FFu) << 20) | ((minor & 0x3FFu) << 10) | (patch & 0x3FFu);
+}
+
+class AppController {
+public:
+    HINSTANCE hInst = nullptr;
+    HWND hwndTrayHost = nullptr;
+    UINT msgTaskbarCreated = 0;
+    NOTIFYICONDATAW nid{};
+    uint64_t dirPathHash = 0;
+    int trayRetryCount = 0;
+    bool trayV4Active = false;
+    ULONGLONG lastTrayPrimaryTick = 0;
+
+    StorageManager storage;
+    AppState state;
+    DarkPopupMenu popupMenu;
+    UpdateManager updater;
+    VaultWindow vaultWnd;
+    DockWindow dockWnd;
+
+    bool Init(HINSTANCE inst, const std::wstring& customDataDir, bool silentAutostart, uint64_t pathHash) {
+        hInst = inst;
+        dirPathHash = pathHash;
+        if (!D2DEngine::Instance().Init()) return false;
+
+        storage.Init(customDataDir);
+        bool loadedCleanly = storage.LoadOrSeed(state);
+
+        DiagLogger::Instance().LogFmt("INFO", "STARTUP",
+            L"=== %ls v%ls starting (autostart=%d, loadedCleanly=%d, readOnlyRecovery=%d, edge=%d, ratioMilli=%d, dataDir=%ls) ===",
+            APP_DISPLAY_TITLE_W, APP_VERSION_W,
+            silentAutostart ? 1 : 0, loadedCleanly ? 1 : 0, storage.readOnlyRecoveryMode ? 1 : 0,
+            (int)state.dockEdge, (int)(state.dockRatioY * 10000.0 + 0.5),
+            storage.SafeDirLabelForLog().c_str());
+
+        if (!CreateTrayHostWindow()) return false;
+        if (!popupMenu.Init(hInst)) return false;
+
+        updater.Init(hwndTrayHost, customDataDir);
+
+        vaultWnd.Init(hInst, &state, &storage, &popupMenu, [this]() {
+            dockWnd.Refresh();
+            UpdateTrayTooltip();
+        });
+        vaultWnd.updater = &updater;
+        vaultWnd.onResetDockPos = [this]() {
+            dockWnd.ResetToEdgeDefault();
+        };
+        vaultWnd.onSetDockEdge = [this](DockEdge edge) {
+            dockWnd.SetDockEdgeAndPersist(edge, true);
+        };
+        vaultWnd.getDockLocationSummary = [this]() -> std::wstring {
+            return dockWnd.DescribeDockLocation();
+        };
+        vaultWnd.onReplayOnboarding = [this]() {
+            if (vaultWnd.hwnd && IsWindowVisible(vaultWnd.hwnd)) {
+                ShowWindow(vaultWnd.hwnd, SW_HIDE);
+            }
+            dockWnd.StartOnboarding(true);
+        };
+
+        if (!dockWnd.Init(hInst, &state, &storage, &popupMenu, &vaultWnd, [this](POINT pt) {
+            ShowAppTrayMenu(pt, MenuOwner::Dock);
+        })) {
+            return false;
+        }
+
+        InstallTrayIcon();
+
+        if (!silentAutostart) {
+            if (!state.onboardingCompleted && !storage.readOnlyRecoveryMode) {
+                // First-launch interactive 3-step edge onboarding
+                dockWnd.StartOnboarding(false);
+            } else if (state.dockEdge != DockEdge::None) {
+                // Smoothly reveal on manual launch so user sees where 词舱 PromptPod is docked
+                dockWnd.ExpandAndReveal(2200);
+            }
+        }
+
+        // One-shot delayed silent update check (24h cooldown, zero background polling timers)
+        if (state.autoCheckUpdates) {
+            int64_t now = NowUnixSeconds();
+            if (state.lastUpdateCheckAt <= 0 || (now - state.lastUpdateCheckAt) >= UpdateManager::kSilentCheckIntervalSec) {
+                SetTimer(hwndTrayHost, kTimerSilentUpdate, 8000, nullptr);
+            }
+        }
+        return true;
+    }
+
+    void Shutdown() {
+        DiagLogger::Instance().Log("INFO", "SHUTDOWN", L"PromptPod shutting down cleanly");
+        updater.Shutdown();
+        RemoveTrayIcon();
+        if (!storage.readOnlyRecoveryMode) {
+            storage.Save(state);
+        }
+    }
+
+private:
+    bool CreateTrayHostWindow() {
+        msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = TrayHostWndProc;
+        wc.hInstance = hInst;
+        wc.lpszClassName = L"PromptPod_TrayHost";
+        RegisterClassExW(&wc);
+
+        hwndTrayHost = CreateWindowExW(
+            0, wc.lpszClassName, APP_DISPLAY_TITLE_W, 0,
+            0, 0, 0, 0,
+            nullptr, nullptr, hInst, this
+        );
+        if (!hwndTrayHost) return false;
+        SetPropW(hwndTrayHost, L"PP_DirHashLo", reinterpret_cast<HANDLE>((ULONG_PTR)(dirPathHash & 0xFFFFFFFFULL)));
+        SetPropW(hwndTrayHost, L"PP_DirHashHi", reinterpret_cast<HANDLE>((ULONG_PTR)((dirPathHash >> 32) & 0xFFFFFFFFULL)));
+        SetPropW(hwndTrayHost, L"PP_AppVerPacked",
+                 reinterpret_cast<HANDLE>((ULONG_PTR)PackAppVersion(APP_VER_MAJOR, APP_VER_MINOR, APP_VER_PATCH)));
+        return true;
+    }
+
+    HICON hTrayIcon = nullptr;
+
+    std::wstring BuildTrayTooltip() const {
+        if (storage.readOnlyRecoveryMode) {
+            return UiText(L"\x8BCD\x8231 PromptPod v" APP_VERSION_W L"\xFF08\x53EA\x8BFB\x4FDD\x62A4\x6A21\x5F0F -- \x8BF7\x6253\x5F00\x8BCD\x8231\x6062\x590D\xFF09");
+        }
+        auto upSnap = updater.GetSnapshot();
+        if (upSnap.phase == UpdatePhase::Available && !upSnap.latestVersion.empty()) {
+            return UiText(L"\x8BCD\x8231 PromptPod v" APP_VERSION_W L"\xFF08\x53D1\x73B0\x65B0\x7248\x672C v" + upSnap.latestVersion + L"\xFF09");
+        }
+        return UiText(L"\x8BCD\x8231 PromptPod v" APP_VERSION_W);
+    }
+
+    void InstallTrayIcon() {
+        if (!hTrayIcon) {
+            hTrayIcon = static_cast<HICON>(LoadImageW(
+                hInst,
+                MAKEINTRESOURCEW(101),
+                IMAGE_ICON,
+                GetSystemMetrics(SM_CXSMICON),
+                GetSystemMetrics(SM_CYSMICON),
+                LR_DEFAULTCOLOR | LR_SHARED
+            ));
+            if (!hTrayIcon) hTrayIcon = LoadIconW(hInst, MAKEINTRESOURCEW(101));
+            if (!hTrayIcon) hTrayIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        }
+
+        ZeroMemory(&nid, sizeof(nid));
+        nid.cbSize = sizeof(NOTIFYICONDATAW);
+        nid.hWnd = hwndTrayHost;
+        nid.uID = kTrayIconId;
+        nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
+        nid.uCallbackMessage = WM_TRAYICON;
+        nid.hIcon = hTrayIcon;
+
+        std::wstring tip = BuildTrayTooltip();
+        wcsncpy_s(nid.szTip, tip.c_str(), _TRUNCATE);
+
+        BOOL added = Shell_NotifyIconW(NIM_ADD, &nid);
+        BOOL modified = added ? Shell_NotifyIconW(NIM_MODIFY, &nid) : FALSE;
+        if (!added && !modified) {
+            ++trayRetryCount;
+            DiagLogger::Instance().LogFmt("WARN", "TRAY",
+                L"Shell_NotifyIconW(NIM_ADD) failed (attempt %d, err=%lu)",
+                trayRetryCount, (unsigned long)GetLastError());
+            if (trayRetryCount <= 5 && hwndTrayHost) {
+                SetTimer(hwndTrayHost, kTimerTrayRetry, 1500, nullptr);
+            }
+        } else {
+            nid.uVersion = NOTIFYICON_VERSION_4;
+            trayV4Active = (Shell_NotifyIconW(NIM_SETVERSION, &nid) != FALSE);
+            trayRetryCount = 0;
+            if (hwndTrayHost) KillTimer(hwndTrayHost, kTimerTrayRetry);
+        }
+    }
+
+    void UpdateTrayTooltip() {
+        if (!nid.hWnd) return;
+        std::wstring tip = BuildTrayTooltip();
+        wcsncpy_s(nid.szTip, tip.c_str(), _TRUNCATE);
+        nid.uFlags = NIF_TIP | NIF_SHOWTIP;
+        Shell_NotifyIconW(NIM_MODIFY, &nid);
+        nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
+    }
+
+    void RemoveTrayIcon() {
+        if (nid.hWnd) {
+            Shell_NotifyIconW(NIM_DELETE, &nid);
+            nid.hWnd = nullptr;
+        }
+    }
+
+    POINT ResolveTrayMenuAnchorPoint(WPARAM wp) const {
+        NOTIFYICONIDENTIFIER niid{};
+        niid.cbSize = sizeof(niid);
+        niid.hWnd = hwndTrayHost;
+        niid.uID = kTrayIconId;
+        RECT iconRc{};
+        if (SUCCEEDED(Shell_NotifyIconGetRect(&niid, &iconRc)) &&
+            iconRc.right > iconRc.left && iconRc.bottom > iconRc.top) {
+            return POINT{ (iconRc.left + iconRc.right) / 2, iconRc.top };
+        }
+        if (trayV4Active) {
+            int px = (int)(short)LOWORD(wp);
+            int py = (int)(short)HIWORD(wp);
+            if (px != 0 || py != 0) return POINT{ px, py };
+        }
+        POINT pt{};
+        GetCursorPos(&pt);
+        return pt;
+    }
+
+    void ExecuteTrayPrimaryAction() {
+        ULONGLONG now = GetTickCount64();
+        ULONGLONG dblGuardMs = std::min<ULONGLONG>(GetDoubleClickTime(), 450ULL);
+        if (lastTrayPrimaryTick != 0 && (now - lastTrayPrimaryTick) < dblGuardMs) {
+            // Swallow second click of a fast double-click so it never double-fires or flips a toggle back
+            if (state.trayClickOpensVault) {
+                vaultWnd.ShowOrFocus(0);
+            }
+            return;
+        }
+        lastTrayPrimaryTick = now;
+
+        if (state.trayClickOpensVault) {
+            DiagLogger::Instance().Log("INFO", "TRAY", L"Tray primary action -> ShowOrFocus VaultWindow");
+            vaultWnd.ShowOrFocus(0);
+        } else {
+            if (state.dockEdge != DockEdge::None && dockWnd.IsExpandedOrExpanding()) {
+                DiagLogger::Instance().Log("INFO", "TRAY", L"Tray primary action -> CollapseNow");
+                dockWnd.CollapseNow();
+            } else {
+                DiagLogger::Instance().Log("INFO", "TRAY", L"Tray primary action -> ExpandAndReveal");
+                dockWnd.ExpandAndReveal(2600);
+            }
+        }
+    }
+
+    void ShowAppTrayMenu(POINT pt, MenuOwner menuOwner = MenuOwner::Tray) {
+        bool bubbleOn = state.showHoverBubble;
+        bool dockExpanded = (state.dockEdge != DockEdge::None && dockWnd.IsExpandedOrExpanding());
+        auto upSnap = updater.GetSnapshot();
+        std::wstring updateLabel = (upSnap.phase == UpdatePhase::Available && !upSnap.latestVersion.empty())
+            ? (L"发现新版本 v" + upSnap.latestVersion + L"...")
+            : L"检查更新...";
+
+        std::vector<DarkMenuItem> items;
+        items.push_back(DarkMenuItem::Header(L"\x8BCD\x8231 PromptPod v" APP_VERSION_W));
+        items.push_back(DarkMenuItem::Action(1, dockExpanded ? L"\x6536\x8D77\x8D34\x8FB9\x9762\x677F" : L"\x5C55\x5F00\x8D34\x8FB9\x9762\x677F"));
+        items.push_back(DarkMenuItem::Action(2, L"\x6253\x5F00\x8BCD\x8231\x7BA1\x7406..."));
+        items.push_back(DarkMenuItem::Action(3, L"\x4F7F\x7528\x6392\x884C..."));
+        items.push_back(DarkMenuItem::Action(6, L"\x6253\x5F00\x8BBE\x7F6E..."));
+        items.push_back(DarkMenuItem::Separator());
+        items.push_back(DarkMenuItem::Action(7, L"\x60AC\x505C\x9884\x89C8\x6B63\x6587", L"", bubbleOn));
+        items.push_back(DarkMenuItem::Action(5, L"\x9762\x677F\x5F52\x4F4D"));
+        items.push_back(DarkMenuItem::Separator());
+        items.push_back(DarkMenuItem::Action(10, updateLabel, upSnap.phase == UpdatePhase::Available ? L"新" : L""));
+        items.push_back(DarkMenuItem::Action(9, L"\x9000\x51FA\x8BCD\x8231 PromptPod", L"", false, true));
+
+        popupMenu.ShowAt(pt, items, [this, dockExpanded](int cmd) {
+            switch (cmd) {
+                case 1:
+                    if (dockExpanded) dockWnd.CollapseNow();
+                    else dockWnd.ExpandAndReveal(2600);
+                    break;
+                case 2:
+                    vaultWnd.Open(0, -1);
+                    break;
+                case 3:
+                    vaultWnd.Open(1, -1);
+                    break;
+                case 6:
+                    vaultWnd.Open(2, -1);
+                    break;
+                case 7:
+                    state.showHoverBubble = !state.showHoverBubble;
+                    if (!storage.Save(state)) {
+                        vaultWnd.ShowExternalToast(L"保存设置失败：当前处于只读保护或配置文件不可写", true);
+                    }
+                    dockWnd.Refresh();
+                    vaultWnd.RefreshIfOpen();
+                    break;
+                case 5:
+                    dockWnd.ResetToEdgeDefault();
+                    vaultWnd.RefreshIfOpen();
+                    break;
+                case 10: {
+                    vaultWnd.Open(2, -1);
+                    auto s = updater.GetSnapshot();
+                    if (s.phase != UpdatePhase::Available && !updater.IsBusy()) {
+                        updater.StartCheck(false);
+                    }
+                    vaultWnd.RefreshIfOpen();
+                    break;
+                }
+                case 9:
+                    PostQuitMessage(0);
+                    break;
+            }
+        }, 238.0f, menuOwner);
+    }
+
+    static LRESULT CALLBACK TrayHostWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+        AppController* self = nullptr;
+        if (msg == WM_NCCREATE) {
+            auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+            self = static_cast<AppController*>(cs->lpCreateParams);
+            SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        } else {
+            self = reinterpret_cast<AppController*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+        }
+        if (!self) return DefWindowProcW(h, msg, wp, lp);
+
+        if (self->msgTaskbarCreated != 0 && msg == self->msgTaskbarCreated) {
+            DiagLogger::Instance().Log("WARN", "TRAY", L"TaskbarCreated received (Explorer restarted), reinstalling tray icon & syncing dock");
+            self->trayRetryCount = 0;
+            self->InstallTrayIcon();
+            self->dockWnd.ScheduleDisplaySync(L"TaskbarCreated");
+            return 0;
+        }
+
+        switch (msg) {
+            case WM_TIMER:
+                if (wp == kTimerTrayRetry) {
+                    KillTimer(h, kTimerTrayRetry);
+                    self->InstallTrayIcon();
+                } else if (wp == kTimerSilentUpdate) {
+                    KillTimer(h, kTimerSilentUpdate);
+                    if (self->state.autoCheckUpdates) {
+                        self->updater.StartCheck(true);
+                    }
+                }
+                return 0;
+
+            case WM_UPDATE_STATE_CHANGED: {
+                auto snap = self->updater.GetSnapshot();
+                if (snap.phase == UpdatePhase::UpToDate || snap.phase == UpdatePhase::Available) {
+                    self->state.lastUpdateCheckAt = NowUnixSeconds();
+                    if (!self->storage.readOnlyRecoveryMode) {
+                        self->storage.Save(self->state);
+                    }
+                }
+                self->UpdateTrayTooltip();
+                self->vaultWnd.RefreshIfOpen();
+                return 0;
+            }
+
+            case WM_UPDATE_RESTART_READY:
+                DiagLogger::Instance().Log("INFO", "UPDATER", L"WM_UPDATE_RESTART_READY received -> exiting old instance for seamless handoff");
+                PostQuitMessage(0);
+                return 0;
+
+            case WM_REVEAL_POD:
+                DiagLogger::Instance().Log("INFO", "TRAY", L"WM_REVEAL_POD received from second instance launch");
+                self->dockWnd.ExpandAndReveal(2600);
+                return 0;
+
+            case WM_TRAYICON: {
+                UINT ev = self->trayV4Active ? (UINT)LOWORD(lp) : (UINT)lp;
+                if (ev == NIN_SELECT || ev == NIN_KEYSELECT ||
+                    (!self->trayV4Active && (ev == WM_LBUTTONUP || ev == WM_LBUTTONDBLCLK))) {
+                    self->ExecuteTrayPrimaryAction();
+                } else if (ev == WM_CONTEXTMENU || (!self->trayV4Active && ev == WM_RBUTTONUP)) {
+                    POINT pt = self->ResolveTrayMenuAnchorPoint(wp);
+                    self->ShowAppTrayMenu(pt, MenuOwner::Tray);
+                }
+                return 0;
+            }
+
+            case WM_CLOSE:
+            case WM_DESTROY:
+                RemovePropW(h, L"PP_DirHashLo");
+                RemovePropW(h, L"PP_DirHashHi");
+                RemovePropW(h, L"PP_AppVerPacked");
+                PostQuitMessage(0);
+                return 0;
+        }
+        return DefWindowProcW(h, msg, wp, lp);
+    }
+};
+
+inline HWND FindExistingInstanceTrayHost(uint64_t expectedHash) {
+    struct SearchCtx {
+        uint64_t wantHash = 0;
+        HWND found = nullptr;
+    } ctx{ expectedHash, nullptr };
+
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+        auto* c = reinterpret_cast<SearchCtx*>(lp);
+        wchar_t cls[64]{};
+        if (GetClassNameW(h, cls, _countof(cls)) > 0 && wcscmp(cls, L"PromptPod_TrayHost") == 0) {
+            HANDLE lo = GetPropW(h, L"PP_DirHashLo");
+            HANDLE hi = GetPropW(h, L"PP_DirHashHi");
+            if (!lo && !hi) {
+                // Backward compatibility with pre-0.5.0 default instance
+                if (!c->found) c->found = h;
+                return TRUE;
+            }
+            uint64_t got = ((uint64_t)(uint32_t)(ULONG_PTR)hi << 32) | (uint64_t)(uint32_t)(ULONG_PTR)lo;
+            if (got == c->wantHash) {
+                c->found = h;
+                return FALSE;
+            }
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.found;
+}
+
+// Headless deterministic self-test for build verification (zero pollution of user data or autostart)
+inline int RunHeadlessSelfTest(const std::wstring& testRootDir) {
+    if (testRootDir.empty()) return 2;
+    std::wstring canonRoot = StorageManager::CanonicalizeDirPath(testRootDir);
+    std::wstring canonDef  = StorageManager::CanonicalizeDirPath(StorageManager::ResolveDefaultDataDir());
+    if (canonRoot.empty() || canonRoot == canonDef) return 3;
+
+    // Create dedicated isolated subfolder for this run so existing files in testRootDir are never touched
+    wchar_t runSub[64]{};
+    wsprintfW(runSub, L"\\run_%lu_%llu", (unsigned long)GetCurrentProcessId(), (unsigned long long)GetTickCount64());
+    std::wstring testDir = testRootDir + runSub;
+
+    // 1. Verify deterministic Chinese typography normalizer (including new brand name)
+    if (UiText(L"\u8BCD\u8231PromptPod v0.6.0") != L"\u8BCD\u8231 PromptPod v0.6.0") return 10;
+    if (UiText(L"\u5DF2\u590D\u523618\u6B21") != L"\u5DF2\u590D\u5236 18 \u6B21") return 11;
+    if (UiText(L"\u6807\u9898 \uFF0C \u6B63\u6587\u2014\u2014\u6D4B\u8BD5") != L"\u6807\u9898\uFF0C\u6B63\u6587--\u6D4B\u8BD5") return 12;
+
+    // 2. Verify storage seed, slot replacement preserving vault & useCount, and strict JSON round-trip
+    StorageManager sm;
+    sm.Init(testDir);
+
+    AppState s1{};
+    if (!sm.LoadOrSeed(s1)) return 20;
+    if (s1.vault.size() != 12 || s1.ActiveSlots()[0] != L"seed_01" || s1.ActiveSlots()[1] != L"seed_02" ||
+        s1.EnabledSceneCount() != 2 || !s1.scenes[0].enabled || !s1.scenes[1].enabled ||
+        s1.scenes[2].enabled || s1.scenes[3].enabled ||
+        s1.scenes[1].name != L"产品" || s1.scenes[1].slots[0] != L"seed_11" || s1.scenes[1].slots[1] != L"seed_12") return 21;
+    for (size_t i = 2; i < 10; ++i) {
+        if (!s1.ActiveSlots()[i].empty()) return 21;
+    }
+    if (s1.onboardingCompleted != false || s1.trayClickOpensVault != true || s1.hasDockAnchor != false) return 17;
+
+    PromptItem* p1 = s1.FindById(s1.ActiveSlots()[0]);
+    if (!p1) return 22;
+    p1->useCount = 3;
+    p1->content += L"\nLine2 \"quoted\" \\backslash \xD83D\xDE80";
+    std::wstring expectedP1Content = p1->content;
+
+    PromptItem extra{ L"vault_extra_11", L"\x5907\x7528\x6D4B\x8BD5\x6761\x76EE", L"Extra prompt body", 0, NowUnixSeconds(), 0 };
+    s1.vault.push_back(extra);
+    s1.AssignToSlot(0, L"vault_extra_11");
+    if (s1.ActiveSlots()[0] != L"vault_extra_11") return 23;
+    const PromptItem* p1After = s1.FindById(L"seed_01");
+    if (!p1After || p1After->useCount != 3 || s1.FindSlotOfId(L"seed_01") != -1) return 24;
+
+    if (!s1.showHoverBubble) return 19;
+    if (!s1.autoCheckUpdates) return 18;
+    s1.showHoverBubble = false;
+    s1.autoCheckUpdates = false;
+    s1.lastUpdateCheckAt = 1795000123LL;
+    if (!sm.Save(s1)) return 25;
+
+    AppState s2{};
+    if (!sm.LoadOrSeed(s2)) return 26;
+    if (s2.vault.size() != 13 || s2.ActiveSlots()[0] != L"vault_extra_11" || s2.TotalCopies() != 3) return 27;
+    if (s2.showHoverBubble != false || s2.autoCheckUpdates != false || s2.lastUpdateCheckAt != 1795000123LL) return 29;
+    const PromptItem* p1Reloaded = s2.FindById(L"seed_01");
+    if (!p1Reloaded || p1Reloaded->content != expectedP1Content) return 28;
+
+    // 2a-compat. Legacy v0.5.0/v0.6.x JSON without v0.6/v0.7 keys must still parse cleanly with safe defaults
+    {
+        AppState legacy{};
+        std::string legacyJson = "{\"schemaVersion\":2,\"dockEdge\":2,\"dockRatioMilli\":3200,\"showHoverBubble\":true,\"slots\":[\"seed_01\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\"],\"vault\":[{\"id\":\"seed_01\",\"title\":\"T\",\"content\":\"C\",\"useCount\":1,\"createdAt\":1,\"lastUsedAt\":2}]}";
+        if (!ParseStateFromJson(legacyJson, legacy) || !legacy.autoCheckUpdates || legacy.lastUpdateCheckAt != 0 ||
+            !legacy.onboardingCompleted || !legacy.trayClickOpensVault || legacy.hasDockAnchor) return 75;
+    }
+
+    // 2b. P0 Regression: existing corrupt data.json must NEVER be overwritten by LoadOrSeed() or Save()!
+    {
+        StorageManager corruptSm;
+        corruptSm.Init(testDir + L"\\corrupt_case");
+        std::string brokenBytes = "{ \"schemaVersion\": 2, \"vault\": [ CORRUPT_USER_DATA ";
+        if (!StorageManager::WriteAllBytesAtomic(corruptSm.dataFilePath, brokenBytes)) return 60;
+
+        AppState recovered{};
+        if (corruptSm.LoadOrSeed(recovered)) return 61; // Must report failure, not silent seed
+        if (!corruptSm.readOnlyRecoveryMode) return 62;
+        if (corruptSm.Save(recovered)) return 63; // Silent Save() must be blocked
+        std::string onDisk;
+        if (!StorageManager::ReadAllBytes(corruptSm.dataFilePath, onDisk) || onDisk != brokenBytes) return 64;
+        DiagLogger::Instance().Init(sm.dataDir);
+    }
+
+    // 2c. P1 Regression: strict RFC 8259 JSON parser rejects empty {}, trailing garbage, deep nesting, lone surrogate, NUL, duplicate IDs
+    {
+        AppState dummy{};
+        if (ParseStateFromJson("{}", dummy)) return 65;
+        if (ParseStateFromJson("{\"slots\":[],\"vault\":[]} garbage", dummy)) return 66;
+        std::string deepNest = "{\"slots\":[],\"vault\":[],\"extra\":";
+        for (int i = 0; i < 64; ++i) deepNest += "[";
+        for (int i = 0; i < 64; ++i) deepNest += "]";
+        deepNest += "}";
+        if (ParseStateFromJson(deepNest, dummy)) return 67;
+        if (ParseStateFromJson("{\"slots\":[],\"vault\":[{\"id\":\"a\",\"title\":\"t\",\"content\":\"x\\u0000y\"}]}", dummy)) return 68;
+        if (ParseStateFromJson("{\"slots\":[],\"vault\":[{\"id\":\"a\",\"title\":\"t\",\"content\":\"\\uD800\"}]}", dummy)) return 69;
+        if (ParseStateFromJson("{\"slots\":[],\"vault\":[{\"id\":\"dup\",\"title\":\"A\",\"content\":\"1\"},{\"id\":\"dup\",\"title\":\"B\",\"content\":\"2\"}]}", dummy)) return 70;
+    }
+
+    // 3. Verify unique-named isolated autostart registry toggle & cleanup
+    wchar_t tempRegVal[96]{};
+    wsprintfW(tempRegVal, L"PromptPod_SelfTest_%lu_%llu", (unsigned long)GetCurrentProcessId(), (unsigned long long)GetTickCount64());
+    if (!AutoStart::SetEnabled(true, tempRegVal)) return 30;
+    if (!AutoStart::IsEnabled(tempRegVal)) {
+        AutoStart::SetEnabled(false, tempRegVal);
+        return 31;
+    }
+    if (!AutoStart::SetEnabled(false, tempRegVal)) return 32;
+    if (AutoStart::IsEnabled(tempRegVal)) return 33;
+
+    // 4. Verify DockWindow interactions, geometry/size self-heal, hover bubble, and first-principles capsule reachability self-heal
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    int uiErr = 0;
+    if (!D2DEngine::Instance().Init()) {
+        uiErr = 40;
+    } else {
+        DockWindow dock;
+        std::wstring capturedClip;
+        bool clipShouldSucceed = true;
+        dock.clipboardWriter = [&](const std::wstring& txt) -> bool {
+            if (!clipShouldSucceed) return false;
+            capturedClip = txt;
+            return true;
+        };
+        if (!dock.Init(GetModuleHandleW(nullptr), &s2, &sm, nullptr, nullptr, nullptr, false)) {
+            uiErr = 41;
+        } else {
+            dock.expandSpring.Snap(1.0f);
+            dock.Refresh();
+
+            auto makeSlotLp = [&](int slotIdx) -> LPARAM {
+                float cxDip = Theme::ShadowPad + Theme::PanelWidth * 0.5f;
+                float cyDip = Theme::ShadowPad + Theme::HeaderHeight +
+                              (float)slotIdx * (Theme::SlotHeight + Theme::SlotGap) + Theme::SlotHeight * 0.5f;
+                int px = (int)std::round(cxDip * dock.dpiScale);
+                int py = (int)std::round(cyDip * dock.dpiScale);
+                return MAKELPARAM((short)px, (short)py);
+            };
+
+            // 4a. Left-click on Slot 01 must copy content & increment useCount
+            LPARAM lp0 = makeSlotLp(0);
+            SendMessageW(dock.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lp0);
+            SendMessageW(dock.hwnd, WM_LBUTTONUP, 0, lp0);
+            const PromptItem* slot0Item = s2.FindById(L"vault_extra_11");
+            if (!slot0Item || slot0Item->useCount != 1 || capturedClip != L"Extra prompt body" || dock.copiedSlot != 0) {
+                uiErr = 42;
+            }
+
+            // 4a-fail. Clipboard failure must NOT increment useCount, must arm inline red flash, and must NOT auto-retract!
+            if (uiErr == 0) {
+                clipShouldSucceed = false;
+                capturedClip.clear();
+                dock.pendingAutoRetract = false;
+                dock.copyFailedSlot = -1;
+                SendMessageW(dock.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lp0);
+                SendMessageW(dock.hwnd, WM_LBUTTONUP, 0, lp0);
+                if (slot0Item->useCount != 1 || !capturedClip.empty() ||
+                    dock.copyFailedSlot != 0 || dock.copyFailedTick == 0 ||
+                    dock.pendingAutoRetract || dock.expandSpring.target < 0.5f) {
+                    uiErr = 71;
+                }
+                clipShouldSucceed = true;
+            }
+
+            // 4b. Press on Slot 01 then release far outside panel must cancel without copying
+            if (uiErr == 0) {
+                capturedClip.clear();
+                SendMessageW(dock.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lp0);
+                SendMessageW(dock.hwnd, WM_LBUTTONUP, 0, MAKELPARAM(-120, (short)HIWORD(lp0)));
+                if (slot0Item->useCount != 1 || !capturedClip.empty()) {
+                    uiErr = 43;
+                }
+            }
+
+            // 4c. Drag Slot 01 down onto Slot 02 must swap slots without triggering copy
+            if (uiErr == 0) {
+                std::wstring origSlot0 = s2.ActiveSlots()[0];
+                std::wstring origSlot1 = s2.ActiveSlots()[1];
+                LPARAM lp1 = makeSlotLp(1);
+                SendMessageW(dock.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lp0);
+                SendMessageW(dock.hwnd, WM_MOUSEMOVE, MK_LBUTTON, lp1);
+                SendMessageW(dock.hwnd, WM_LBUTTONUP, 0, lp1);
+                if (s2.ActiveSlots()[0] != origSlot1 || s2.ActiveSlots()[1] != origSlot0 || slot0Item->useCount != 1 || !capturedClip.empty()) {
+                    uiErr = 44;
+                }
+            }
+
+            // 4d. Verify DIBSection capacity reuse on collapse + D2D target recreate resilience + non-zero solid center alpha
+            if (uiErr == 0) {
+                HBITMAP expandedDib = dock.canvas.dib;
+                dock.expandSpring.Snap(0.0f);
+                dock.canvas.rt.Reset();
+                if (!dock.RenderAndPresent("selftest-collapse") || !dock.lastPresentOk ||
+                    dock.canvas.dib != expandedDib || dock.lastCollapsedCenterAlpha < 180) {
+                    uiErr = 45;
+                }
+            }
+
+            // 4e. Verify display switch (1920x1080 -> 2560x1440), external move & size-only drift self-heal
+            if (uiErr == 0) {
+                RECT simMon{ 0, 0, 1920, 1080 };
+                RECT simWork{ 0, 0, 1920, 1040 };
+                dock.monitorProvider = [&](POINT, RECT* outMon) -> RECT {
+                    if (outMon) *outMon = simMon;
+                    return simWork;
+                };
+                SendMessageW(dock.hwnd, WM_DISPLAYCHANGE, 32, MAKELPARAM(1920, 1080));
+                int expectedX1920 = 1920 - dock.curWinW;
+                if (dock.curWinX != expectedX1920) {
+                    uiErr = 46;
+                }
+
+                simMon = { 0, 0, 2560, 1440 };
+                simWork = { 0, 0, 2560, 1400 };
+                SendMessageW(dock.hwnd, WM_DISPLAYCHANGE, 32, MAKELPARAM(2560, 1440));
+                int expectedX2560 = 2560 - dock.curWinW;
+                if (dock.curWinX != expectedX2560) {
+                    uiErr = 47;
+                }
+
+                // External move to X=1280 + click jitter must NOT detach
+                {
+                    DockWindow::ScopedSelfPresent guard(dock.selfPresentDepth);
+                    SetWindowPos(dock.hwnd, nullptr, 1280, dock.curWinY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+                SendMessageW(dock.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(4, 20));
+                SendMessageW(dock.hwnd, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(6, 21));
+                SendMessageW(dock.hwnd, WM_LBUTTONUP, 0, MAKELPARAM(6, 21));
+                if (s2.dockEdge != DockEdge::Right) {
+                    uiErr = 48;
+                }
+
+                // Watchdog heals external move AND external size-only drift (same X/Y, shrunken width!)
+                dock.expandSpring.Snap(0.0f);
+                dock.RenderAndPresent("selftest-reset-collapsed");
+                int expCollapsedW = dock.curWinW;
+                {
+                    DockWindow::ScopedSelfPresent guard(dock.selfPresentDepth);
+                    SetWindowPos(dock.hwnd, nullptr, dock.curWinX, dock.curWinY, 2, 2, SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+                dock.animRunning = false;
+                dock.OnWatchdogTimer();
+                RECT healedRc{};
+                GetWindowRect(dock.hwnd, &healedRc);
+                if (healedRc.left != expectedX2560 || (healedRc.right - healedRc.left) != expCollapsedW) {
+                    uiErr = 49;
+                }
+            }
+
+            // 4f. Verify HoverBubble early-hover trigger during opening spring + DIB reuse + text buffer release
+            if (uiErr == 0) {
+                s2.showHoverBubble = true;
+                dock.expandSpring.value = 0.25f;
+                dock.expandSpring.target = 1.0f;
+                dock.hoverSlot = -1;
+
+                float slideDip = dock.CurrentSlideOffsetDip();
+                float cxDip = Theme::ShadowPad + Theme::PanelWidth * 0.5f + slideDip;
+                float cyDip = Theme::ShadowPad + Theme::HeaderHeight +
+                              1.0f * (Theme::SlotHeight + Theme::SlotGap) + Theme::SlotHeight * 0.5f;
+                LPARAM lpHoverEarly = MAKELPARAM((short)std::round(cxDip * dock.dpiScale),
+                                                 (short)std::round(cyDip * dock.dpiScale));
+                SendMessageW(dock.hwnd, WM_MOUSEMOVE, 0, lpHoverEarly);
+                if (dock.hoverSlot != 1) {
+                    uiErr = 53;
+                }
+
+                dock.expandSpring.Snap(1.0f);
+                SendMessageW(dock.hwnd, WM_TIMER, DockWindow::kTimerBubbleHover, 0);
+                if (!dock.hoverBubble.IsShowingOrAppearing() || dock.hoverBubble.currentSlot != 1 ||
+                    dock.hoverBubble.canvas.widthPx <= 10 || !IsWindowVisible(dock.hoverBubble.hwnd)) {
+                    uiErr = 54;
+                }
+
+                HBITMAP bubbleDib = dock.hoverBubble.canvas.dib;
+                dock.hoverBubble.HideImmediate();
+                if (dock.hoverBubble.canvas.dib != bubbleDib || !dock.hoverBubble.bodyText.empty()) {
+                    uiErr = 55;
+                }
+            }
+
+            // 4g. First-principles capsule reachability self-heal regression:
+            //     (1) External Z-order occluder -> heals ONCE, then circuit-breaks against same persistent occluder
+            //     (2) Layered-surface click-through (no occluder above) -> recommits collapsed frame ONLY
+            if (uiErr == 0) {
+                dock.expandSpring.Snap(0.0f);
+                dock.RenderAndPresent("selftest-probe-base");
+                dock.animRunning = false;
+
+                HWND fakeOccluder = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(0xDEADBEEF));
+                bool simOccludedAbove = true;
+                int simSwpCount = 0;
+                dock.hitProbeProvider = [&](POINT) -> HWND { return fakeOccluder; };
+                dock.aboveInZOrderProvider = [&](HWND cand, HWND) -> bool { return simOccludedAbove && (cand == fakeOccluder); };
+                dock.swpTopmostProvider = [&](HWND) -> bool { ++simSwpCount; return true; };
+
+                dock.watchdogZHealCount = 0;
+                dock.watchdogSurfaceRecommitCount = 0;
+                dock.lastHealedOccluder = nullptr;
+                dock.lastZHealTick = 0;
+
+                // 1st watchdog tick: detects persistent Z-order occlusion and performs 1 heal cycle (with Win11 fallback if still above)
+                dock.OnWatchdogTimer();
+                int swpAfterFirstHeal = simSwpCount;
+                if (dock.watchdogZHealCount != 1 || swpAfterFirstHeal < 1 || dock.watchdogSurfaceRecommitCount != 0) {
+                    uiErr = 72;
+                }
+
+                // 2nd watchdog tick with SAME persistent occluder: circuit breaker prevents ping-pong loop!
+                if (uiErr == 0) {
+                    dock.lastZHealTick = 0; // Bypass cooldown to prove per-occluder circuit breaker triggers
+                    dock.OnWatchdogTimer();
+                    if (dock.watchdogZHealCount != 1 || simSwpCount != swpAfterFirstHeal) {
+                        uiErr = 73;
+                    }
+                }
+
+                // Layered-surface click-through (no occluder above): must recommit frame ONLY, zero Z-order raises!
+                if (uiErr == 0) {
+                    simOccludedAbove = false;
+                    dock.lastHealedOccluder = nullptr;
+                    dock.OnWatchdogTimer();
+                    if (dock.watchdogSurfaceRecommitCount != 1 || simSwpCount != swpAfterFirstHeal || dock.lastCollapsedCenterAlpha < 180) {
+                        uiErr = 74;
+                    }
+                }
+            }
+
+            if (dock.hoverBubble.hwnd) DestroyWindow(dock.hoverBubble.hwnd);
+            if (dock.hwnd) DestroyWindow(dock.hwnd);
+        }
+    }
+    CoUninitialize();
+    if (uiErr != 0) return uiErr;
+
+    // 5. Verify diagnostic log output & fresh-directory size-based rotation
+    std::string logBytes;
+    if (!StorageManager::ReadAllBytes(sm.logFilePath, logBytes) || logBytes.empty()) return 50;
+    if (logBytes.find("[DISPLAY]") == std::string::npos || logBytes.find("[SELF_HEAL]") == std::string::npos) return 51;
+
+    DiagLogger::Instance().maxBytes = 256;
+    for (int i = 0; i < 8; ++i) {
+        DiagLogger::Instance().Log("INFO", "ROTATE_TEST", L"Testing log file size rotation threshold line padding");
+    }
+    DiagLogger::Instance().maxBytes = 512 * 1024;
+    std::string oldLogBytes;
+    if (!StorageManager::ReadAllBytes(DiagLogger::Instance().oldLogFilePath, oldLogBytes) || oldLogBytes.empty()) return 52;
+
+    // 6. Verify v0.6.0 Updater core primitives (SemVer, tag extraction, manifest security gate, SHA-256, NTFS swap, feedback URL & sanitized diagnostics)
+    {
+        // 6a. SemVer parse & compare
+        SemVer v50 = ParseSemVer(L"v0.5.0");
+        SemVer v60 = ParseSemVer(L"0.6.0");
+        SemVer v100 = ParseSemVer(L"V0.10.0");
+        if (!v50.valid || !v60.valid || !v100.valid) return 76;
+        if (CompareSemVer(v50, v60) >= 0 || CompareSemVer(v60, v100) >= 0 || CompareSemVer(v60, ParseSemVer(L"v0.6.0")) != 0) return 77;
+        if (ParseSemVer(L"0.6.0-beta.1").valid || ParseSemVer(L"0.06.0").valid || ParseSemVer(L"0.6").valid) return 78;
+
+        // 6b. Release Location tag extraction
+        if (ExtractTagFromReleaseLocation(L"https://github.com/Rex-Enough-Better/PromptPod/releases/tag/v0.7.1") != L"v0.7.1") return 79;
+        if (ExtractTagFromReleaseLocation(L"/Rex-Enough-Better/PromptPod/releases/tag/v1.0.0?foo=bar") != L"v1.0.0") return 80;
+        if (!ExtractTagFromReleaseLocation(L"https://github.com/Rex-Enough-Better/PromptPod/releases").empty()) return 81;
+
+        // 6c. Strict UpdateManifest parser & host/SHA security checks
+        std::string validMan =
+            "{\"schemaVersion\":1,\"version\":\"0.7.0\",\"tag\":\"v0.7.0\","
+            "\"releaseUrl\":\"https://github.com/Rex-Enough-Better/PromptPod/releases/tag/v0.7.0\","
+            "\"notes\":\"New release\",\"assetName\":\"PromptPod-0.7.0.exe\","
+            "\"assetUrl\":\"https://github.com/Rex-Enough-Better/PromptPod/releases/download/v0.7.0/PromptPod-0.7.0.exe\","
+            "\"assetSize\":460000,"
+            "\"sha256\":\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\"}";
+        UpdateManifest parsedMan{};
+        if (!ParseUpdateManifestJson(validMan, L"0.7.0", parsedMan) || parsedMan.assetSize != 460000) return 82;
+        if (ParseUpdateManifestJson(validMan, L"0.8.0", parsedMan)) return 83; // Version mismatch must reject
+
+        // Foreign host assetUrl must reject
+        std::string evilHostMan =
+            "{\"schemaVersion\":1,\"version\":\"0.7.0\",\"assetUrl\":\"https://evil.example.com/PromptPod.exe\","
+            "\"assetSize\":460000,\"sha256\":\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\"}";
+        if (ParseUpdateManifestJson(evilHostMan, L"0.7.0", parsedMan)) return 84;
+
+        // Malformed SHA-256 must reject
+        std::string badShaMan =
+            "{\"schemaVersion\":1,\"version\":\"0.7.0\","
+            "\"assetUrl\":\"https://github.com/Rex-Enough-Better/PromptPod/releases/download/v0.7.0/PromptPod-0.7.0.exe\","
+            "\"assetSize\":460000,\"sha256\":\"short\"}";
+        if (ParseUpdateManifestJson(badShaMan, L"0.7.0", parsedMan)) return 85;
+
+        // 6d. BCrypt SHA-256 NIST standard vector ("abc")
+        std::wstring shaTestPath = testDir + L"\\sha_vec.bin";
+        if (!StorageManager::WriteAllBytesAtomic(shaTestPath, "abc")) return 86;
+        std::wstring shaHex;
+        if (!ComputeFileSha256Hex(shaTestPath, shaHex) ||
+            shaHex != L"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") {
+            return 87;
+        }
+
+        // 6e. NTFS atomic binary swap with backup & verification
+        std::wstring curBin = testDir + L"\\fake_app.exe";
+        std::wstring newBin = testDir + L"\\fake_app.exe.new";
+        if (!StorageManager::WriteAllBytesAtomic(curBin, "OLD_BINARY_V1")) return 88;
+        if (!StorageManager::WriteAllBytesAtomic(newBin, "NEW_BINARY_V2")) return 89;
+        std::wstring oldBak;
+        if (!SwapBinaryWithBackup(curBin, newBin, oldBak) || oldBak.empty()) return 90;
+        std::string afterCur, afterOld;
+        if (!StorageManager::ReadAllBytes(curBin, afterCur) || afterCur != "NEW_BINARY_V2") return 91;
+        if (!StorageManager::ReadAllBytes(oldBak, afterOld) || afterOld != "OLD_BINARY_V1") return 92;
+
+        // 6f. URL encoding, GitHub Issue Form URL generation & privacy-safe diagnostics (must NOT leak user prompt content!)
+        if (UrlEncodeUtf8(L"A B+C") != L"A%20B%2BC") return 93;
+        std::wstring diag = BuildSanitizedDiagnostics(s2, sm, true);
+        if (diag.find(L"PromptPod v" APP_VERSION_W) == std::wstring::npos) return 94;
+        if (diag.find(L"Extra prompt body") != std::wstring::npos || diag.find(L"vault_extra_11") != std::wstring::npos) return 95;
+        std::wstring issueUrl = BuildGitHubIssueUrl(true, L"测试标题", L"复现步骤", L"Windows 11", diag);
+        if (issueUrl.rfind(L"https://github.com/Rex-Enough-Better/PromptPod/issues/new?template=bug_report.yml", 0) != 0 ||
+            issueUrl.size() > 1900) {
+            return 96;
+        }
+
+        // 6g. Packed version monotonic comparison for seamless newer-version single-instance takeover
+        uint32_t pv050 = PackAppVersion(0, 5, 0);
+        uint32_t pv060 = PackAppVersion(0, 6, 0);
+        uint32_t pv061 = PackAppVersion(0, 6, 1);
+        uint32_t pv100 = PackAppVersion(1, 0, 0);
+        if (!(0u < pv050 && pv050 < pv060 && pv060 < pv061 && pv061 < pv100)) return 97;
+    }
+
+    // 7. Verify DarkEditScrollbar with borderless multi-line EDIT (no native WS_VSCROLL)
+    {
+        HINSTANCE hInst = GetModuleHandleW(nullptr);
+        HWND hHost = CreateWindowExW(0, L"STATIC", L"", WS_POPUP | WS_CLIPCHILDREN,
+                                     0, 0, 480, 320, nullptr, nullptr, hInst, nullptr);
+        if (!hHost) return 98;
+        HWND hEd = CreateWindowExW(0, L"EDIT", L"Single line",
+                                   WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
+                                   26, 20, 400, 180, hHost, (HMENU)9001, hInst, nullptr);
+        HFONT hf = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                               CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+        int sbErr = 0;
+        if (!hEd || !hf) {
+            sbErr = 99;
+        } else {
+            SendMessageW(hEd, WM_SETFONT, (WPARAM)hf, TRUE);
+            DarkEditScrollbar sb;
+            sb.Attach(hHost, hEd);
+            sb.SetTrackLayout(D2D1::RectF(20.0f, 14.0f, 440.0f, 206.0f), 1.0f);
+
+            // 7a. Short text must hide scrollbar completely (no WS_VSCROLL chrome!)
+            DWORD style = (DWORD)GetWindowLongPtrW(hEd, GWL_STYLE);
+            D2D1_RECT_F thumb{};
+            auto mShort = sb.QueryMetrics();
+            if ((style & WS_VSCROLL) != 0 || mShort.maxFirstLine != 0 || sb.CanScroll() || sb.ComputeThumb(mShort, thumb)) {
+                sbErr = 100;
+            }
+
+            // 7b. Long 40-line content enables scrollbar, computes valid thumb, and supports clamped EM_LINESCROLL + wheel
+            if (sbErr == 0) {
+                std::wstring many;
+                for (int i = 1; i <= 40; ++i) {
+                    many += L"Prompt line " + std::to_wstring(i);
+                    if (i < 40) many += L"\r\n";
+                }
+                SetWindowTextW(hEd, many.c_str());
+                auto mLong = sb.QueryMetrics();
+                if (mLong.totalLines < 40 || mLong.visibleLines <= 0 || mLong.maxFirstLine <= 0 ||
+                    !sb.CanScroll() || !sb.ComputeThumb(mLong, thumb) ||
+                    thumb.top < sb.trackVisRect.top - 0.1f || thumb.bottom > sb.trackVisRect.bottom + 0.1f) {
+                    sbErr = 101;
+                }
+
+                // Wheel down one notch (-WHEEL_DELTA) must advance first visible line
+                if (sbErr == 0) {
+                    SendMessageW(hEd, WM_MOUSEWHEEL, MAKEWPARAM(0, -WHEEL_DELTA), 0);
+                    int afterWheel = sb.QueryMetrics().firstLine;
+                    if (afterWheel <= 0 || afterWheel > mLong.maxFirstLine) {
+                        sbErr = 102;
+                    }
+                }
+
+                // Scroll to bottom must clamp cleanly to maxFirstLine (never overscroll past content)
+                if (sbErr == 0) {
+                    sb.ScrollByLines(999);
+                    auto mBot = sb.QueryMetrics();
+                    if (mBot.firstLine != mBot.maxFirstLine) {
+                        sbErr = 103;
+                    }
+                    D2D1_RECT_F botThumb{};
+                    if (!sb.ComputeThumb(mBot, botThumb) || std::fabs(botThumb.bottom - sb.trackVisRect.bottom) > 0.5f) {
+                        sbErr = 104;
+                    }
+                    // Round-trip ThumbTopToLine at bottom and top
+                    int rtBot = sb.ThumbTopToLine(botThumb.top, mBot, botThumb.bottom - botThumb.top);
+                    int rtTop = sb.ThumbTopToLine(sb.trackVisRect.top, mBot, botThumb.bottom - botThumb.top);
+                    if (rtBot != mBot.maxFirstLine || rtTop != 0) {
+                        sbErr = 105;
+                    }
+                }
+
+                // Shrinking text back to 1 line must auto-reset firstLine to 0 and hide scrollbar
+                if (sbErr == 0) {
+                    SetWindowTextW(hEd, L"Short again");
+                    auto mBack = sb.QueryMetrics();
+                    if (mBack.firstLine != 0 || mBack.maxFirstLine != 0 || sb.CanScroll()) {
+                        sbErr = 106;
+                    }
+                }
+            }
+            sb.Detach();
+            if (GetPropW(hEd, DarkEditScrollbar::kPropName) != nullptr) {
+                sbErr = 107;
+            }
+        }
+        if (hHost) DestroyWindow(hHost);
+        if (hf) DeleteObject(hf);
+        if (sbErr != 0) return sbErr;
+    }
+
+    // 8. Verify v0.6.2 state-machine, transactional drag, menu owner/UIPI, data safety & feedback regressions
+    {
+        // 8a. Export path guard must block active data.json and data.json.bak (including case/slash variants)
+        std::wstring mixedDataPath = sm.dataFilePath;
+        for (auto& c : mixedDataPath) {
+            if (c == L'\\') c = L'/';
+            else if (c >= L'a' && c <= L'z') c = (wchar_t)(c - L'a' + L'A');
+        }
+        if (!sm.IsProtectedInternalPath(sm.dataFilePath) ||
+            !sm.IsProtectedInternalPath(mixedDataPath) ||
+            !sm.IsProtectedInternalPath(sm.backupFilePath) ||
+            sm.IsProtectedInternalPath(testDir + L"\\safe-export.json")) {
+            return 108;
+        }
+
+        // 8b. Verified pre-import snapshot created by SaveExplicitReplacement before replacing valid data.json
+        std::string beforeImportBytes;
+        if (!StorageManager::ReadAllBytes(sm.dataFilePath, beforeImportBytes) || beforeImportBytes.empty()) return 109;
+        AppState importedState = s2;
+        importedState.vault.push_back(PromptItem{ L"imp_01", L"Imported Title", L"Imported Body", 0, NowUnixSeconds(), 0 });
+        std::wstring snapPath, saveErr;
+        if (!sm.SaveExplicitReplacement(importedState, &snapPath, &saveErr) || snapPath.empty()) return 110;
+        std::string snapBytes;
+        if (!StorageManager::ReadAllBytes(snapPath, snapBytes) || snapBytes != beforeImportBytes) return 111;
+
+        // 8c. Read-only recovery distinction (recoveredFromBackup true vs false) + 1-click RestoreFromLastBackup
+        {
+            StorageManager recSm;
+            recSm.Init(testDir + L"\\recovery_bak_case");
+            AppState origState{};
+            if (!recSm.LoadOrSeed(origState)) return 112;
+            origState.vault[0].title = L"GoodBackupTitle";
+            if (!recSm.Save(origState)) return 113;
+            // Reload once cleanly to populate data.json.bak
+            AppState cleanReload{};
+            if (!recSm.LoadOrSeed(cleanReload)) return 114;
+
+            // Corrupt data.json while keeping valid data.json.bak
+            std::string corruptPayload = "{ \"schemaVersion\": 2, \"vault\": [ BROKEN ";
+            if (!StorageManager::WriteAllBytesAtomic(recSm.dataFilePath, corruptPayload)) return 115;
+
+            AppState fallbackState{};
+            if (recSm.LoadOrSeed(fallbackState)) return 116;
+            if (!recSm.readOnlyRecoveryMode || !recSm.recoveredFromBackup ||
+                fallbackState.vault.empty() || fallbackState.vault[0].title != L"GoodBackupTitle") {
+                return 117;
+            }
+            // RestoreFromLastBackup must archive corrupt file, restore .bak, and exit read-only mode
+            std::wstring restErr;
+            AppState restored{};
+            if (!recSm.RestoreFromLastBackup(restored, restErr) ||
+                recSm.readOnlyRecoveryMode || recSm.recoveredFromBackup ||
+                restored.vault.empty() || restored.vault[0].title != L"GoodBackupTitle") {
+                return 118;
+            }
+            // Corrupt data.json with NO .bak must set recoveredFromBackup = false
+            DeleteFileW(recSm.backupFilePath.c_str());
+            if (!StorageManager::WriteAllBytesAtomic(recSm.dataFilePath, corruptPayload)) return 119;
+            AppState noBakState{};
+            if (recSm.LoadOrSeed(noBakState)) return 120;
+            if (!recSm.readOnlyRecoveryMode || recSm.recoveredFromBackup) return 121;
+            DiagLogger::Instance().Init(sm.dataDir);
+        }
+
+        // 8d. Feedback URL overflow must report body truncation and NEVER silently chop user body
+        {
+            std::wstring hugeBody(2200, L'A');
+            bool bodyTruncated = false;
+            std::wstring url = BuildGitHubIssueUrl(true, L"长正文反馈", hugeBody, L"Windows 11", L"diag", &bodyTruncated);
+            if (!bodyTruncated || url.size() > 1900 || url.find(L"AAAAAAAAAAAA") != std::wstring::npos) {
+                return 122;
+            }
+        }
+
+        // 8e. Dock retract state machine + MenuOwner isolation + UIPI foreground auto-close + transactional drag + stall self-heal + press ownership
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        int smErr = 0;
+        {
+            DarkPopupMenu menu;
+            DockWindow dock2;
+            AppState st2 = s2;
+            st2.dockEdge = DockEdge::Right;
+            st2.ActiveSlots()[9].clear(); // Leave slot 10 empty to test empty-slot press-release ownership
+
+            if (!menu.Init(GetModuleHandleW(nullptr)) ||
+                !dock2.Init(GetModuleHandleW(nullptr), &st2, &sm, &menu, nullptr, nullptr, false)) {
+                smErr = 123;
+            } else {
+                RECT simMon{ 0, 0, 1920, 1080 };
+                RECT simWork{ 0, 0, 1920, 1040 };
+                dock2.monitorProvider = [&](POINT, RECT* outMon) -> RECT {
+                    if (outMon) *outMon = simMon;
+                    return simWork;
+                };
+                POINT simCursor{ 200, 200 }; // Far outside right-docked panel
+                BOOL simCursorOk = TRUE;
+                dock2.cursorPosProvider = [&](POINT* outPt) -> BOOL {
+                    if (!simCursorOk) return FALSE;
+                    if (outPt) *outPt = simCursor;
+                    return TRUE;
+                };
+                HWND simFg = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(0x1111));
+                menu.foregroundProvider = [&]() -> HWND { return simFg; };
+                menu.cursorPosProvider = [&](POINT* outPt) -> BOOL {
+                    if (outPt) *outPt = simCursor;
+                    return TRUE;
+                };
+
+                // (1) Vault-owned menu must NOT block DockWindow auto-collapse
+                dock2.ExpandAndReveal(0);
+                dock2.expandSpring.Snap(1.0f);
+                dock2.RenderAndPresent("selftest-v062-open");
+                if (dock2.holdOpenUntilTick != 0 || dock2.handleHovered) smErr = 124;
+
+                if (smErr == 0) {
+                    std::vector<DarkMenuItem> mItems = { DarkMenuItem::Action(1, L"测试项") };
+                    menu.ShowAt(POINT{ 400, 400 }, mItems, nullptr, 200.0f, MenuOwner::Vault);
+                    dock2.mouseOutsideSince = GetTickCount64() - 300;
+                    dock2.EvaluateCollapseState("selftest-vault-menu");
+                    if (!menu.IsOpenFor(MenuOwner::Vault) || dock2.expandSpring.target != 0.0f) {
+                        smErr = 125;
+                    }
+                    menu.Close();
+                }
+
+                // (2) Dock-owned menu blocks collapse while open, then UIPI foreground switch closes menu & retracts dock!
+                if (smErr == 0) {
+                    dock2.ExpandAndReveal(0);
+                    dock2.expandSpring.Snap(1.0f);
+                    dock2.RenderAndPresent("selftest-v062-dockmenu");
+                    std::vector<DarkMenuItem> mItems = { DarkMenuItem::Action(1, L"槽位菜单") };
+                    menu.ShowAt(POINT{ 1700, 400 }, mItems, nullptr, 200.0f, MenuOwner::Dock);
+                    dock2.mouseOutsideSince = GetTickCount64() - 300;
+                    dock2.EvaluateCollapseState("selftest-dock-menu-open");
+                    if (!menu.IsOpenFor(MenuOwner::Dock) || dock2.expandSpring.target < 0.5f) {
+                        smErr = 126;
+                    }
+                    // Simulate Alt+Tab / elevated window foreground change (UIPI)
+                    simFg = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(0x2222));
+                    dock2.mouseOutsideSince = GetTickCount64() - 300;
+                    menu.OnPollTimer();
+                    if (menu.IsOpen() || dock2.expandSpring.target != 0.0f) {
+                        smErr = 127;
+                    }
+                }
+
+                // (3) Transactional header drag: move 10px then WM_CAPTURECHANGED -> MUST roll back to DockEdge::Right!
+                if (smErr == 0) {
+                    dock2.ExpandAndReveal(0);
+                    dock2.expandSpring.Snap(1.0f);
+                    dock2.RenderAndPresent("selftest-v062-drag");
+                    int hdrX = (int)std::round((Theme::ShadowPad + Theme::PanelWidth * 0.5f) * dock2.dpiScale);
+                    int hdrY = (int)std::round((Theme::ShadowPad + 16.0f) * dock2.dpiScale);
+                    SendMessageW(dock2.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(hdrX, hdrY));
+                    SendMessageW(dock2.hwnd, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(hdrX - 12, hdrY));
+                    if (!dock2.isDragging || !dock2.dragPreviewFloating || st2.dockEdge != DockEdge::Right) {
+                        smErr = 128; // Must NOT mutate dockEdge during WM_MOUSEMOVE preview!
+                    }
+                    SendMessageW(dock2.hwnd, WM_CAPTURECHANGED, 0, 0);
+                    if (dock2.isDragging || dock2.dragPreviewFloating || st2.dockEdge != DockEdge::Right) {
+                        smErr = 129; // Must roll back cleanly on capture loss!
+                    }
+                }
+
+                // (4) Stale kTimerAutoRetract generation invalidated by ExpandAndReveal(0)
+                if (smErr == 0) {
+                    dock2.clipboardWriter = [](const std::wstring&) { return true; };
+                    dock2.ExpandAndReveal(0);
+                    dock2.expandSpring.Snap(1.0f);
+                    dock2.RenderAndPresent("selftest-v062-gen");
+                    dock2.TriggerSlotCopy(0);
+                    if (!dock2.pendingAutoRetract) smErr = 130;
+                    uint64_t armedGen = dock2.pendingAutoRetractGen;
+                    dock2.ExpandAndReveal(0); // Increments retractGen and cancels stale pending retract
+                    dock2.pendingAutoRetract = true;
+                    dock2.pendingAutoRetractGen = armedGen; // Re-inject stale gen to verify WM_TIMER rejects it
+                    SendMessageW(dock2.hwnd, WM_TIMER, DockWindow::kTimerAutoRetract, 0);
+                    if (dock2.expandSpring.target < 0.5f) {
+                        smErr = 131;
+                    }
+                    dock2.pendingAutoRetract = false;
+                }
+
+                // (5) Docked-side physical edge bridge (Fitts's Law) + strict inner/vertical/multi-monitor bounds + GetCursorPos fail-closed
+                if (smErr == 0) {
+                    dock2.ExpandAndReveal(0);
+                    dock2.expandSpring.Snap(1.0f);
+                    dock2.RenderAndPresent("selftest-v081-edge-right");
+                    int midY = dock2.curWinY + dock2.curWinH / 2;
+                    int cardLeftPx = dock2.curWinX + (int)std::round(Theme::ShadowPad * dock2.dpiScale);
+                    int cardTopPx = dock2.curWinY + (int)std::round(Theme::ShadowPad * dock2.dpiScale);
+
+                    // Right physical edge pixel (1919) MUST keep expanded panel open (both settled & mid-slide!)
+                    simCursor = POINT{ 1919, midY };
+                    if (!dock2.IsCursorInsideInteractivePanel()) smErr = 132;
+                    if (smErr == 0) {
+                        dock2.mouseOutsideSince = GetTickCount64() - 400;
+                        dock2.EvaluateCollapseState("selftest-right-edge-stay");
+                        if (dock2.expandSpring.target < 0.5f) smErr = 132;
+                    }
+                    if (smErr == 0) {
+                        dock2.expandSpring.value = 0.05f; // Early expand animation frame
+                        if (!dock2.IsCursorInsideInteractivePanel()) smErr = 132;
+                        dock2.expandSpring.Snap(1.0f);
+                    }
+                    // Crossing to adjacent right monitor (x=1920), inner left outside card, or vertically outside card MUST return false
+                    if (smErr == 0) {
+                        simCursor = POINT{ 1920, midY };
+                        if (dock2.IsCursorInsideInteractivePanel()) smErr = 132;
+                    }
+                    if (smErr == 0) {
+                        simCursor = POINT{ cardLeftPx - 2, midY };
+                        if (dock2.IsCursorInsideInteractivePanel()) smErr = 132;
+                    }
+                    if (smErr == 0) {
+                        simCursor = POINT{ 1919, cardTopPx - 5 };
+                        if (dock2.IsCursorInsideInteractivePanel()) smErr = 132;
+                    }
+
+                    // Mirror verification for DockEdge::Left (x=0 stays open, x=-1 adjacent monitor & inner-right leave)
+                    if (smErr == 0) {
+                        st2.dockEdge = DockEdge::Left;
+                        dock2.RenderAndPresent("selftest-v081-edge-left");
+                        int cardRightPx = dock2.curWinX + (int)std::round((Theme::ShadowPad + Theme::PanelWidth) * dock2.dpiScale);
+                        simCursor = POINT{ 0, midY };
+                        if (!dock2.IsCursorInsideInteractivePanel()) smErr = 132;
+                        simCursor = POINT{ -1, midY };
+                        if (smErr == 0 && dock2.IsCursorInsideInteractivePanel()) smErr = 132;
+                        simCursor = POINT{ cardRightPx + 2, midY };
+                        if (smErr == 0 && dock2.IsCursorInsideInteractivePanel()) smErr = 132;
+                        st2.dockEdge = DockEdge::Right;
+                        dock2.RenderAndPresent("selftest-v081-edge-restore");
+                    }
+
+                    // GetCursorPos failure must remain fail-closed
+                    simCursorOk = FALSE;
+                    if (smErr == 0 && dock2.IsCursorInsideInteractivePanel()) {
+                        smErr = 133;
+                    }
+                    simCursorOk = TRUE;
+                    simCursor = POINT{ 200, 200 };
+                }
+
+                // (6) Watchdog expanded-state stall self-heal when leave-watch timer was dropped
+                if (smErr == 0) {
+                    dock2.ExpandAndReveal(0);
+                    dock2.expandSpring.Snap(1.0f);
+                    dock2.RenderAndPresent("selftest-v062-stall");
+                    dock2.animRunning = false;
+                    dock2.StopLeaveWatchTimer();
+                    dock2.mouseOutsideSince = GetTickCount64() - 400;
+                    dock2.OnWatchdogTimer();
+                    if (dock2.expandSpring.target != 0.0f) {
+                        smErr = 134;
+                    }
+                }
+
+                // (7) Press-release ownership: stray WM_LBUTTONUP on empty slot 10 without WM_LBUTTONDOWN must NOT open menu!
+                if (smErr == 0) {
+                    dock2.ExpandAndReveal(0);
+                    dock2.expandSpring.Snap(1.0f);
+                    dock2.RenderAndPresent("selftest-v062-press");
+                    float emptyCx = Theme::ShadowPad + Theme::PanelWidth * 0.5f;
+                    float emptyCy = Theme::ShadowPad + Theme::HeaderHeight +
+                                    9.0f * (Theme::SlotHeight + Theme::SlotGap) + Theme::SlotHeight * 0.5f;
+                    LPARAM lpEmpty = MAKELPARAM((short)std::round(emptyCx * dock2.dpiScale),
+                                                (short)std::round(emptyCy * dock2.dpiScale));
+                    SendMessageW(dock2.hwnd, WM_LBUTTONUP, 0, lpEmpty);
+                    if (menu.IsOpen()) {
+                        smErr = 135;
+                    }
+                }
+
+                if (dock2.hoverBubble.hwnd) DestroyWindow(dock2.hoverBubble.hwnd);
+                if (dock2.hwnd) DestroyWindow(dock2.hwnd);
+                if (menu.hwnd) DestroyWindow(menu.hwnd);
+            }
+        }
+        CoUninitialize();
+        if (smErr != 0) return smErr;
+    }
+
+    // 9. Verify v0.7.0 onboarding, AutoStart stale-path detection, Vault decoupling/undo/duplicate,
+    //    quick-swap sorting, multi-monitor anchor, short-screen scroll clamp & DarkPopupMenu keyboard nav
+    {
+        // 9a. AutoStart::GetStatus distinguishes Disabled / StaleOtherPath / EnabledCurrent
+        wchar_t staleRegVal[96]{};
+        wsprintfW(staleRegVal, L"PromptPod_StaleTest_%lu_%llu", (unsigned long)GetCurrentProcessId(), (unsigned long long)GetTickCount64());
+        if (AutoStart::GetStatus(staleRegVal) != AutoStart::Status::Disabled) return 136;
+        HKEY hKey = nullptr;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, AutoStart::kRunSubKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
+            const wchar_t* fakeMoved = L"\"C:\\OldMovedFolder\\PromptPod.exe\" --autostart";
+            RegSetValueExW(hKey, staleRegVal, 0, REG_SZ, reinterpret_cast<const BYTE*>(fakeMoved),
+                           (DWORD)((wcslen(fakeMoved) + 1) * sizeof(wchar_t)));
+            RegCloseKey(hKey);
+        }
+        if (AutoStart::GetStatus(staleRegVal) != AutoStart::Status::StaleOtherPath || AutoStart::IsEnabled(staleRegVal)) {
+            AutoStart::SetEnabled(false, staleRegVal);
+            return 137;
+        }
+        if (!AutoStart::SetEnabled(true, staleRegVal) || AutoStart::GetStatus(staleRegVal) != AutoStart::Status::EnabledCurrent) {
+            AutoStart::SetEnabled(false, staleRegVal);
+            return 138;
+        }
+        AutoStart::SetEnabled(false, staleRegVal);
+
+        // 9b. VaultWindow::ReorderVaultItemOnly must reorder vault WITHOUT mutating active slots!
+        AppState decSt{};
+        StorageManager::SeedDefaults(decSt, false);
+        auto origSlots = decSt.ActiveSlots();
+        if (!VaultWindow::ReorderVaultItemOnly(decSt, 0, 1)) return 139;
+        if (decSt.vault[0].id != L"seed_02" || decSt.vault[1].id != L"seed_01" || decSt.ActiveSlots() != origSlots) {
+            return 140;
+        }
+
+        // 9c. VaultWindow DeletePromptWithUndo + UndoLastDelete + DuplicatePrompt
+        StorageManager vSm;
+        vSm.Init(testDir + L"\\vault_ux_case");
+        AppState vSt{};
+        if (!vSm.LoadOrSeed(vSt)) return 141;
+        vSt.vault[0].useCount = 7;
+        vSm.Save(vSt);
+
+        VaultWindow vw;
+        vw.state = &vSt;
+        vw.storage = &vSm;
+        if (!vw.DeletePromptWithUndo(L"seed_01")) return 142;
+        if (vSt.vault.size() != 11 || !vSt.ActiveSlots()[0].empty() || !vw.undoDelete.active) return 143;
+        if (!vw.UndoLastDelete()) return 144;
+        if (vSt.vault.size() != 12 || vSt.vault[0].id != L"seed_01" || vSt.vault[0].useCount != 7 || vSt.ActiveSlots()[0] != L"seed_01") {
+            return 145;
+        }
+        if (!vw.DuplicatePrompt(L"seed_01") || vSt.vault.size() != 13 || vSt.vault[1].useCount != 0 ||
+            vSt.FindSlotOfId(vSt.vault[1].id) != -1) {
+            return 146;
+        }
+        DiagLogger::Instance().Init(sm.dataDir);
+
+        // 9d. Search context snippet centers around a late body match
+        std::wstring longBody(80, L'x');
+        longBody += L" TARGET_NEEDLE_XYZ ";
+        longBody += std::wstring(60, L'y');
+        std::wstring snip = BuildSearchPreviewSnippet(longBody, L"target_needle", 80);
+        if (snip.rfind(L"...", 0) != 0 || snip.find(L"TARGET_NEEDLE_XYZ") == std::wstring::npos) return 147;
+
+        // 9e. DockWindow::SelectQuickSwapCandidates sorts unmounted items by lastUsedAt desc, then useCount desc
+        AppState swapSt{};
+        StorageManager::SeedDefaults(swapSt, false);
+        swapSt.vault[4].useCount = 15; swapSt.vault[4].lastUsedAt = 100;
+        swapSt.vault[6].useCount = 2;  swapSt.vault[6].lastUsedAt = 500;
+        swapSt.vault[8].useCount = 9;  swapSt.vault[8].lastUsedAt = 100;
+        auto cands = DockWindow::SelectQuickSwapCandidates(swapSt, 6);
+        if (cands.size() != 6 || cands[0]->id != L"seed_07" || cands[1]->id != L"seed_05" || cands[2]->id != L"seed_09") {
+            return 148;
+        }
+
+        // 9f-9i. Onboarding flow, multi-monitor anchor, short-screen clamp & DarkPopupMenu keyboard nav
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        int v7Err = 0;
+        {
+            DarkPopupMenu menu7;
+            DockWindow dock7;
+            AppState st7{};
+            StorageManager::SeedDefaults(st7, false);
+            st7.onboardingCompleted = false;
+            st7.hasDockAnchor = true;
+            st7.dockAnchorX = 2500;
+            st7.dockAnchorY = 500;
+
+            if (!menu7.Init(GetModuleHandleW(nullptr)) ||
+                !dock7.Init(GetModuleHandleW(nullptr), &st7, &sm, &menu7, nullptr, nullptr, false)) {
+                v7Err = 149;
+            } else {
+                // 9g. Multi-monitor anchor must query secondary monitor refPt (2500, 500) before first present!
+                POINT capturedRef{ 0, 0 };
+                RECT secMon{ 1920, 0, 3840, 1080 };
+                RECT secWork{ 1920, 0, 3840, 1040 };
+                dock7.hasPresentedOnce = false;
+                dock7.monitorProvider = [&](POINT ref, RECT* outMon) -> RECT {
+                    capturedRef = ref;
+                    if (outMon) *outMon = secMon;
+                    return secWork;
+                };
+                dock7.RenderAndPresent("selftest-anchor");
+                if (capturedRef.x != 2500 || capturedRef.y != 500 || dock7.curWinX != (3840 - dock7.curWinW)) {
+                    v7Err = 150;
+                }
+
+                // 9f. Onboarding keeps panel open during Step 1 copy, advances step1Done, and finishes with capsule glow
+                if (v7Err == 0) {
+                    dock7.clipboardWriter = [](const std::wstring&) { return true; };
+                    POINT farOut{ 100, 100 };
+                    dock7.cursorPosProvider = [&](POINT* outPt) -> BOOL { if (outPt) *outPt = farOut; return TRUE; };
+                    dock7.StartOnboarding(false);
+                    dock7.mouseOutsideSince = GetTickCount64() - 500;
+                    dock7.EvaluateCollapseState("selftest-onboard-open");
+                    if (!dock7.IsOnboardingActive() || dock7.expandSpring.target < 0.5f) {
+                        v7Err = 151;
+                    }
+                    dock7.TriggerSlotCopy(0);
+                    if (!dock7.onboardingWnd.step1Done || dock7.pendingAutoRetract) {
+                        v7Err = 152;
+                    }
+                    dock7.FinishOnboarding(true);
+                    if (dock7.IsOnboardingActive() || !st7.onboardingCompleted ||
+                        dock7.expandSpring.target != 0.0f || dock7.capsuleBreathStartTick == 0) {
+                        v7Err = 153;
+                    }
+                }
+
+                // 9h. Short-screen work area height clamp (e.g. 1366x768 @ 150% -> ~480 DIP work height)
+                if (v7Err == 0) {
+                    RECT shortMon{ 0, 0, 910, 512 };
+                    RECT shortWork{ 0, 0, 910, 440 };
+                    dock7.monitorProvider = [&](POINT, RECT* outMon) -> RECT {
+                        if (outMon) *outMon = shortMon;
+                        return shortWork;
+                    };
+                    dock7.expandSpring.Snap(1.0f);
+                    dock7.RenderAndPresent("selftest-short-screen");
+                    if (dock7.curPanelHeightDip >= Theme::PanelHeight() - 10.0f ||
+                        dock7.maxSlotScrollDip <= 10.0f) {
+                        v7Err = 154;
+                    }
+                    SendMessageW(dock7.hwnd, WM_MOUSEWHEEL, MAKEWPARAM(0, -WHEEL_DELTA), 0);
+                    if (dock7.slotScrollDip <= 0.1f || dock7.slotScrollDip > dock7.maxSlotScrollDip) {
+                        v7Err = 155;
+                    }
+                }
+
+                // 9i. DarkPopupMenu keyboard navigation (VK_DOWN skips header/separator, VK_RETURN fires callback)
+                if (v7Err == 0) {
+                    int chosenCmd = -1;
+                    std::vector<DarkMenuItem> kbItems = {
+                        DarkMenuItem::Header(L"分组"),
+                        DarkMenuItem::Separator(),
+                        DarkMenuItem::Action(42, L"第一项"),
+                        DarkMenuItem::Action(99, L"第二项")
+                    };
+                    menu7.ShowAt(POINT{ 400, 400 }, kbItems, [&](int cmd) { chosenCmd = cmd; }, 200.0f, MenuOwner::Tray);
+                    SendMessageW(menu7.hwnd, WM_KEYDOWN, VK_DOWN, 0);
+                    SendMessageW(menu7.hwnd, WM_KEYDOWN, VK_DOWN, 0);
+                    SendMessageW(menu7.hwnd, WM_KEYDOWN, VK_RETURN, 0);
+                    if (chosenCmd != 99 || menu7.IsOpen()) {
+                        v7Err = 156;
+                    }
+                }
+
+                if (dock7.hoverBubble.hwnd) DestroyWindow(dock7.hoverBubble.hwnd);
+                if (dock7.hwnd) DestroyWindow(dock7.hwnd);
+                if (menu7.hwnd) DestroyWindow(menu7.hwnd);
+            }
+        }
+        CoUninitialize();
+        if (v7Err != 0) return v7Err;
+    }
+
+    // 10. Verify v0.10.0 Multi-Select 4-Scene Deck (schema v4, visual width units, lossless v2/v3 seed upgrade,
+    //     non-contiguous multi-select, scene prompt assign/remove, 4-scene cascade undo, sanitized diag & DockWindow 1..4 scenes)
+    {
+        // 10a. VisualWidthUnits, IsValidSceneName & ClampSceneName boundary checks (4 default names)
+        if (VisualWidthUnits(L"深度复盘") != 8 || !IsValidSceneName(L"深度复盘")) return 160;
+        if (VisualWidthUnits(L"深度复盘啊") != 10 || IsValidSceneName(L"深度复盘啊")) return 161;
+        if (ClampSceneName(L"深度复盘啊", 0) != L"深度复盘") return 162;
+        if (VisualWidthUnits(L"Coding01") != 8 || !IsValidSceneName(L"Coding01")) return 163;
+        if (VisualWidthUnits(L"Coding012") != 9 || IsValidSceneName(L"Coding012")) return 164;
+        if (ClampSceneName(L"Coding012", 1) != L"Coding01") return 165;
+        if (VisualWidthUnits(L"AI开发者") != 8 || !IsValidSceneName(L"AI开发者") || IsValidSceneName(L"AI开发者1")) return 166;
+        if (IsValidSceneName(L"") || IsValidSceneName(L"   ") || IsValidSceneName(L"A\nB") ||
+            ClampSceneName(L"   ", 1) != L"产品" || ClampSceneName(L"   ", 2) != L"开发" || ClampSceneName(L"   ", 3) != L"写作") return 167;
+
+        // 10b. Legacy v2 -> v4 lossless upgrade: preserves data.v2.bak.json, adds seed_11/seed_12, initializes empty Scene 1 ("产品"),
+        //      and NEVER resurrects deleted seed_11 after upgrade!
+        StorageManager mSm;
+        mSm.Init(testDir + L"\\v2_migrate_case");
+        std::string v2Json = "{\"schemaVersion\":2,\"dockEdge\":2,\"dockRatioMilli\":3200,\"showHoverBubble\":true,"
+                             "\"slots\":[\"p1\",\"p2\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\"],"
+                             "\"vault\":[{\"id\":\"p1\",\"title\":\"T1\",\"content\":\"Body1\",\"useCount\":4,\"createdAt\":1,\"lastUsedAt\":2},"
+                             "{\"id\":\"p2\",\"title\":\"T2\",\"content\":\"Body2\",\"useCount\":2,\"createdAt\":1,\"lastUsedAt\":3}]}";
+        if (!StorageManager::WriteAllBytesAtomic(mSm.dataFilePath, v2Json)) return 168;
+        AppState mSt{};
+        if (!mSm.LoadOrSeed(mSt)) return 169;
+        if (mSt.schemaVersion != 4 || mSt.seedPackRev != kCurrentSeedPackRev ||
+            mSt.vault.size() != 4 || !mSt.FindById(L"seed_11") || !mSt.FindById(L"seed_12") ||
+            mSt.scenes[0].slots[0] != L"p1" || mSt.scenes[0].slots[1] != L"p2" ||
+            mSt.scenes[0].name != L"通用" || !mSt.scenes[0].enabled ||
+            mSt.scenes[1].name != L"产品" || !mSt.scenes[1].enabled ||
+            mSt.scenes[1].slots[0] != L"seed_11" || mSt.scenes[1].slots[1] != L"seed_12" ||
+            mSt.scenes[2].enabled || mSt.scenes[3].enabled) return 170;
+
+        std::string v2BakOnDisk, v4OnDisk;
+        if (!StorageManager::ReadAllBytes(mSm.dataDir + L"\\data.v2.bak.json", v2BakOnDisk) || v2BakOnDisk != v2Json) return 172;
+        if (!StorageManager::ReadAllBytes(mSm.dataFilePath, v4OnDisk) || v4OnDisk.find("\"schemaVersion\": 4") == std::string::npos) return 173;
+
+        // Verify deleting seed_11 after upgrade stays deleted across reload (seedPackRev prevents resurrection)
+        {
+            AppState delCheck = mSt;
+            delCheck.RemoveFromScene(1, L"seed_11");
+            delCheck.vault.erase(std::remove_if(delCheck.vault.begin(), delCheck.vault.end(),
+                [](const PromptItem& x) { return x.id == L"seed_11"; }), delCheck.vault.end());
+            if (!mSm.Save(delCheck)) return 171;
+            AppState reloaded{};
+            if (!mSm.LoadOrSeed(reloaded) || reloaded.FindById(L"seed_11") != nullptr || reloaded.FindById(L"seed_12") == nullptr) return 171;
+            if (!mSm.Save(mSt)) return 171;
+        }
+
+        // 10b-v3. Legacy v3 user who ALREADY populated Scene 1 ("思考" with p1) must NOT have Scene 1 overwritten!
+        {
+            StorageManager v3Sm;
+            v3Sm.Init(testDir + L"\\v3_nonoverwrite_case");
+            std::string v3Json = "{\"schemaVersion\":3,\"dockEdge\":2,\"dockRatioMilli\":3200,\"showHoverBubble\":true,"
+                                 "\"multiSceneEnabled\":true,\"sceneCount\":2,\"activeSceneIndex\":1,"
+                                 "\"scenes\":[{\"name\":\"通用\",\"slots\":[\"p1\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\"]},"
+                                 "{\"name\":\"思考\",\"slots\":[\"p2\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\"]},"
+                                 "{\"name\":\"开发\",\"slots\":[\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\"]}],"
+                                 "\"vault\":[{\"id\":\"p1\",\"title\":\"T1\",\"content\":\"B1\",\"useCount\":1,\"createdAt\":1,\"lastUsedAt\":1},"
+                                 "{\"id\":\"p2\",\"title\":\"T2\",\"content\":\"B2\",\"useCount\":1,\"createdAt\":1,\"lastUsedAt\":1}]}";
+            if (!StorageManager::WriteAllBytesAtomic(v3Sm.dataFilePath, v3Json)) return 195;
+            AppState v3St{};
+            if (!v3Sm.LoadOrSeed(v3St)) return 196;
+            if (v3St.vault.size() != 4 || !v3St.FindById(L"seed_11") || !v3St.FindById(L"seed_12") ||
+                v3St.scenes[1].name != L"思考" || v3St.scenes[1].slots[0] != L"p2" ||
+                !v3St.scenes[0].enabled || !v3St.scenes[1].enabled || v3St.scenes[2].enabled || v3St.scenes[3].enabled ||
+                v3St.activeSceneIndex != 1) return 197;
+            std::string v3Bak;
+            if (!StorageManager::ReadAllBytes(v3Sm.dataDir + L"\\data.v3.bak.json", v3Bak) || v3Bak != v3Json) return 198;
+            DiagLogger::Instance().Init(sm.dataDir);
+        }
+
+        // 10c. 4-scene multi-select, at-least-1 guard, cross-scene sharing, AssignToSceneFirstEmpty/RemoveFromScene,
+        //      v2 compat export, sanitized diagnostics & 4-scene cascade delete/undo
+        mSt.SetSceneEnabled(0, true);
+        mSt.SetSceneEnabled(1, true);
+        mSt.SetSceneEnabled(2, true);
+        mSt.SetSceneEnabled(3, true);
+        mSt.scenes[1].name = L"SecPrj"; // 6 ASCII units, tests sanitized diagnostics non-leak
+        mSt.scenes[2].name = L"Coding";
+        mSt.scenes[3].name = L"写作";
+        mSt.scenes[1].slots[0] = L"p1"; // Same Prompt ID shared across all 4 scenes
+        mSt.scenes[1].slots[1] = L"p1"; // Duplicate within same scene -> must be cleared by SanitizeSlots
+        mSt.scenes[2].slots[3] = L"p1";
+        mSt.scenes[2].slots[0] = L"p2";
+        if (mSt.AssignToSceneFirstEmpty(3, L"p1") != 0) return 174;
+        mSt.SanitizeSlots();
+        if (mSt.scenes[0].slots[0] != L"p1" || mSt.scenes[1].slots[0] != L"p1" || !mSt.scenes[1].slots[1].empty() ||
+            mSt.scenes[2].slots[3] != L"p1" || mSt.scenes[3].slots[0] != L"p1" ||
+            mSt.CountOtherEnabledScenesWithId(L"p1") != 3) return 174;
+
+        // Unchecking 3 scenes leaves 1; attempting to uncheck the last scene MUST fail cleanly while preserving hidden scenes!
+        mSt.activeSceneIndex = 3;
+        if (!mSt.SetSceneEnabled(1, false) || !mSt.SetSceneEnabled(2, false) || !mSt.SetSceneEnabled(3, false)) return 175;
+        if (mSt.ToggleSceneEnabled(0)) return 175; // Cannot disable the only enabled scene!
+        if (mSt.EffectiveActiveSceneIndex() != 0 || mSt.EnabledSceneCount() != 1 || mSt.IsMultiSceneActive() ||
+            mSt.scenes[1].name != L"SecPrj" || mSt.scenes[2].slots[3] != L"p1" || mSt.scenes[3].slots[0] != L"p1") return 175;
+
+        // Non-contiguous subset {0, 2, 3}
+        mSt.SetSceneEnabled(2, true);
+        mSt.SetSceneEnabled(3, true);
+        int visSub[kMaxScenes]{};
+        if (mSt.GetEnabledScenes(visSub) != 3 || visSub[0] != 0 || visSub[1] != 2 || visSub[2] != 3) return 176;
+        mSt.SetSceneEnabled(1, true);
+        if (!mSm.Save(mSt)) return 177;
+
+        // v2 compat export preserves all vault items + scenes[0].slots without scenes key
+        std::string v2Export = SerializeStateToJson(mSt, true);
+        AppState v2Parsed{};
+        if (v2Export.find("\"schemaVersion\": 2") == std::string::npos || v2Export.find("\"scenes\"") != std::string::npos ||
+            !ParseStateFromJson(v2Export, v2Parsed) || v2Parsed.vault.size() != 4 || v2Parsed.scenes[0].slots[0] != L"p1") return 178;
+
+        // Sanitized diagnostics reports multiScene state WITHOUT leaking custom scene name ("SecPrj")
+        std::wstring msDiag = BuildSanitizedDiagnostics(mSt, mSm, false);
+        if (msDiag.find(L"multiScene=on(count=4,active=0)") == std::wstring::npos || msDiag.find(L"SecPrj") != std::wstring::npos) return 179;
+
+        // Cascade delete across all 4 scenes + undo restores all 4 scenes
+        VaultWindow vwMs;
+        vwMs.state = &mSt;
+        vwMs.storage = &mSm;
+        if (!vwMs.DeletePromptWithUndo(L"p1")) return 180;
+        if (!mSt.scenes[0].slots[0].empty() || !mSt.scenes[1].slots[0].empty() ||
+            !mSt.scenes[2].slots[3].empty() || !mSt.scenes[3].slots[0].empty()) return 181;
+        if (!vwMs.UndoLastDelete()) return 182;
+        if (mSt.scenes[0].slots[0] != L"p1" || mSt.scenes[1].slots[0] != L"p1" ||
+            mSt.scenes[2].slots[3] != L"p1" || mSt.scenes[3].slots[0] != L"p1") return 183;
+
+        // 10e. DockWindow single-scene (471 DIP), non-contiguous 2-scene ({0,2}), 4-scene (507 DIP, 5 DIP gap),
+        //      click/wheel scene switch, isolated copy/drag & panel right-click app menu
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        int v8Err = 0;
+        {
+            DockWindow dock8;
+            std::wstring clip8;
+            int appMenuCalls = 0;
+            dock8.clipboardWriter = [&](const std::wstring& txt) -> bool { clip8 = txt; return true; };
+            mSt.SetSceneEnabled(1, false);
+            mSt.SetSceneEnabled(2, false);
+            mSt.SetSceneEnabled(3, false);
+            if (!dock8.Init(GetModuleHandleW(nullptr), &mSt, &mSm, nullptr, nullptr,
+                            [&](POINT) { ++appMenuCalls; }, false)) {
+                v8Err = 184;
+            } else {
+                RECT simMon{ 0, 0, 1920, 1080 };
+                RECT simWork{ 0, 0, 1920, 1040 };
+                dock8.monitorProvider = [&](POINT, RECT* outMon) -> RECT {
+                    if (outMon) *outMon = simMon;
+                    return simWork;
+                };
+                dock8.expandSpring.Snap(1.0f);
+                dock8.RenderAndPresent("selftest-v10-single");
+                if (std::fabs(dock8.curPanelHeightDip - 471.0f) > 0.5f) v8Err = 185;
+
+                // Right-clicking panel margin triggers app menu
+                if (v8Err == 0) {
+                    D2D1_RECT_F pb8 = dock8.PanelBoxDip();
+                    LPARAM lpMargin = MAKELPARAM((short)std::round((pb8.left + 4.0f) * dock8.dpiScale),
+                                                 (short)std::round((pb8.bottom - 4.0f) * dock8.dpiScale));
+                    SendMessageW(dock8.hwnd, WM_RBUTTONUP, 0, lpMargin);
+                    if (appMenuCalls != 1) v8Err = 193;
+                }
+
+                // Non-contiguous subset {0, 2}: clicking button pos 1 switches directly to Scene 2!
+                if (v8Err == 0) {
+                    mSt.SetSceneEnabled(2, true);
+                    mSt.activeSceneIndex = 0;
+                    mSt.scenes[2].slots[0] = L"p2";
+                    mSt.scenes[2].slots[1] = L"p1";
+                    dock8.RenderAndPresent("selftest-v10-subset");
+                    if (std::fabs(dock8.curPanelHeightDip - 507.0f) > 0.5f) v8Err = 186;
+                    D2D1_RECT_F b1 = dock8.SceneBtnRectDip(1, 2);
+                    LPARAM lpB1 = MAKELPARAM((short)std::round(((b1.left + b1.right) * 0.5f) * dock8.dpiScale),
+                                             (short)std::round(((b1.top + b1.bottom) * 0.5f) * dock8.dpiScale));
+                    SendMessageW(dock8.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lpB1);
+                    SendMessageW(dock8.hwnd, WM_LBUTTONUP, 0, lpB1);
+                    if (mSt.activeSceneIndex != 2) v8Err = 187;
+
+                    D2D1_RECT_F sl0 = dock8.SlotRectDip(0);
+                    LPARAM lpSl0 = MAKELPARAM((short)std::round(((sl0.left + sl0.right) * 0.5f) * dock8.dpiScale),
+                                              (short)std::round(((sl0.top + sl0.bottom) * 0.5f) * dock8.dpiScale));
+                    SendMessageW(dock8.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lpSl0);
+                    SendMessageW(dock8.hwnd, WM_LBUTTONUP, 0, lpSl0);
+                    if (clip8 != L"Body2") v8Err = 188;
+
+                    // Drag slot 0 -> slot 1 in Scene 2 must NOT disturb Scene 0
+                    D2D1_RECT_F sl1 = dock8.SlotRectDip(1);
+                    LPARAM lpSl1 = MAKELPARAM((short)std::round(((sl1.left + sl1.right) * 0.5f) * dock8.dpiScale),
+                                              (short)std::round(((sl1.top + sl1.bottom) * 0.5f) * dock8.dpiScale));
+                    SendMessageW(dock8.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lpSl0);
+                    SendMessageW(dock8.hwnd, WM_MOUSEMOVE, MK_LBUTTON, lpSl1);
+                    SendMessageW(dock8.hwnd, WM_LBUTTONUP, 0, lpSl1);
+                    if (mSt.scenes[2].slots[0] != L"p1" || mSt.scenes[2].slots[1] != L"p2" || mSt.scenes[0].slots[0] != L"p1") {
+                        v8Err = 189;
+                    }
+                }
+
+                // All 4 scenes enabled -> 5 DIP gap, flush PaddingX alignment, click 4th button -> Scene 3, wheel cycles 3 -> 0
+                if (v8Err == 0) {
+                    mSt.SetSceneEnabled(1, true);
+                    mSt.SetSceneEnabled(3, true);
+                    dock8.RenderAndPresent("selftest-v10-four");
+                    D2D1_RECT_F pb8 = dock8.PanelBoxDip();
+                    D2D1_RECT_F s0r = dock8.SceneBtnRectDip(0, 4);
+                    D2D1_RECT_F s1r = dock8.SceneBtnRectDip(1, 4);
+                    D2D1_RECT_F s3r = dock8.SceneBtnRectDip(3, 4);
+                    if (std::fabs((s0r.bottom - s0r.top) - 26.0f) > 0.2f ||
+                        std::fabs((s1r.left - s0r.right) - 5.0f) > 0.2f ||
+                        std::fabs(s0r.left - (pb8.left + Theme::PaddingX)) > 0.2f ||
+                        std::fabs(s3r.right - (pb8.right - Theme::PaddingX)) > 0.2f) {
+                        v8Err = 194;
+                    }
+                    LPARAM lpS3 = MAKELPARAM((short)std::round(((s3r.left + s3r.right) * 0.5f) * dock8.dpiScale),
+                                             (short)std::round(((s3r.top + s3r.bottom) * 0.5f) * dock8.dpiScale));
+                    SendMessageW(dock8.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lpS3);
+                    SendMessageW(dock8.hwnd, WM_LBUTTONUP, 0, lpS3);
+                    if (mSt.activeSceneIndex != 3) v8Err = 190;
+
+                    D2D1_RECT_F sb = dock8.SceneBarBoxDip();
+                    int sx = dock8.curWinX + (int)std::round(((sb.left + sb.right) * 0.5f) * dock8.dpiScale);
+                    int sy = dock8.curWinY + (int)std::round(((sb.top + sb.bottom) * 0.5f) * dock8.dpiScale);
+                    SendMessageW(dock8.hwnd, WM_MOUSEWHEEL, MAKEWPARAM(0, -WHEEL_DELTA), MAKELPARAM((short)sx, (short)sy));
+                    if (mSt.activeSceneIndex != 0) v8Err = 191;
+                }
+
+                // Back to single checked scene -> height restores cleanly to compact 471 DIP
+                if (v8Err == 0) {
+                    mSt.SetSceneEnabled(1, false);
+                    mSt.SetSceneEnabled(2, false);
+                    mSt.SetSceneEnabled(3, false);
+                    dock8.RenderAndPresent("selftest-v10-off");
+                    if (std::fabs(dock8.curPanelHeightDip - 471.0f) > 0.5f) v8Err = 192;
+                }
+
+                if (dock8.hoverBubble.hwnd) DestroyWindow(dock8.hoverBubble.hwnd);
+                if (dock8.hwnd) DestroyWindow(dock8.hwnd);
+            }
+        }
+        CoUninitialize();
+        DiagLogger::Instance().Init(sm.dataDir);
+        if (v8Err != 0) return v8Err;
+    }
+
+    return 0;
+}
+
+} // namespace pp
+
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+
+    bool silentAutostart = false;
+    bool selfTest = false;
+    std::wstring selfTestDir;
+    std::wstring customDataDir;
+    DWORD waitPid = 0;
+    std::wstring cleanupOldPath;
+
+    if (argv) {
+        for (int i = 1; i < argc; ++i) {
+            std::wstring arg = argv[i];
+            if (arg == L"--autostart") {
+                silentAutostart = true;
+            } else if (arg == L"--data-dir") {
+                if (i + 1 < argc) customDataDir = argv[++i];
+            } else if (arg == L"--self-test") {
+                selfTest = true;
+                if (i + 1 < argc) selfTestDir = argv[++i];
+            } else if (arg == L"--wait-pid") {
+                if (i + 1 < argc) waitPid = (DWORD)wcstoul(argv[++i], nullptr, 10);
+            } else if (arg == L"--cleanup-old") {
+                if (i + 1 < argc) cleanupOldPath = argv[++i];
+            }
+        }
+        LocalFree(argv);
+    }
+
+    if (selfTest) {
+        return pp::RunHeadlessSelfTest(selfTestDir);
+    }
+
+    // If spawned by in-place updater, wait cleanly for the previous process to exit and release its mutex
+    if (waitPid != 0 && waitPid != GetCurrentProcessId()) {
+        HANDLE hPrev = OpenProcess(SYNCHRONIZE, FALSE, waitPid);
+        if (hPrev) {
+            WaitForSingleObject(hPrev, 10000);
+            CloseHandle(hPrev);
+        }
+    }
+
+    // Single-instance guard keyed by canonicalized data directory path!
+    std::wstring resolvedDir = customDataDir.empty() ? pp::StorageManager::ResolveDefaultDataDir() : customDataDir;
+    std::wstring canonDir = pp::StorageManager::CanonicalizeDirPath(resolvedDir);
+    std::wstring canonDef = pp::StorageManager::CanonicalizeDirPath(pp::StorageManager::ResolveDefaultDataDir());
+    uint64_t dirHash = pp::HashPathFnv1a64(canonDir);
+
+    std::wstring mutexName = APP_MUTEX_NAME_W;
+    if (canonDir != canonDef) {
+        wchar_t buf[96]{};
+        wsprintfW(buf, L"Local\\PromptPod_SingleInstance_Dir_%016I64x", (unsigned long long)dirHash);
+        mutexName = buf;
+    }
+
+    HANDLE hMutex = nullptr;
+    DWORD mutexErr = 0;
+    int maxAttempts = (waitPid != 0) ? 40 : 1;
+    for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+        hMutex = CreateMutexW(nullptr, TRUE, mutexName.c_str());
+        mutexErr = GetLastError();
+        if (!hMutex) return 1;
+        if (mutexErr != ERROR_ALREADY_EXISTS) break;
+        if (attempt + 1 < maxAttempts) {
+            CloseHandle(hMutex);
+            hMutex = nullptr;
+            Sleep(120);
+        }
+    }
+    if (mutexErr == ERROR_ALREADY_EXISTS) {
+        HWND existing = pp::FindExistingInstanceTrayHost(dirHash);
+        uint32_t runningVer = existing ? (uint32_t)(ULONG_PTR)GetPropW(existing, L"PP_AppVerPacked") : 0;
+        uint32_t currentVer = pp::PackAppVersion(APP_VER_MAJOR, APP_VER_MINOR, APP_VER_PATCH);
+
+        // Seamless upgrade handoff: if user double-clicks a NEWER version while an older version is resident,
+        // gracefully ask the older instance to save & exit (WM_CLOSE) and take over automatically!
+        if (existing && runningVer < currentVer) {
+            // Must close our duplicate handle BEFORE waiting, otherwise the named kernel mutex stays alive!
+            CloseHandle(hMutex);
+            hMutex = nullptr;
+
+            DWORD oldPid = 0;
+            GetWindowThreadProcessId(existing, &oldPid);
+            HANDLE hOld = (oldPid != 0 && oldPid != GetCurrentProcessId())
+                ? OpenProcess(SYNCHRONIZE, FALSE, oldPid)
+                : nullptr;
+
+            PostMessageW(existing, WM_CLOSE, 0, 0);
+            if (hOld) {
+                WaitForSingleObject(hOld, 5000);
+                CloseHandle(hOld);
+            }
+
+            for (int attempt = 0; attempt < 40; ++attempt) {
+                hMutex = CreateMutexW(nullptr, TRUE, mutexName.c_str());
+                mutexErr = GetLastError();
+                if (!hMutex) return 1;
+                if (mutexErr != ERROR_ALREADY_EXISTS) break;
+                if (attempt + 1 < 40) {
+                    CloseHandle(hMutex);
+                    hMutex = nullptr;
+                    Sleep(100);
+                }
+            }
+        }
+
+        if (mutexErr == ERROR_ALREADY_EXISTS) {
+            HWND live = pp::FindExistingInstanceTrayHost(dirHash);
+            if (live) {
+                PostMessageW(live, pp::WM_REVEAL_POD, 0, 0);
+            }
+            if (hMutex) CloseHandle(hMutex);
+            return 0;
+        }
+    }
+
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    pp::AppController app;
+    if (!app.Init(hInstance, customDataDir, silentAutostart, dirHash)) {
+        CoUninitialize();
+        ReleaseMutex(hMutex);
+        CloseHandle(hMutex);
+        return 1;
+    }
+
+    // Sweep stale .old / .update.*.new files ONLY AFTER AppController::Init succeeds so failed boots retain rollback backup
+    pp::CleanupStaleUpdateFiles(cleanupOldPath);
+
+    MSG msg{};
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    app.Shutdown();
+    CoUninitialize();
+    ReleaseMutex(hMutex);
+    CloseHandle(hMutex);
+    return (int)msg.wParam;
+}
