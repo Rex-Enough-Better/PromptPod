@@ -387,15 +387,23 @@ struct AppState {
         return true;
     }
 
-    // Counts how many OTHER enabled scenes (excluding activeScene) contain `id`.
-    int CountOtherEnabledScenesWithId(const std::wstring& id, int* outFirstScene = nullptr, int* outFirstSlot = nullptr) const {
+    bool IsMountedInAnyEnabledScene(const std::wstring& id) const {
+        if (id.empty()) return false;
+        for (int s = 0; s < kMaxScenes; ++s) {
+            if (scenes[(size_t)s].enabled && FindSlotOfIdInScene(s, id) >= 0) return true;
+        }
+        return false;
+    }
+
+    // Counts how many OTHER enabled scenes (excluding `excludeSceneIdx`, or activeScene if < 0) contain `id`.
+    int CountOtherEnabledScenesWithId(const std::wstring& id, int* outFirstScene = nullptr, int* outFirstSlot = nullptr, int excludeSceneIdx = -1) const {
         if (outFirstScene) *outFirstScene = -1;
         if (outFirstSlot) *outFirstSlot = -1;
         if (id.empty() || !IsMultiSceneActive()) return 0;
-        int activeIdx = EffectiveActiveSceneIndex();
+        int skipIdx = (excludeSceneIdx >= 0 && excludeSceneIdx < kMaxScenes) ? excludeSceneIdx : EffectiveActiveSceneIndex();
         int count = 0;
         for (int s = 0; s < kMaxScenes; ++s) {
-            if (s == activeIdx || !scenes[(size_t)s].enabled) continue;
+            if (s == skipIdx || !scenes[(size_t)s].enabled) continue;
             int sl = FindSlotOfIdInScene(s, id);
             if (sl >= 0) {
                 if (count == 0) {
@@ -408,12 +416,17 @@ struct AppState {
         return count;
     }
 
-    int FindFirstEmptySlot() const {
-        const auto& sl = ActiveSlots();
+    int FindFirstEmptySlotInScene(int sceneIdx) const {
+        if (sceneIdx < 0 || sceneIdx >= kMaxScenes) return -1;
+        const auto& sl = scenes[(size_t)sceneIdx].slots;
         for (int i = 0; i < 10; ++i) {
             if (sl[(size_t)i].empty()) return i;
         }
         return -1;
+    }
+
+    int FindFirstEmptySlot() const {
+        return FindFirstEmptySlotInScene(EffectiveActiveSceneIndex());
     }
 
     uint64_t TotalCopies() const {
@@ -446,22 +459,27 @@ struct AppState {
         }
     }
 
-    // Assigns prompt `id` into `targetSlot` (0..9) of the active scene. If `id` was already in another slot of the SAME scene, swaps them cleanly.
-    [[gnu::noinline]] void AssignToSlot(int targetSlot, const std::wstring& id) {
-        if (targetSlot < 0 || targetSlot >= 10) return;
-        auto& sl = ActiveSlots();
+    // Assigns prompt `id` into `targetSlot` (0..9) of `sceneIdx`. If `id` was already in another slot of the SAME scene, swaps them cleanly.
+    [[gnu::noinline]] void AssignToSlotInScene(int sceneIdx, int targetSlot, const std::wstring& id) {
+        if (sceneIdx < 0 || sceneIdx >= kMaxScenes || targetSlot < 0 || targetSlot >= 10) return;
+        auto& sl = scenes[(size_t)sceneIdx].slots;
         if (id.empty()) {
             sl[(size_t)targetSlot].clear();
             return;
         }
         if (!FindById(id)) return;
-        int prevSlot = FindSlotOfId(id);
+        int prevSlot = FindSlotOfIdInScene(sceneIdx, id);
         if (prevSlot == targetSlot) return;
         if (prevSlot >= 0) {
             std::swap(sl[(size_t)prevSlot], sl[(size_t)targetSlot]);
         } else {
             sl[(size_t)targetSlot] = id;
         }
+    }
+
+    // Assigns prompt `id` into `targetSlot` (0..9) of the active scene. If `id` was already in another slot of the SAME scene, swaps them cleanly.
+    void AssignToSlot(int targetSlot, const std::wstring& id) {
+        AssignToSlotInScene(EffectiveActiveSceneIndex(), targetSlot, id);
     }
 };
 

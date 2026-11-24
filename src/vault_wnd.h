@@ -3279,6 +3279,7 @@ public:
 
     int activeTab = 0;          // 0 = Vault, 1 = Leaderboard, 2 = Settings
     int assignTargetSlot = -1;  // -1 normal, 0..9 assigning to specific dock slot
+    int vaultFilter = -1;       // Tab 0 view filter: -1 = All, 0..3 = specific enabled scene, -2 = Unmounted
     float scrollY = 0.0f;
     float maxScrollY = 0.0f;
     float lastViewportH = 300.0f;
@@ -3330,7 +3331,8 @@ public:
         // 33:EdgeRight, 34:EdgeLeft, 35:UndoDelete, 36:EdgeFloat,
         // 37:TrayOpensVault, 38:TrayTogglesDock, 39:CopyDataDir, 40:ReplayOnboarding, 41:SelectCard,
         // 50..53:ToggleSceneEnabled(0..3), 54..57:ConfigScenePrompts(0..3),
-        // 60..63:RenameScene(0..3), 64:OpenKhazixX, 65:OpenKhazixGitHub, 70..73:SwitchActiveScene(0..3)
+        // 60..63:RenameScene(0..3), 64:OpenKhazixX, 65:OpenKhazixGitHub,
+        // 70:FilterAll, 71..74:FilterScene(0..3), 75:FilterUnmounted
         int kind = 0;
         std::wstring promptId;
         D2D1_RECT_F rect{};
@@ -3403,9 +3405,36 @@ public:
         return true;
     }
 
+    int EffectiveVaultFilter() const {
+        if (assignTargetSlot >= 0 && assignTargetSlot < 10) return -1;
+        if (vaultFilter >= 0 && vaultFilter < kMaxScenes) {
+            if (state && state->scenes[(size_t)vaultFilter].enabled) return vaultFilter;
+            return -1;
+        }
+        return (vaultFilter == -2) ? -2 : -1;
+    }
+
+    int TargetSceneForVaultAction() const {
+        if (activeTab == 0) {
+            int f = EffectiveVaultFilter();
+            if (f >= 0 && f < kMaxScenes) return f;
+        }
+        return state ? state->EffectiveActiveSceneIndex() : 0;
+    }
+
+    int CountUnmountedVaultItems() const {
+        if (!state) return 0;
+        int n = 0;
+        for (const auto& item : state->vault) {
+            if (!state->IsMountedInAnyEnabledScene(item.id)) ++n;
+        }
+        return n;
+    }
+
     void Open(int tab = 0, int targetSlot = -1, bool scrollToUpdate = false) {
         activeTab = tab;
         assignTargetSlot = targetSlot;
+        if (targetSlot >= 0) vaultFilter = -1;
         scrollY = 0.0f;
         pendingScrollToUpdate = (tab == 2 && scrollToUpdate);
         InvalidateCaches();
@@ -3578,25 +3607,38 @@ public:
         return true;
     }
 
-    bool OpenNewPromptModal(int targetSlot = -1, int* outMountedSlot = nullptr, const std::wstring& initTitle = L"", bool preserveOccupied = false) {
+    [[gnu::noinline]] bool OpenNewPromptModal(int targetSlot = -1, int* outMountedSlot = nullptr, const std::wstring& initTitle = L"", bool preserveOccupied = false, int explicitSceneIdx = -1) {
         if (outMountedSlot) *outMountedSlot = -1;
         if (editorModalOpen) return false;
         HWND parent = (hwnd && IsWindowVisible(hwnd)) ? hwnd : nullptr;
+        int targetScene = (explicitSceneIdx >= 0 && explicitSceneIdx < kMaxScenes)
+            ? explicitSceneIdx
+            : (state ? state->EffectiveActiveSceneIndex() : 0);
         int effectiveTarget = targetSlot;
         if (preserveOccupied && state && effectiveTarget >= 0 && effectiveTarget < 10 &&
-            state->FindById(state->ActiveSlots()[(size_t)effectiveTarget]) != nullptr) {
-            effectiveTarget = state->FindFirstEmptySlot();
+            state->FindById(state->scenes[(size_t)targetScene].slots[(size_t)effectiveTarget]) != nullptr) {
+            effectiveTarget = state->FindFirstEmptySlotInScene(targetScene);
         }
-        std::wstring slotTag = (state && state->IsMultiSceneActive())
-            ? (L"「" + state->ActiveScene().name + L" · 槽位 " + FormatSlotNum(effectiveTarget) + L"」")
-            : (L"槽位 " + FormatSlotNum(effectiveTarget));
-        std::wstring hd = (effectiveTarget >= 0)
-            ? (L"\x65B0\x5EFA Prompt \x5E76\x653E\x5165" + slotTag)
-            : L"\x65B0\x5EFA Prompt \x5230\x8BCD\x8231";
+        std::wstring sceneName = state ? state->scenes[(size_t)targetScene].name : std::wstring();
+        std::wstring hd;
+        if (effectiveTarget >= 0) {
+            std::wstring slotTag = (state && state->IsMultiSceneActive())
+                ? (L"「" + sceneName + L" · 槽位 " + FormatSlotNum(effectiveTarget) + L"」")
+                : (L"槽位 " + FormatSlotNum(effectiveTarget));
+            hd = L"\x65B0\x5EFA Prompt \x5E76\x653E\x5165" + slotTag;
+        } else if (explicitSceneIdx >= 0 && state && state->IsMultiSceneActive()) {
+            bool scFull = (state->CountMountedInScene(targetScene) >= 10);
+            hd = scFull
+                ? (L"新建 Prompt 到词舱（「" + sceneName + L"」已满）")
+                : (L"新建 Prompt 并加入「" + sceneName + L"」");
+        } else {
+            hd = L"\x65B0\x5EFA Prompt \x5230\x8BCD\x8231";
+        }
         int mountedSlot = -1;
+        std::wstring createdId;
         editorModalOpen = true;
         auto res = PromptEditorDialog::Show(hInst, parent, hd, initTitle, L"",
-            [this, effectiveTarget, preserveOccupied, &mountedSlot](const std::wstring& title, const std::wstring& content, std::wstring& outErr) -> bool {
+            [this, targetScene, effectiveTarget, preserveOccupied, &mountedSlot, &createdId](const std::wstring& title, const std::wstring& content, std::wstring& outErr) -> bool {
                 AppState candidate = *state;
                 PromptItem item{};
                 item.id = GeneratePromptId(&candidate);
@@ -3607,17 +3649,17 @@ public:
 
                 if (effectiveTarget >= 0 && effectiveTarget < 10) {
                     int assignIdx = effectiveTarget;
-                    if (preserveOccupied && candidate.FindById(candidate.ActiveSlots()[(size_t)assignIdx]) != nullptr) {
-                        assignIdx = candidate.FindFirstEmptySlot(); // Never clobber an occupied slot during onboarding!
+                    if (preserveOccupied && candidate.FindById(candidate.scenes[(size_t)targetScene].slots[(size_t)assignIdx]) != nullptr) {
+                        assignIdx = candidate.FindFirstEmptySlotInScene(targetScene); // Never clobber an occupied slot during onboarding!
                     }
                     if (assignIdx >= 0 && assignIdx < 10) {
-                        candidate.AssignToSlot(assignIdx, item.id);
+                        candidate.AssignToSlotInScene(targetScene, assignIdx, item.id);
                         mountedSlot = assignIdx;
                     }
                 } else {
-                    int emptySlot = candidate.FindFirstEmptySlot();
+                    int emptySlot = candidate.FindFirstEmptySlotInScene(targetScene);
                     if (emptySlot >= 0) {
-                        candidate.AssignToSlot(emptySlot, item.id);
+                        candidate.AssignToSlotInScene(targetScene, emptySlot, item.id);
                         mountedSlot = emptySlot;
                     }
                 }
@@ -3628,6 +3670,7 @@ public:
                         : L"\x4FDD\x5B58\x5931\x8D25\xFF1A\x65E0\x6CD5\x5199\x5165\x6570\x636E\x6587\x4EF6\xFF0C\x8BF7\x7A0D\x540E\x91CD\x8BD5";
                     return false;
                 }
+                createdId = item.id;
                 *state = std::move(candidate);
                 return true;
             });
@@ -3635,20 +3678,35 @@ public:
         if (!res.accepted) return false;
 
         if (outMountedSlot) *outMountedSlot = mountedSlot;
-        // Clear stale search filter so the newly created Prompt is immediately visible at the top!
+        // Clear stale search filter and reset incompatible view filter so the newly created Prompt is immediately visible!
         if (!searchQuery.empty()) {
             searchQuery.clear();
             if (hSearchEdit && IsWindow(hSearchEdit)) SetWindowTextW(hSearchEdit, L"");
         }
-        scrollY = 0.0f;
-        selectedVaultRow = 0;
+        int curFilter = EffectiveVaultFilter();
+        if ((curFilter == -2 && mountedSlot >= 0) || (curFilter >= 0 && (curFilter != targetScene || mountedSlot < 0))) {
+            vaultFilter = -1;
+            UpdateSearchCueBanner();
+        }
         InvalidateCaches();
+        EnsureVaultCache();
+        selectedVaultRow = 0;
+        for (int i = 0; i < (int)cachedFilteredIndices.size(); ++i) {
+            if (state->vault[cachedFilteredIndices[(size_t)i]].id == createdId) {
+                selectedVaultRow = i;
+                break;
+            }
+        }
+        scrollY = 0.0f;
+        EnsureSelectedVaultRowVisible();
         if (onStateChanged) onStateChanged();
         if (mountedSlot >= 0) {
             std::wstring dest = (state && state->IsMultiSceneActive())
-                ? (L"「" + state->ActiveScene().name + L" · 槽位 " + FormatSlotNum(mountedSlot) + L"」")
+                ? (L"「" + state->scenes[(size_t)targetScene].name + L" · 槽位 " + FormatSlotNum(mountedSlot) + L"」")
                 : (L"槽位 " + FormatSlotNum(mountedSlot));
             ShowToast(L"已保存并放入" + dest, false);
+        } else if (explicitSceneIdx >= 0 && state && state->IsMultiSceneActive()) {
+            ShowToast(L"已存入词舱（「" + state->scenes[(size_t)targetScene].name + L"」已满 10 格）", false);
         } else {
             ShowToast(L"\x5DF2\x4FDD\x5B58\x65B0 Prompt", false);
         }
@@ -3942,16 +4000,35 @@ private:
         if (hwnd) InvalidateRect(hwnd, nullptr, FALSE);
     }
 
-    void EnsureVaultCache() {
+    [[gnu::noinline]] void EnsureVaultCache() {
         if (!vaultCacheDirty || !state) return;
         cachedFilteredIndices.clear();
         cachedFilteredIndices.reserve(state->vault.size());
-        for (size_t vi = 0; vi < state->vault.size(); ++vi) {
-            const auto& item = state->vault[vi];
-            if (searchQuery.empty() ||
-                ContainsIgnoreCase(item.title, searchQuery) ||
-                ContainsIgnoreCase(item.content, searchQuery)) {
-                cachedFilteredIndices.push_back(vi);
+        auto matchesQuery = [&](const PromptItem& item) {
+            return searchQuery.empty() ||
+                   ContainsIgnoreCase(item.title, searchQuery) ||
+                   ContainsIgnoreCase(item.content, searchQuery);
+        };
+        int effFilter = EffectiveVaultFilter();
+        if (effFilter >= 0 && effFilter < kMaxScenes) {
+            // Scene view: display mounted prompts strictly in dock slot order (01 .. 10)
+            const auto& sl = state->scenes[(size_t)effFilter].slots;
+            for (int i = 0; i < 10; ++i) {
+                if (sl[(size_t)i].empty()) continue;
+                for (size_t vi = 0; vi < state->vault.size(); ++vi) {
+                    if (state->vault[vi].id == sl[(size_t)i]) {
+                        if (matchesQuery(state->vault[vi])) cachedFilteredIndices.push_back(vi);
+                        break;
+                    }
+                }
+            }
+        } else {
+            for (size_t vi = 0; vi < state->vault.size(); ++vi) {
+                const auto& item = state->vault[vi];
+                if (effFilter == -2 && state->IsMountedInAnyEnabledScene(item.id)) continue;
+                if (matchesQuery(item)) {
+                    cachedFilteredIndices.push_back(vi);
+                }
             }
         }
         if (cachedFilteredIndices.empty()) {
@@ -4044,7 +4121,8 @@ private:
             return true;
         }
         if (ctrl && !alt && vk == 'N') {
-            OpenNewPromptModal(assignTargetSlot);
+            int sc = (assignTargetSlot < 0 && activeTab == 0 && EffectiveVaultFilter() >= 0) ? EffectiveVaultFilter() : -1;
+            OpenNewPromptModal(assignTargetSlot, nullptr, L"", false, sc);
             return true;
         }
         if (ctrl && !alt && vk == 'A' && fromSearchEdit && hSearchEdit) {
@@ -4129,11 +4207,21 @@ private:
         }
     }
 
-    void UpdateSearchCueBanner() {
+    [[gnu::noinline]] void UpdateSearchCueBanner() {
         if (!hSearchEdit || !IsWindow(hSearchEdit)) return;
-        std::wstring cue = (assignTargetSlot >= 0 && assignTargetSlot < 10)
-            ? UiText(L"搜索要放入槽位 " + FormatSlotNum(assignTargetSlot) + L" 的 Prompt（↑↓ 选择，Enter 放入）")
-            : UiText(L"搜索标题或正文（↑↓ 选择，Enter 复制，Esc 清空）");
+        std::wstring cue;
+        if (assignTargetSlot >= 0 && assignTargetSlot < 10) {
+            cue = UiText(L"搜索要放入槽位 " + FormatSlotNum(assignTargetSlot) + L" 的 Prompt（↑↓ 选择，Enter 放入）");
+        } else {
+            int eff = EffectiveVaultFilter();
+            if (eff >= 0 && state) {
+                cue = UiText(L"在「" + state->scenes[(size_t)eff].name + L"」中搜索（↑↓ 选择，Enter 复制，Esc 清空）");
+            } else if (eff == -2) {
+                cue = UiText(L"在未装配词舱中搜索（↑↓ 选择，Enter 复制，Esc 清空）");
+            } else {
+                cue = UiText(L"搜索标题或正文（↑↓ 选择，Enter 复制，Esc 清空）");
+            }
+        }
         SendMessageW(hSearchEdit, 0x1501 /*EM_SETCUEBANNER*/, TRUE, reinterpret_cast<LPARAM>(cue.c_str()));
     }
 
@@ -4270,6 +4358,15 @@ private:
         if (!fmt || !raw || !*raw) return;
         std::wstring s = UiText(raw);
         rt->DrawTextW(s.c_str(), (UINT32)s.size(), fmt, r, Br(col));
+    }
+
+    [[gnu::noinline]] void DrawStatusBadge(const D2D1_RECT_F& r, const std::wstring& txt,
+                                           uint32_t bgHex, float bgAlpha, uint32_t fgHex, float fgAlpha) {
+        rt->FillRoundedRectangle(D2D1::RoundedRect(r, 5.0f, 5.0f), Br(Rgba(bgHex, bgAlpha)));
+        if (fmtBadge && !txt.empty()) {
+            std::wstring s = UiText(txt);
+            rt->DrawTextW(s.c_str(), (UINT32)s.size(), fmtBadge.Get(), r, Br(Rgba(fgHex, fgAlpha)));
+        }
     }
 
     [[gnu::noinline]] void DrawPillButton(const D2D1_RECT_F& r, const wchar_t* text, int zoneIdx,
@@ -4443,45 +4540,6 @@ private:
                             Br(Rgba(Theme::AccentCyan, 0.98f)));
         }
 
-        // Top-bar quick scene switcher pills (ONLY when multi-scene active & viewing Vault / Leaderboard!)
-        if (state->IsMultiSceneActive() && (activeTab == 0 || activeTab == 1)) {
-            int vis[kMaxScenes]{};
-            int cnt = state->GetEnabledScenes(vis);
-            int actIdx = state->EffectiveActiveSceneIndex();
-            float areaLeft = 320.0f;
-            float areaRight = (activeTab == 0) ? (cw - 134.0f) : (cw - 18.0f);
-            float avail = std::max(0.0f, areaRight - areaLeft);
-            float gap = 4.0f;
-            float widths[kMaxScenes]{};
-            float sumW = 0.0f;
-            for (int p = 0; p < cnt; ++p) {
-                int units = std::max(2, VisualWidthUnits(state->scenes[(size_t)vis[p]].name));
-                widths[p] = std::clamp((float)units * 7.2f + 16.0f, 40.0f, 74.0f);
-                sumW += widths[p];
-            }
-            float maxSum = std::max(0.0f, avail - (float)(cnt - 1) * gap);
-            if (sumW > maxSum && sumW > 1.0f) {
-                float scale = maxSum / sumW;
-                for (int p = 0; p < cnt; ++p) widths[p] *= scale;
-            }
-            if (maxSum >= (float)cnt * 32.0f) {
-                float pl = areaLeft;
-                for (int p = 0; p < cnt; ++p) {
-                    int s = vis[p];
-                    bool isAct = (s == actIdx);
-                    D2D1_RECT_F pr = D2D1::RectF(pl, 15.0f, pl + widths[p], 41.0f);
-                    int zSc = AddZone(70 + s, pr);
-                    uint32_t acc = Theme::SceneTextAccent(s);
-                    DrawPillButton(pr, state->scenes[(size_t)s].name, zSc,
-                                   isAct ? 0x202A40 : 0x151923,
-                                   isAct ? 0x283552 : 0x222838,
-                                   isAct ? acc : Theme::TextSecondary,
-                                   isAct ? 0.34f : 0.08f);
-                    pl += widths[p] + gap;
-                }
-            }
-        }
-
         // Top-right action bar scoped strictly by Tab: only Tab 0 shows '+ New Prompt'; Tab 1 & 2 stay clean
         if (activeTab == 0) {
             D2D1_RECT_F rcNew = D2D1::RectF(cw - 126.0f, 13.0f, cw - 18.0f, 43.0f);
@@ -4566,7 +4624,73 @@ private:
                                   Br(Rgba(clrHov ? Theme::TextPrimary : Theme::TextMuted, 0.95f)));
                 }
             }
-            contentTop += 44.0f;
+            contentTop += 42.0f;
+
+            // Vault scene/status filter bar (hidden during assignTargetSlot pick mode so all prompts stay direct)
+            int effFilter = EffectiveVaultFilter();
+            if (assignTargetSlot < 0) {
+                struct FilterPill {
+                    int kind;
+                    bool selected;
+                    uint32_t accent;
+                    std::wstring label;
+                    float width;
+                };
+                FilterPill pills[kMaxScenes + 2]{};
+                int pillCnt = 0;
+                auto pushPill = [&](int kind, bool sel, uint32_t acc, const std::wstring& txt) {
+                    std::wstring u = UiText(txt);
+                    float w = std::clamp((float)VisualWidthUnits(u) * 6.2f + 18.0f, 50.0f, 114.0f);
+                    pills[pillCnt++] = FilterPill{ kind, sel, acc, std::move(u), w };
+                };
+
+                wchar_t lb[48]{};
+                wsprintfW(lb, L"\x5168\x90E8 %u", (unsigned)state->vault.size());
+                pushPill(70, effFilter == -1, Theme::AccentCyan, lb);
+
+                int vis[kMaxScenes]{};
+                int enCnt = state->GetEnabledScenes(vis);
+                for (int p = 0; p < enCnt; ++p) {
+                    int s = vis[p];
+                    _snwprintf_s(lb, _countof(lb), _TRUNCATE, L"%ls %d",
+                                 state->scenes[(size_t)s].name.c_str(), state->CountMountedInScene(s));
+                    pushPill(71 + s, effFilter == s, Theme::SceneTextAccent(s), lb);
+                }
+
+                wsprintfW(lb, L"\x672A\x88C5\x914D %d", CountUnmountedVaultItems());
+                pushPill(75, effFilter == -2, Theme::AccentCyan, lb);
+
+                float barRight = (effFilter >= 0) ? (cw - 112.0f) : (cw - 20.0f);
+                float gap = 6.0f;
+                float sumW = 0.0f;
+                for (int i = 0; i < pillCnt; ++i) sumW += pills[i].width;
+                float maxSum = std::max(80.0f, (barRight - 18.0f) - (float)(pillCnt - 1) * gap);
+                if (sumW > maxSum && sumW > 1.0f) {
+                    float sc = maxSum / sumW;
+                    for (int i = 0; i < pillCnt; ++i) pills[i].width *= sc;
+                }
+
+                float px = 18.0f;
+                for (int i = 0; i < pillCnt; ++i) {
+                    D2D1_RECT_F pr = D2D1::RectF(px, contentTop, px + pills[i].width, contentTop + 26.0f);
+                    int zF = AddZone(pills[i].kind, pr);
+                    DrawPillButton(pr, pills[i].label, zF,
+                                   pills[i].selected ? 0x202A40 : 0x151923,
+                                   pills[i].selected ? 0x283552 : 0x222838,
+                                   pills[i].selected ? pills[i].accent : Theme::TextSecondary,
+                                   pills[i].selected ? 0.34f : 0.08f);
+                    px += pills[i].width + gap;
+                }
+
+                if (effFilter >= 0) {
+                    D2D1_RECT_F rcCfg = D2D1::RectF(cw - 104.0f, contentTop, cw - 20.0f, contentTop + 26.0f);
+                    int zCfg = AddZone(54 + effFilter, rcCfg);
+                    DrawPillButton(rcCfg, L"\x914D\x7F6E\x63D0\x793A\x8BCD", zCfg, 0x1B263B, 0x253554, Theme::AccentCyan, 0.22f);
+                }
+                contentTop += 34.0f;
+            } else {
+                contentTop += 2.0f;
+            }
 
             // Clip scrollable list area and use cached filtered indices
             vaultListTopDip = contentTop;
@@ -4581,6 +4705,8 @@ private:
 
             rt->PushAxisAlignedClip(listViewport, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
+            int badgeScene = (effFilter >= 0) ? effFilter : state->EffectiveActiveSceneIndex();
+            bool canDragVaultOrder = (searchQuery.empty() && effFilter == -1);
             float y = contentTop - scrollY;
             int visibleCount = (int)cachedFilteredIndices.size();
             for (int rowPos = 0; rowPos < visibleCount; ++rowPos) {
@@ -4590,7 +4716,7 @@ private:
                 bool isSelectedRow = (rowPos == selectedVaultRow);
                 D2D1_RECT_F card = D2D1::RectF(18.0f, y, cw - 20.0f, y + 68.0f);
                 if (card.bottom >= contentTop && card.top <= ch) {
-                    int slotIdx = state->FindSlotOfId(item.id);
+                    int slotIdx = state->FindSlotOfIdInScene(badgeScene, item.id);
                     uint32_t cardBgHex = isBeingDragged ? 0x263046 : (isSelectedRow ? 0x21283A : Theme::CardBg);
                     rt->FillRoundedRectangle(D2D1::RoundedRect(card, 9.0f, 9.0f),
                                              Br(Rgba(cardBgHex, isBeingDragged ? 0.99f : 0.96f)));
@@ -4600,9 +4726,9 @@ private:
                     DrawRim(rt.Get(), card, 9.0f, cardRim, Rgba(0xFFFFFF, 0.04f),
                                      (isBeingDragged || isSelectedRow) ? 1.25f : 1.0f);
 
-                    // Subtle 6-dot drag grip on far left when unfiltered
+                    // Subtle 6-dot drag grip on far left ONLY in unfiltered All-vault view
                     float leftContentOffset = 12.0f;
-                    if (searchQuery.empty()) {
+                    if (canDragVaultOrder) {
                         leftContentOffset = 24.0f;
                         auto* gripBr = Br(Rgba(isBeingDragged ? Theme::AccentCyan : Theme::TextMuted, isBeingDragged ? 0.9f : 0.45f));
                         for (int gr = 0; gr < 3; ++gr) {
@@ -4620,54 +4746,33 @@ private:
                         D2D1_RECT_F statusPill = D2D1::RectF(pillRight, card.top + 11.0f, pillRight + 62.0f, card.top + 31.0f);
                         pillRight = statusPill.right;
                         if (slotIdx >= 0) {
-                            rt->FillRoundedRectangle(D2D1::RoundedRect(statusPill, 5.0f, 5.0f), Br(Rgba(Theme::AccentCyan, 0.15f)));
-                            std::wstring sp = UiText(L"\x69FD\x4F4D " + FormatSlotNum(slotIdx));
-                            if (fmtBadge) rt->DrawTextW(sp.c_str(), (UINT32)sp.size(), fmtBadge.Get(), statusPill, Br(Rgba(Theme::AccentCyan, 0.95f)));
+                            DrawStatusBadge(statusPill, L"\x69FD\x4F4D " + FormatSlotNum(slotIdx), Theme::AccentCyan, 0.15f, Theme::AccentCyan, 0.95f);
                         } else {
-                            rt->FillRoundedRectangle(D2D1::RoundedRect(statusPill, 5.0f, 5.0f), Br(Rgba(0xFFFFFF, 0.05f)));
-                            std::wstring sp = UiText(L"\x672A\x88C5\x914D");
-                            if (fmtBadge) rt->DrawTextW(sp.c_str(), (UINT32)sp.size(), fmtBadge.Get(), statusPill, Br(Rgba(Theme::TextMuted, 0.95f)));
+                            DrawStatusBadge(statusPill, L"\x672A\x88C5\x914D", 0xFFFFFF, 0.05f, Theme::TextMuted, 0.95f);
                         }
                     } else {
                         int firstOtherScene = -1, firstOtherSlot = -1;
-                        int otherCnt = state->CountOtherEnabledScenesWithId(item.id, &firstOtherScene, &firstOtherSlot);
-                        if (slotIdx >= 0) {
-                            uint32_t acc = Theme::SceneTextAccent(state->EffectiveActiveSceneIndex());
+                        int otherCnt = state->CountOtherEnabledScenesWithId(item.id, &firstOtherScene, &firstOtherSlot, badgeScene);
+                        int shownScene = (slotIdx >= 0) ? badgeScene : firstOtherScene;
+                        int shownSlot  = (slotIdx >= 0) ? slotIdx : firstOtherSlot;
+                        int extraScenes = (slotIdx >= 0) ? otherCnt : (otherCnt > 1 ? otherCnt - 1 : 0);
+                        if (shownScene >= 0 && shownSlot >= 0) {
+                            uint32_t acc = Theme::SceneTextAccent(shownScene);
                             D2D1_RECT_F statusPill = D2D1::RectF(pillRight, card.top + 11.0f, pillRight + 86.0f, card.top + 31.0f);
                             pillRight = statusPill.right;
-                            rt->FillRoundedRectangle(D2D1::RoundedRect(statusPill, 5.0f, 5.0f), Br(Rgba(acc, 0.16f)));
-                            std::wstring sp = UiText(state->ActiveScene().name + L" \x00B7 " + FormatSlotNum(slotIdx));
-                            if (fmtBadge) rt->DrawTextW(sp.c_str(), (UINT32)sp.size(), fmtBadge.Get(), statusPill, Br(Rgba(acc, 0.96f)));
-                            if (otherCnt > 0) {
+                            DrawStatusBadge(statusPill, state->scenes[(size_t)shownScene].name + L" \x00B7 " + FormatSlotNum(shownSlot),
+                                            acc, slotIdx >= 0 ? 0.16f : 0.14f, acc, slotIdx >= 0 ? 0.96f : 0.94f);
+                            if (extraScenes > 0) {
                                 D2D1_RECT_F subPill = D2D1::RectF(pillRight + 4.0f, card.top + 11.0f, pillRight + 52.0f, card.top + 31.0f);
                                 pillRight = subPill.right;
-                                rt->FillRoundedRectangle(D2D1::RoundedRect(subPill, 5.0f, 5.0f), Br(Rgba(Theme::AccentIndigo, 0.14f)));
                                 wchar_t ob[24]{};
-                                wsprintfW(ob, L"+%d \x573A\x666F", otherCnt);
-                                std::wstring os = UiText(ob);
-                                if (fmtBadge) rt->DrawTextW(os.c_str(), (UINT32)os.size(), fmtBadge.Get(), subPill, Br(Rgba(0xA5B4FC, 0.92f)));
-                            }
-                        } else if (otherCnt > 0 && firstOtherScene >= 0) {
-                            D2D1_RECT_F statusPill = D2D1::RectF(pillRight, card.top + 11.0f, pillRight + 86.0f, card.top + 31.0f);
-                            pillRight = statusPill.right;
-                            rt->FillRoundedRectangle(D2D1::RoundedRect(statusPill, 5.0f, 5.0f), Br(Rgba(Theme::AccentBlue, 0.13f)));
-                            std::wstring sp = UiText(state->scenes[(size_t)firstOtherScene].name + L" \x00B7 " + FormatSlotNum(firstOtherSlot));
-                            if (fmtBadge) rt->DrawTextW(sp.c_str(), (UINT32)sp.size(), fmtBadge.Get(), statusPill, Br(Rgba(Theme::AccentBlue, 0.92f)));
-                            if (otherCnt > 1) {
-                                D2D1_RECT_F subPill = D2D1::RectF(pillRight + 4.0f, card.top + 11.0f, pillRight + 52.0f, card.top + 31.0f);
-                                pillRight = subPill.right;
-                                rt->FillRoundedRectangle(D2D1::RoundedRect(subPill, 5.0f, 5.0f), Br(Rgba(Theme::AccentIndigo, 0.14f)));
-                                wchar_t ob[24]{};
-                                wsprintfW(ob, L"+%d \x573A\x666F", otherCnt - 1);
-                                std::wstring os = UiText(ob);
-                                if (fmtBadge) rt->DrawTextW(os.c_str(), (UINT32)os.size(), fmtBadge.Get(), subPill, Br(Rgba(0xA5B4FC, 0.92f)));
+                                wsprintfW(ob, L"+%d \x573A\x666F", extraScenes);
+                                DrawStatusBadge(subPill, ob, Theme::AccentIndigo, 0.14f, 0xA5B4FC, 0.92f);
                             }
                         } else {
                             D2D1_RECT_F statusPill = D2D1::RectF(pillRight, card.top + 11.0f, pillRight + 56.0f, card.top + 31.0f);
                             pillRight = statusPill.right;
-                            rt->FillRoundedRectangle(D2D1::RoundedRect(statusPill, 5.0f, 5.0f), Br(Rgba(0xFFFFFF, 0.05f)));
-                            std::wstring sp = UiText(L"\x672A\x88C5\x914D");
-                            if (fmtBadge) rt->DrawTextW(sp.c_str(), (UINT32)sp.size(), fmtBadge.Get(), statusPill, Br(Rgba(Theme::TextMuted, 0.95f)));
+                            DrawStatusBadge(statusPill, L"\x672A\x88C5\x914D", 0xFFFFFF, 0.05f, Theme::TextMuted, 0.95f);
                         }
                     }
 
@@ -4732,19 +4837,53 @@ private:
             }
 
             if (visibleCount == 0 && fmtCardBody) {
-                std::wstring emptyMsg = searchQuery.empty()
-                    ? UiText(L"\x8BCD\x8231\x6682\x65E0 Prompt\xFF0C\x70B9\x51FB\x53F3\x4E0A\x89D2\x300C+ \x65B0\x5EFA Prompt\x300D\x5F00\x59CB\x79EF\x7D2F")
-                    : UiText(L"未找到包含「" + CollapseWhitespaceSingleLine(searchQuery, 20) + L"」的 Prompt");
-                rt->DrawTextW(emptyMsg.c_str(), (UINT32)emptyMsg.size(), fmtCardBody.Get(),
-                              D2D1::RectF(24.0f, contentTop + 28.0f, cw - 24.0f, contentTop + 56.0f),
-                              Br(Rgba(Theme::TextMuted, 0.95f)));
+                std::wstring emptyMsg;
                 if (!searchQuery.empty()) {
-                    D2D1_RECT_F rcClrEmpty = D2D1::RectF(24.0f, contentTop + 62.0f, 108.0f, contentTop + 90.0f);
-                    D2D1_RECT_F rcNewEmpty = D2D1::RectF(118.0f, contentTop + 62.0f, 246.0f, contentTop + 90.0f);
-                    int zCE = AddClippedZone(8,  rcClrEmpty, listViewport);
-                    int zNE = AddClippedZone(17, rcNewEmpty, listViewport);
+                    std::wstring qShort = CollapseWhitespaceSingleLine(searchQuery, 20);
+                    if (effFilter >= 0) {
+                        emptyMsg = UiText(L"在「" + state->scenes[(size_t)effFilter].name + L"」中未找到包含「" + qShort + L"」的 Prompt");
+                    } else if (effFilter == -2) {
+                        emptyMsg = UiText(L"在未装配词舱中未找到包含「" + qShort + L"」的 Prompt");
+                    } else {
+                        emptyMsg = UiText(L"未找到包含「" + qShort + L"」的 Prompt");
+                    }
+                } else if (effFilter >= 0) {
+                    emptyMsg = UiText(L"场景「" + state->scenes[(size_t)effFilter].name + L"」暂未装配 Prompt，可从词舱勾选或新建加入");
+                } else if (effFilter == -2) {
+                    emptyMsg = UiText(L"当前所有词舱 Prompt 均已装配到贴边面板");
+                } else {
+                    emptyMsg = UiText(L"\x8BCD\x8231\x6682\x65E0 Prompt\xFF0C\x70B9\x51FB\x53F3\x4E0A\x89D2\x300C+ \x65B0\x5EFA Prompt\x300D\x5F00\x59CB\x79EF\x7D2F");
+                }
+                rt->DrawTextW(emptyMsg.c_str(), (UINT32)emptyMsg.size(), fmtCardBody.Get(),
+                              D2D1::RectF(24.0f, contentTop + 26.0f, cw - 24.0f, contentTop + 54.0f),
+                              Br(Rgba(Theme::TextMuted, 0.95f)));
+                float bx = 24.0f;
+                if (!searchQuery.empty()) {
+                    D2D1_RECT_F rcClrEmpty = D2D1::RectF(bx, contentTop + 60.0f, bx + 84.0f, contentTop + 88.0f);
+                    int zCE = AddClippedZone(8, rcClrEmpty, listViewport);
                     DrawPillButton(rcClrEmpty, L"清空搜索", zCE, 0x222736, 0x2D3448, Theme::TextSecondary);
+                    bx += 94.0f;
+                    if (effFilter != -1) {
+                        D2D1_RECT_F rcAll = D2D1::RectF(bx, contentTop + 60.0f, bx + 98.0f, contentTop + 88.0f);
+                        int zAll = AddClippedZone(70, rcAll, listViewport);
+                        DrawPillButton(rcAll, L"搜全部词舱", zAll, 0x222736, 0x2D3448, Theme::TextPrimary);
+                        bx += 108.0f;
+                    }
+                    D2D1_RECT_F rcNewEmpty = D2D1::RectF(bx, contentTop + 60.0f, bx + 128.0f, contentTop + 88.0f);
+                    int zNE = AddClippedZone(17, rcNewEmpty, listViewport);
                     DrawPillButton(rcNewEmpty, L"+ 新建此 Prompt", zNE, 0x1E3A5F, 0x284D7E, Theme::AccentCyan, 0.25f);
+                } else if (effFilter >= 0) {
+                    D2D1_RECT_F rcCfgEmpty = D2D1::RectF(bx, contentTop + 60.0f, bx + 132.0f, contentTop + 88.0f);
+                    int zCfgE = AddClippedZone(54 + effFilter, rcCfgEmpty, listViewport);
+                    DrawPillButton(rcCfgEmpty, L"配置此场景提示词", zCfgE, 0x1E3A5F, 0x284D7E, Theme::AccentCyan, 0.25f);
+                    bx += 142.0f;
+                    D2D1_RECT_F rcNewSc = D2D1::RectF(bx, contentTop + 60.0f, bx + 114.0f, contentTop + 88.0f);
+                    int zNewSc = AddClippedZone(3, rcNewSc, listViewport);
+                    DrawPillButton(rcNewSc, L"+ 新建并加入", zNewSc, 0x222736, 0x2D3448, Theme::TextPrimary);
+                } else if (effFilter == -2) {
+                    D2D1_RECT_F rcAll = D2D1::RectF(bx, contentTop + 60.0f, bx + 108.0f, contentTop + 88.0f);
+                    int zAll = AddClippedZone(70, rcAll, listViewport);
+                    DrawPillButton(rcAll, L"查看全部词舱", zAll, 0x222736, 0x2D3448, Theme::AccentCyan);
                 }
             }
 
@@ -5324,14 +5463,16 @@ private:
     }
 
     void ShowSlotAssignPopup(const std::wstring& promptId, POINT screenPt) {
-        if (!popupMenu) return;
+        if (!popupMenu || !state) return;
+        int targetScene = TargetSceneForVaultAction();
+        std::wstring sceneName = state->scenes[(size_t)targetScene].name;
         std::vector<DarkMenuItem> items;
         std::wstring hdr = state->IsMultiSceneActive()
-            ? (L"\x88C5\x914D\x5230\x5F53\x524D\x573A\x666F\xFF1A" + state->ActiveScene().name)
+            ? (L"\x88C5\x914D\x5230\x573A\x666F\xFF1A" + sceneName)
             : L"\x9009\x62E9\x8981\x88C5\x914D\x7684\x53F0\x9762\x69FD\x4F4D";
         items.push_back(DarkMenuItem::Header(hdr));
-        int curSlot = state->FindSlotOfId(promptId);
-        const auto& curSlots = state->ActiveSlots();
+        int curSlot = state->FindSlotOfIdInScene(targetScene, promptId);
+        const auto& curSlots = state->scenes[(size_t)targetScene].slots;
         for (int i = 0; i < 10; ++i) {
             const PromptItem* occ = state->FindById(curSlots[(size_t)i]);
             std::wstring label = L"\x69FD\x4F4D " + FormatSlotNum(i) + L" -- ";
@@ -5343,16 +5484,16 @@ private:
             items.push_back(DarkMenuItem::Action(
                 200,
                 state->IsMultiSceneActive()
-                    ? L"\x79FB\x51FA\x5F53\x524D\x573A\x666F\xFF08\x4FDD\x7559\x5728\x8BCD\x8231\xFF09"
+                    ? (L"移出「" + sceneName + L"」（保留在词舱）")
                     : L"\x79FB\x51FA\x69FD\x4F4D\xFF08\x4FDD\x7559\x5728\x8BCD\x8231\xFF09"));
         }
         lastMenuTriggerKind = 11;
         lastMenuTriggerId = promptId;
-        popupMenu->ShowAt(screenPt, items, [this, promptId](int cmd) {
+        popupMenu->ShowAt(screenPt, items, [this, promptId, targetScene](int cmd) {
             if (cmd >= 100 && cmd < 110) {
                 int target = cmd - 100;
                 AppState candidate = *state;
-                candidate.AssignToSlot(target, promptId);
+                candidate.AssignToSlotInScene(targetScene, target, promptId);
                 if (!storage->Save(candidate)) {
                     ShowToast(L"\x4FDD\x5B58\x5931\x8D25\xFF1A\x65E0\x6CD5\x66F4\x65B0\x69FD\x4F4D", true);
                     return;
@@ -5360,23 +5501,25 @@ private:
                 *state = std::move(candidate);
                 if (onStateChanged) onStateChanged();
                 std::wstring dest = state->IsMultiSceneActive()
-                    ? (L"「" + state->ActiveScene().name + L" · 槽位 " + FormatSlotNum(target) + L"」")
+                    ? (L"「" + state->scenes[(size_t)targetScene].name + L" · 槽位 " + FormatSlotNum(target) + L"」")
                     : (L"槽位 " + FormatSlotNum(target));
                 ShowToast(L"\x5DF2\x653E\x5165" + dest, false);
                 RefreshIfOpen();
             } else if (cmd == 200) {
                 // Re-query current slot dynamically so stale slot index can never clear another item
-                int liveSlot = state->FindSlotOfId(promptId);
+                int liveSlot = state->FindSlotOfIdInScene(targetScene, promptId);
                 if (liveSlot >= 0) {
                     AppState candidate = *state;
-                    candidate.ActiveSlots()[(size_t)liveSlot].clear();
+                    candidate.scenes[(size_t)targetScene].slots[(size_t)liveSlot].clear();
                     if (!storage->Save(candidate)) {
                         ShowToast(L"\x4FDD\x5B58\x5931\x8D25\xFF1A\x65E0\x6CD5\x79FB\x51FA\x69FD\x4F4D", true);
                         return;
                     }
                     *state = std::move(candidate);
                     if (onStateChanged) onStateChanged();
-                    ShowToast(state->IsMultiSceneActive() ? L"已移出当前场景（词舱已保留）" : L"已移出槽位（词舱已保留）", false);
+                    ShowToast(state->IsMultiSceneActive()
+                        ? (L"已移出「" + state->scenes[(size_t)targetScene].name + L"」（词舱已保留）")
+                        : L"已移出槽位（词舱已保留）", false);
                     RefreshIfOpen();
                 }
             }
@@ -5440,19 +5583,20 @@ private:
             case 70:
             case 71:
             case 72:
-            case 73: {
-                int scIdx = z.kind - 70;
-                if (scIdx >= 0 && scIdx < kMaxScenes && state->scenes[(size_t)scIdx].enabled &&
-                    scIdx != state->EffectiveActiveSceneIndex()) {
-                    AppState candidate = *state;
-                    candidate.activeSceneIndex = scIdx;
-                    if (!storage->Save(candidate)) {
-                        ShowToast(L"切换场景失败：当前处于只读保护或配置文件不可写", true);
-                        break;
-                    }
-                    *state = std::move(candidate);
+            case 73:
+            case 74:
+            case 75: {
+                // Pure view-level Vault filter (All / Scene 0..3 / Unmounted); NEVER mutates dock activeSceneIndex or writes disk!
+                int nextFilter = (z.kind == 70) ? -1 : ((z.kind == 75) ? -2 : (z.kind - 71));
+                if (nextFilter >= 0 && (!state || nextFilter >= kMaxScenes || !state->scenes[(size_t)nextFilter].enabled)) {
+                    nextFilter = -1;
+                }
+                if (nextFilter != vaultFilter) {
+                    vaultFilter = nextFilter;
+                    scrollY = 0.0f;
+                    selectedVaultRow = searchQuery.empty() ? -1 : 0;
                     InvalidateCaches();
-                    if (onStateChanged) onStateChanged();
+                    UpdateSearchCueBanner();
                     InvalidateRect(hwnd, nullptr, FALSE);
                 }
                 break;
@@ -5593,7 +5737,8 @@ private:
                 break;
             }
             case 17: {
-                OpenNewPromptModal(assignTargetSlot, nullptr, CollapseWhitespaceSingleLine(searchQuery, 24));
+                int sc = (assignTargetSlot < 0 && activeTab == 0 && EffectiveVaultFilter() >= 0) ? EffectiveVaultFilter() : -1;
+                OpenNewPromptModal(assignTargetSlot, nullptr, CollapseWhitespaceSingleLine(searchQuery, 24), false, sc);
                 break;
             }
             case 8: {
@@ -5686,9 +5831,11 @@ private:
                 }
                 break;
             }
-            case 3:
-                OpenNewPromptModal(assignTargetSlot);
+            case 3: {
+                int sc = (assignTargetSlot < 0 && activeTab == 0 && EffectiveVaultFilter() >= 0) ? EffectiveVaultFilter() : -1;
+                OpenNewPromptModal(assignTargetSlot, nullptr, L"", false, sc);
                 break;
+            }
             case 4:
                 ImportBackupDialog();
                 break;
@@ -5919,7 +6066,7 @@ private:
                         int rowIdx = (int)std::floor(relY / 76.0f);
                         if (rowIdx >= 0 && rowIdx < (int)self->cachedFilteredIndices.size() && (relY - rowIdx * 76.0f) <= 68.0f) {
                             self->selectedVaultRow = rowIdx;
-                            if (self->searchQuery.empty()) {
+                            if (self->searchQuery.empty() && self->EffectiveVaultFilter() == -1) {
                                 self->vaultDragIdx = (int)self->cachedFilteredIndices[(size_t)rowIdx];
                                 self->isVaultDragging = false;
                                 self->vaultDragStartDipY = dy;
@@ -6099,9 +6246,10 @@ private:
                 self->OnPaint();
                 return 0;
             case WM_CLOSE:
-                // Reset transient search query & slot assignment target when closing VaultWindow
+                // Reset transient search query, view filter & slot assignment target when closing VaultWindow
                 self->searchQuery.clear();
                 self->assignTargetSlot = -1;
+                self->vaultFilter = -1;
                 self->selectedVaultRow = -1;
                 self->scrollY = 0.0f;
                 self->InvalidateCaches();

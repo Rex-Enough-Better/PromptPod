@@ -142,8 +142,13 @@ try {
     & windres.exe -c 65001 -O coff "app.rc" -o $resObj
     if ($LASTEXITCODE -ne 0) { throw "windres failed with code $LASTEXITCODE" }
 
+    $gccVerRaw = (& g++.exe -dumpversion).Trim()
+    $gccMajor = 0
+    if ($gccVerRaw -match '^(\d+)') { $gccMajor = [int]$Matches[1] }
+    $optFlag = if ($gccMajor -ge 12) { "-Oz" } else { "-Os" }
+
     & g++.exe `
-        -std=c++17 -Os -s -DNDEBUG -fno-ident -Wall -Wextra -Wno-missing-field-initializers `
+        -std=c++17 $optFlag -s -DNDEBUG -fno-ident -Wall -Wextra -Wno-missing-field-initializers `
         -finput-charset=UTF-8 -fwide-exec-charset=UTF-16LE `
         -fno-exceptions -fno-rtti -ffunction-sections -fdata-sections "-Wl,--gc-sections" `
         -static -static-libgcc -static-libstdc++ `

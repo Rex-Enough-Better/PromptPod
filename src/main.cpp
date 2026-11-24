@@ -1773,6 +1773,60 @@ inline int RunHeadlessSelfTest(const std::wstring& testRootDir) {
             vw11.activeTab = 2;
             float topTab2 = vw11.ComputeContentTopDip();
             if (std::fabs((topTab0 - topTab2) - 40.0f) > 0.5f) return 208;
+
+            // 11e. v0.11.1 Vault scene/unmounted filter view: filters accurately, sorts scene view strictly by slot 01..10,
+            //      NEVER mutates dock activeSceneIndex, falls back cleanly when scene disabled or assignTargetSlot active!
+            {
+                AppState fltSt{};
+                StorageManager::SeedDefaults(fltSt, false); // Scene 0: seed_01/seed_02; Scene 1: seed_11/seed_12; 8 unmounted
+                // Reverse Scene 1 slots (slot 00 = seed_12, slot 01 = seed_11) to prove slot-order sorting overrides vault order!
+                fltSt.scenes[1].slots[0] = L"seed_12";
+                fltSt.scenes[1].slots[1] = L"seed_11";
+                fltSt.activeSceneIndex = 0;
+
+                VaultWindow vwFlt;
+                vwFlt.state = &fltSt;
+                vwFlt.storage = &uxSm;
+                vwFlt.activeTab = 0;
+                vwFlt.assignTargetSlot = -1;
+
+                // All view -> 12 items, Unmounted count -> 8
+                vwFlt.vaultFilter = -1;
+                vwFlt.InvalidateCaches();
+                vwFlt.EnsureVaultCache();
+                if (vwFlt.cachedFilteredIndices.size() != 12 || vwFlt.CountUnmountedVaultItems() != 8) return 219;
+
+                // Scene 1 ("产品") view -> strictly 2 items in slot order [seed_12, seed_11], activeSceneIndex untouched (still 0)!
+                vwFlt.vaultFilter = 1;
+                vwFlt.InvalidateCaches();
+                vwFlt.EnsureVaultCache();
+                if (vwFlt.cachedFilteredIndices.size() != 2 ||
+                    fltSt.vault[vwFlt.cachedFilteredIndices[0]].id != L"seed_12" ||
+                    fltSt.vault[vwFlt.cachedFilteredIndices[1]].id != L"seed_11" ||
+                    fltSt.activeSceneIndex != 0 ||
+                    vwFlt.TargetSceneForVaultAction() != 1) {
+                    return 220;
+                }
+
+                // Unmounted view -> strictly 8 items, none mounted in Scene 0 or Scene 1
+                vwFlt.vaultFilter = -2;
+                vwFlt.InvalidateCaches();
+                vwFlt.EnsureVaultCache();
+                if (vwFlt.cachedFilteredIndices.size() != 8) return 221;
+                for (size_t vi : vwFlt.cachedFilteredIndices) {
+                    if (fltSt.IsMountedInAnyEnabledScene(fltSt.vault[vi].id)) return 222;
+                }
+
+                // assignTargetSlot mode forces EffectiveVaultFilter back to -1 (All)
+                vwFlt.vaultFilter = 1;
+                vwFlt.assignTargetSlot = 3;
+                if (vwFlt.EffectiveVaultFilter() != -1 || vwFlt.TargetSceneForVaultAction() != 0) return 223;
+                vwFlt.assignTargetSlot = -1;
+
+                // Disabling Scene 1 automatically falls EffectiveVaultFilter back to -1 (All)
+                fltSt.SetSceneEnabled(1, false);
+                if (vwFlt.EffectiveVaultFilter() != -1) return 224;
+            }
             DiagLogger::Instance().Init(sm.dataDir);
         }
 
