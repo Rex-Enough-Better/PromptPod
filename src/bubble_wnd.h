@@ -404,9 +404,7 @@ private:
         rt->PopAxisAlignedClip();
 
         if (isOverflow && fmtFootHint) {
-            wchar_t fhBuf[128]{};
-            wsprintfW(fhBuf, L"\u5168\u6587\u5171 %u \u5B57\uFF08\u5DF2\u9884\u89C8\u524D\u6BB5\uFF09\u00B7 \u5DE6\u952E\u590D\u5236\u5B8C\u6574\u5185\u5BB9\uFF0C\u53F3\u952E\u7F16\u8F91", (unsigned)charCount);
-            std::wstring fhStr = UiText(fhBuf);
+            std::wstring fhStr = UiText(L"\u4EC5\u663E\u793A\u524D\u6BB5 \u00B7 \u5DE6\u952E\u590D\u5236\u5168\u6587\uFF0C\u53F3\u952E\u7F16\u8F91");
             rt->DrawTextW(fhStr.c_str(), (UINT32)fhStr.size(), fmtFootHint.Get(),
                           D2D1::RectF(box.left + 12.0f, box.bottom - 26.0f, box.right - 12.0f, box.bottom - 6.0f),
                           canvas.Brush(Rgba(Theme::AccentCyan, 0.88f * a)));

@@ -260,8 +260,10 @@ inline std::wstring BuildGitHubIssueUrl(bool isBug,
                                         const std::wstring& description,
                                         const std::wstring& osLabel,
                                         const std::wstring& diagnosticsSummary,
-                                        bool* outBodyTruncated = nullptr) {
+                                        bool* outBodyTruncated = nullptr,
+                                        bool* outDiagTruncated = nullptr) {
     if (outBodyTruncated) *outBodyTruncated = false;
+    if (outDiagTruncated) *outDiagTruncated = false;
     std::wstring url = APP_GITHUB_ISSUES_W L"/new?template=";
     url += isBug ? L"bug_report.yml" : L"feature_request.yml";
 
@@ -284,18 +286,36 @@ inline std::wstring BuildGitHubIssueUrl(bool isBug,
     if (isBug) {
         appendParam(L"version", L"v" APP_VERSION_W, kMaxUrlLen);
         appendParam(L"os", osLabel, kMaxUrlLen);
-        if (!appendParam(L"description", description, kMaxUrlLen)) {
-            if (outBodyTruncated) *outBodyTruncated = true;
-            std::wstring note = L"（反馈正文较长，已自动完整复制到剪贴板，请直接在此框按 Ctrl+V 粘贴）";
+        bool bodyTr = false;
+        bool diagTr = false;
+        std::wstring encodedDesc = description.empty() ? L"" : (L"&description=" + UrlEncodeUtf8(description));
+        std::wstring encodedDiag = diagnosticsSummary.empty() ? L"" : (L"&diagnostics=" + UrlEncodeUtf8(diagnosticsSummary));
+
+        if (!encodedDesc.empty() && url.size() + encodedDesc.size() <= kMaxUrlLen) {
+            url += encodedDesc;
+        } else if (!encodedDesc.empty()) {
+            bodyTr = true;
+            // Check whether diagnostics will ALSO miss URL budget so placeholder matches actual clipboard payload 1:1
+            bool diagWillMiss = !encodedDiag.empty() && (url.size() + encodedDiag.size() + 260 > kMaxUrlLen);
+            std::wstring note = diagWillMiss
+                ? L"（反馈正文与脱敏诊断已一并复制到剪贴板，请直接在此框按 Ctrl+V 粘贴）"
+                : L"（反馈正文较长，已自动完整复制到剪贴板，请直接在此框按 Ctrl+V 粘贴）";
             appendParam(L"description", note, kMaxUrlLen);
         }
-        if (!diagnosticsSummary.empty()) {
-            if (!appendParam(L"diagnostics", diagnosticsSummary, kMaxUrlLen)) {
-                // Keep URL under browser/ShellExecute limit; full diagnostics already copied to clipboard
-                std::wstring note = L"（完整脱敏诊断已自动复制到剪贴板，请直接在此框按 Ctrl+V 粘贴）";
+
+        if (!encodedDiag.empty()) {
+            if (url.size() + encodedDiag.size() <= kMaxUrlLen) {
+                url += encodedDiag;
+            } else {
+                diagTr = true;
+                std::wstring note = bodyTr
+                    ? L"（已随正文一并复制到剪贴板，粘贴正文后即可包含完整诊断）"
+                    : L"（完整脱敏诊断已自动复制到剪贴板，请直接在此框按 Ctrl+V 粘贴）";
                 appendParam(L"diagnostics", note, kMaxUrlLen);
             }
         }
+        if (outBodyTruncated) *outBodyTruncated = bodyTr;
+        if (outDiagTruncated) *outDiagTruncated = diagTr;
     } else {
         if (!appendParam(L"proposal", description, kMaxUrlLen)) {
             if (outBodyTruncated) *outBodyTruncated = true;
@@ -605,7 +625,7 @@ public:
             snap.downloadPercent = 0;
             snap.downloadedBytes = 0;
             snap.totalBytes = 0;
-            snap.statusText = L"正在连接 GitHub Releases 检查更新...";
+            snap.statusText = L"正在检查新版本...";
         }
         NotifyUi();
         if (!LaunchWorker([this, silent](std::shared_ptr<CancelCtx> ctx) {
@@ -614,7 +634,7 @@ public:
             {
                 SrwGuard lk(mu);
                 snap.phase = silent ? UpdatePhase::Idle : UpdatePhase::Error;
-                snap.statusText = silent ? L"" : L"无法启动更新检查线程，请稍后重试或前往发布页";
+                snap.statusText = silent ? L"" : L"暂时无法启动更新检查，请稍后重试或前往发布页";
             }
             NotifyUi();
             return false;
@@ -1052,7 +1072,7 @@ private:
                 snap.assetUrl = manifest.assetUrl;
                 snap.assetSize = manifest.assetSize;
                 snap.sha256 = manifest.sha256;
-                snap.statusText = L"发现新版本 v" + remoteVerStr + L" -- 点击「立即更新」下载并原地无损替换";
+                snap.statusText = L"发现新版本 v" + remoteVerStr + L"，点击右侧「更新并重启」即可自动升级";
             } else {
                 snap.canAutoInstall = false;
                 snap.releaseUrl = std::wstring(APP_GITHUB_URL_W) + L"/releases/tag/" + latestTag;
@@ -1060,7 +1080,7 @@ private:
                 snap.assetUrl.clear();
                 snap.assetSize = 0;
                 snap.sha256.clear();
-                snap.statusText = L"发现新版本 v" + remoteVerStr + L" -- 该版本未附带自动校验清单，请点击前往发布页下载";
+                snap.statusText = L"发现新版本 v" + remoteVerStr + L"，请点击「打开发布页」手动下载替换";
             }
         }
         DiagLogger::Instance().LogFmt("INFO", "UPDATER", L"Update available: v%ls (canAutoInstall=%d, manifestStatus=%lu)",
@@ -1180,7 +1200,7 @@ private:
             SrwGuard lk(mu);
             snap.phase = UpdatePhase::Installing;
             snap.downloadPercent = 100;
-            snap.statusText = L"校验通过，正在原地热替换并重启新版本...";
+            snap.statusText = L"安全校验通过，正在替换并重启新版本...";
         }
         NotifyUi();
 

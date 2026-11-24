@@ -156,29 +156,67 @@ inline std::wstring BuildSearchPreviewSnippet(const std::wstring& content, const
     DrawTopLitBorder(rt, box, radius, topColor, bottomColor, strokeWidth);
 }
 
+[[gnu::noinline]] inline HFONT CreateUiInputFont(float sizeDip, float dpiScale) {
+    return CreateFontW(-(int)std::round(sizeDip * dpiScale), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                       CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+}
+
+[[gnu::noinline]] inline std::wstring DeriveAutoPromptTitle(const std::wstring& body) {
+    size_t i = 0;
+    while (i < body.size()) {
+        wchar_t c = body[i];
+        if (c == L' ' || c == L'\t' || c == L'\r' || c == L'\n' ||
+            c == L'#' || c == L'>' || c == L'-' || c == L'*' || c == L'\x2022') {
+            ++i;
+        } else {
+            break;
+        }
+    }
+    std::wstring line;
+    size_t glyphs = 0;
+    for (; i < body.size() && glyphs < 14; ++i) {
+        wchar_t c = body[i];
+        if (c == L'\r' || c == L'\n') break;
+        if (c == L'\t') c = L' ';
+        if (c == L' ' && !line.empty() && line.back() == L' ') continue;
+        line.push_back(c);
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < body.size() && body[i + 1] >= 0xDC00 && body[i + 1] <= 0xDFFF) {
+            line.push_back(body[++i]);
+        }
+        ++glyphs;
+    }
+    while (!line.empty() && (line.back() == L' ' || line.back() == L':' || line.back() == L'\xFF1A')) line.pop_back();
+    return line.empty() ? std::wstring(L"\x672A\x547D\x540D Prompt") : line;
+}
+
 [[gnu::noinline]] inline void DrawDarkPillButton(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, IDWriteTextFormat* fmt,
                                                  const D2D1_RECT_F& r, const wchar_t* text, bool hov,
-                                                 uint32_t baseBg, uint32_t hoverBg, uint32_t textHex, float borderAlpha = 0.12f) {
-    br->SetColor(Rgba(hov ? hoverBg : baseBg, 1.0f));
+                                                 uint32_t baseBg, uint32_t hoverBg, uint32_t textHex,
+                                                 float borderAlpha = 0.12f, bool pressed = false) {
+    uint32_t fillHex = pressed ? baseBg : (hov ? hoverBg : baseBg);
+    br->SetColor(Rgba(fillHex, pressed ? 0.84f : 1.0f));
     rt->FillRoundedRectangle(D2D1::RoundedRect(r, 6.0f, 6.0f), br);
-    DrawRim(rt, r, 6.0f, Rgba(0xFFFFFF, hov ? borderAlpha + 0.10f : borderAlpha), Rgba(0xFFFFFF, 0.04f));
+    float topA = pressed ? (borderAlpha * 0.7f) : (hov ? borderAlpha + 0.10f : borderAlpha);
+    DrawRim(rt, r, 6.0f, Rgba(0xFFFFFF, topA), Rgba(0xFFFFFF, 0.04f));
     if (fmt && text && *text) {
         std::wstring s = UiText(text);
-        br->SetColor(Rgba(textHex, hov ? 1.0f : 0.92f));
+        br->SetColor(Rgba(textHex, pressed ? 0.85f : (hov ? 1.0f : 0.92f)));
         rt->DrawTextW(s.c_str(), (UINT32)s.size(), fmt, r, br);
     }
 }
 
 [[gnu::noinline]] inline void DrawDarkCheckbox(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br,
                                                const D2D1_RECT_F& cb, bool checked, bool hovered,
-                                               uint32_t accentHex = Theme::AccentCyan) {
-    br->SetColor(Rgba(checked ? 0x2563EB : (hovered ? 0x252B3B : 0x151924), 1.0f));
+                                               uint32_t accentHex = Theme::AccentCyan, bool locked = false) {
+    uint32_t fillHex = checked ? (locked ? 0x1E3A5F : 0x2563EB) : (hovered ? 0x252B3B : 0x151924);
+    br->SetColor(Rgba(fillHex, locked ? 0.72f : 1.0f));
     rt->FillRoundedRectangle(D2D1::RoundedRect(cb, 4.0f, 4.0f), br);
     DrawRim(rt, cb, 4.0f,
-            checked ? Rgba(accentHex, 0.72f) : Rgba(0xFFFFFF, hovered ? 0.28f : 0.18f),
+            checked ? Rgba(accentHex, locked ? 0.36f : 0.72f) : Rgba(0xFFFFFF, hovered ? 0.28f : 0.18f),
             Rgba(0xFFFFFF, 0.05f));
     if (checked) {
-        br->SetColor(Rgba(0xFFFFFF, 1.0f));
+        br->SetColor(Rgba(0xFFFFFF, locked ? 0.65f : 1.0f));
         rt->DrawLine(D2D1::Point2F(cb.left + 3.5f, cb.top + 8.2f), D2D1::Point2F(cb.left + 6.8f, cb.top + 11.6f), br, 1.8f);
         rt->DrawLine(D2D1::Point2F(cb.left + 6.8f, cb.top + 11.6f), D2D1::Point2F(cb.right - 3.2f, cb.top + 4.4f), br, 1.8f);
     }
@@ -790,17 +828,14 @@ private:
         dirtyConfirmArmed = false;
         std::wstring t = Trim(GetWndText(hEditTitle));
         std::wstring c = NormalizeLfFromEdit(GetWndText(hEditBody));
-        if (t.empty()) {
-            errorHint = UiText(L"\x8BF7\x586B\x5199\x7B80\x77ED\x6807\x9898\xFF08\x7528\x4E8E\x69FD\x4F4D\x5C55\x793A\xFF09");
-            SetFocus(hEditTitle);
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return;
-        }
         if (Trim(c).empty()) {
             errorHint = UiText(L"\x8BF7\x586B\x5199 Prompt \x6B63\x6587\x5185\x5BB9");
             SetFocus(hEditBody);
             InvalidateRect(hwnd, nullptr, FALSE);
             return;
+        }
+        if (t.empty()) {
+            t = DeriveAutoPromptTitle(c);
         }
         if (commitCallback) {
             std::wstring commitErr;
@@ -897,6 +932,7 @@ private:
             bool isOwnMsg = (msg.hwnd == hwnd || IsChild(hwnd, msg.hwnd));
             if (isOwnMsg && msg.message == WM_KEYDOWN) {
                 if (msg.wParam == VK_ESCAPE) {
+                    if ((msg.lParam & 0x40000000) != 0) continue; // Ignore auto-repeat hold
                     RequestCancel();
                     continue;
                 }
@@ -973,9 +1009,7 @@ private:
     }
 
     void RebuildEditFont() {
-        HFONT nextFont = CreateFontW(-(int)std::round(13.5f * dpiScale), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                     CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+        HFONT nextFont = CreateUiInputFont(13.5f, dpiScale);
         if (nextFont) {
             if (hEditTitle) SendMessageW(hEditTitle, WM_SETFONT, (WPARAM)nextFont, TRUE);
             if (hEditBody)  SendMessageW(hEditBody,  WM_SETFONT, (WPARAM)nextFont, TRUE);
@@ -1048,7 +1082,7 @@ private:
             // Title input label & live char count
             size_t titleChars = hEditTitle ? CountDisplayChars(GetWndText(hEditTitle)) : 0;
             size_t bodyChars  = hEditBody  ? CountDisplayChars(GetWndText(hEditBody))  : 0;
-            std::wstring lbl1 = UiText(L"\x69FD\x4F4D\x6807\x9898\xFF08\x7B80\x77ED\x597D\x8BA4\xFF0C\x5EFA\x8BAE 12 \x5B57\x4EE5\x5185\xFF09");
+            std::wstring lbl1 = UiText(L"\x6807\x9898\xFF08\x9009\x586B\xFF0C\x7559\x7A7A\x81EA\x52A8\x53D6\x6B63\x6587\x9996\x884C\xFF09");
             if (fmtLabel) {
                 rt->DrawTextW(lbl1.c_str(), (UINT32)lbl1.size(), fmtLabel.Get(),
                               D2D1::RectF(20.0f, 48.0f, cw - 92.0f, 68.0f), Br(Rgba(Theme::TextSecondary)));
@@ -1098,24 +1132,11 @@ private:
                               D2D1::RectF(20.0f, ch - 46.0f, rcCancelBtn.left - 10.0f, ch - 14.0f), Br(hc));
             }
 
-            // Cancel button
-            rt->FillRoundedRectangle(D2D1::RoundedRect(rcCancelBtn, 7.0f, 7.0f),
-                                     Br(Rgba(hoverBtn == 1 ? 0x282F42 : 0x1D2230, 1.0f)));
-            DrawRim(rt.Get(), rcCancelBtn, 7.0f, Rgba(0xFFFFFF, 0.12f), Rgba(0xFFFFFF, 0.05f));
-            std::wstring sCancel = L"\x53D6\x6D88";
-            if (fmtBtn) {
-                rt->DrawTextW(sCancel.c_str(), (UINT32)sCancel.size(), fmtBtn.Get(), rcCancelBtn,
-                              Br(Rgba(Theme::TextSecondary, hoverBtn == 1 ? 1.0f : 0.85f)));
-            }
-
-            // Save button
-            rt->FillRoundedRectangle(D2D1::RoundedRect(rcSaveBtn, 7.0f, 7.0f),
-                                     Br(Rgba(hoverBtn == 2 ? 0x4F8EF7 : 0x3B7BF6, 1.0f)));
-            DrawRim(rt.Get(), rcSaveBtn, 7.0f, Rgba(0xFFFFFF, 0.28f), Rgba(0xFFFFFF, 0.08f));
-            std::wstring sSave = L"\x4FDD\x5B58";
-            if (fmtBtn) {
-                rt->DrawTextW(sSave.c_str(), (UINT32)sSave.size(), fmtBtn.Get(), rcSaveBtn, Br(Rgba(0xFFFFFF, 1.0f)));
-            }
+            // Cancel & Save buttons
+            DrawDarkPillButton(rt.Get(), brush.Get(), fmtBtn.Get(), rcCancelBtn, L"\x53D6\x6D88",
+                               hoverBtn == 1, 0x1D2230, 0x282F42, Theme::TextSecondary, 0.12f, pressedBtn == 1);
+            DrawDarkPillButton(rt.Get(), brush.Get(), fmtBtn.Get(), rcSaveBtn, L"\x4FDD\x5B58",
+                               hoverBtn == 2, 0x3B7BF6, 0x4F8EF7, 0xFFFFFF, 0.28f, pressedBtn == 2);
 
             if (rt->EndDraw() == D2DERR_RECREATE_TARGET) {
                 brush.Reset();
@@ -1197,6 +1218,12 @@ private:
                 if (self->bodyScroll.OnParentMouseWheel(wp, spt)) return 0;
                 break;
             }
+            case WM_SETCURSOR:
+                if (LOWORD(lp) == HTCLIENT) {
+                    SetCursor(LoadCursorW(nullptr, self->hoverBtn != 0 ? IDC_HAND : IDC_ARROW));
+                    return TRUE;
+                }
+                break;
             case WM_LBUTTONDOWN: {
                 float x = (float)(short)LOWORD(lp) / self->dpiScale;
                 float y = (float)(short)HIWORD(lp) / self->dpiScale;
@@ -1205,9 +1232,11 @@ private:
                 if (PtInDip(self->rcCancelBtn, x, y)) {
                     self->pressedBtn = 1;
                     SetCapture(h);
+                    InvalidateRect(h, nullptr, FALSE);
                 } else if (PtInDip(self->rcSaveBtn, x, y)) {
                     self->pressedBtn = 2;
                     SetCapture(h);
+                    InvalidateRect(h, nullptr, FALSE);
                 }
                 return 0;
             }
@@ -1249,6 +1278,7 @@ private:
                 self->pressedBtn = 0;
                 if (GetCapture() == h) ReleaseCapture();
                 if (downBtn == 0) return 0;
+                InvalidateRect(h, nullptr, FALSE);
                 float x = (float)(short)LOWORD(lp) / self->dpiScale;
                 float y = (float)(short)HIWORD(lp) / self->dpiScale;
                 if (downBtn == 1 && PtInDip(self->rcCancelBtn, x, y)) self->RequestCancel();
@@ -1256,7 +1286,7 @@ private:
                 return 0;
             }
             case WM_CAPTURECHANGED:
-                self->pressedBtn = 0;
+                if (self->pressedBtn != 0) { self->pressedBtn = 0; InvalidateRect(h, nullptr, FALSE); }
                 self->bodyScroll.OnParentCaptureChanged();
                 return 0;
             case WM_DPICHANGED: {
@@ -1295,8 +1325,8 @@ class DarkConfirmDialog {
 public:
     static bool Show(HINSTANCE hInst, HWND parent, const std::wstring& title,
                      const std::wstring& body, const std::wstring& confirmLabel = L"确认",
-                     const std::wstring& cancelLabel = L"取消") {
-        DarkConfirmDialog dlg(hInst, title, body, confirmLabel, cancelLabel);
+                     const std::wstring& cancelLabel = L"取消", bool isDanger = false) {
+        DarkConfirmDialog dlg(hInst, title, body, confirmLabel, cancelLabel, isDanger);
         dlg.RunModal(parent);
         return dlg.accepted;
     }
@@ -1314,9 +1344,12 @@ private:
     std::wstring bodyText;
     std::wstring confirmText;
     std::wstring cancelText;
+    bool dangerMode = false;
     float dpiScale = 1.0f;
     int hoverBtn = 0;   // 1 cancel, 2 confirm
     int pressedBtn = 0; // 1 cancel, 2 confirm
+    int focusBtn = 1;   // 1 cancel (default on danger), 2 confirm (default on normal)
+    bool kbFocusMoved = false;
     bool trackingLeave = false;
     bool done = false;
     bool accepted = false;
@@ -1325,9 +1358,10 @@ private:
     D2D1_RECT_F rcConfirmBtn{};
 
     DarkConfirmDialog(HINSTANCE inst, const std::wstring& hd, const std::wstring& body,
-                      const std::wstring& okLbl, const std::wstring& cancelLbl)
+                      const std::wstring& okLbl, const std::wstring& cancelLbl, bool isDanger)
         : hInst(inst), heading(UiText(hd)), bodyText(UiText(body)),
-          confirmText(UiText(okLbl)), cancelText(UiText(cancelLbl)) {}
+          confirmText(UiText(okLbl)), cancelText(UiText(cancelLbl)), dangerMode(isDanger),
+          focusBtn(isDanger ? 1 : 2) {}
 
     static bool PtInDip(const D2D1_RECT_F& r, float x, float y) {
         return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
@@ -1382,27 +1416,27 @@ private:
 
             D2D1_RECT_F infoBox = D2D1::RectF(20.0f, 52.0f, cw - 20.0f, ch - 64.0f);
             rt->FillRoundedRectangle(D2D1::RoundedRect(infoBox, 8.0f, 8.0f), Br(Rgba(Theme::CardBg, 1.0f)));
-            DrawRim(rt.Get(), infoBox, 8.0f, Rgba(Theme::AccentCyan, 0.28f), Rgba(0xFFFFFF, 0.05f));
+            DrawRim(rt.Get(), infoBox, 8.0f,
+                    dangerMode ? Rgba(Theme::DangerRed, 0.42f) : Rgba(Theme::AccentCyan, 0.28f),
+                    Rgba(0xFFFFFF, 0.05f));
             if (fmtBody) {
                 rt->DrawTextW(bodyText.c_str(), (UINT32)bodyText.size(), fmtBody.Get(),
                               D2D1::RectF(infoBox.left + 14.0f, infoBox.top + 12.0f, infoBox.right - 14.0f, infoBox.bottom - 10.0f),
                               Br(Rgba(Theme::TextSecondary, 0.96f)));
             }
 
-            rt->FillRoundedRectangle(D2D1::RoundedRect(rcCancelBtn, 7.0f, 7.0f),
-                                     Br(Rgba(hoverBtn == 1 ? 0x282F42 : 0x1D2230, 1.0f)));
-            DrawRim(rt.Get(), rcCancelBtn, 7.0f, Rgba(0xFFFFFF, 0.14f), Rgba(0xFFFFFF, 0.05f));
-            if (fmtBtn) {
-                rt->DrawTextW(cancelText.c_str(), (UINT32)cancelText.size(), fmtBtn.Get(), rcCancelBtn,
-                              Br(Rgba(Theme::TextSecondary, hoverBtn == 1 ? 1.0f : 0.88f)));
-            }
-
-            rt->FillRoundedRectangle(D2D1::RoundedRect(rcConfirmBtn, 7.0f, 7.0f),
-                                     Br(Rgba(hoverBtn == 2 ? 0x4F8EF7 : 0x3B7BF6, 1.0f)));
-            DrawRim(rt.Get(), rcConfirmBtn, 7.0f, Rgba(0xFFFFFF, 0.28f), Rgba(0xFFFFFF, 0.08f));
-            if (fmtBtn) {
-                rt->DrawTextW(confirmText.c_str(), (UINT32)confirmText.size(), fmtBtn.Get(), rcConfirmBtn,
-                              Br(Rgba(0xFFFFFF, 1.0f)));
+            DrawDarkPillButton(rt.Get(), brush.Get(), fmtBtn.Get(), rcCancelBtn, cancelText.c_str(),
+                               hoverBtn == 1, 0x1D2230, 0x282F42, Theme::TextSecondary, 0.14f, pressedBtn == 1);
+            DrawDarkPillButton(rt.Get(), brush.Get(), fmtBtn.Get(), rcConfirmBtn, confirmText.c_str(),
+                               hoverBtn == 2,
+                               dangerMode ? 0xB91C1C : 0x3B7BF6,
+                               dangerMode ? 0xDC2626 : 0x4F8EF7,
+                               0xFFFFFF, 0.28f, pressedBtn == 2);
+            if (focusBtn == 1 || focusBtn == 2) {
+                const D2D1_RECT_F& fr = (focusBtn == 1) ? rcCancelBtn : rcConfirmBtn;
+                D2D1_RECT_F ring = D2D1::RectF(fr.left - 2.0f, fr.top - 2.0f, fr.right + 2.0f, fr.bottom + 2.0f);
+                rt->DrawRoundedRectangle(D2D1::RoundedRect(ring, 7.5f, 7.5f),
+                                         Br(Rgba(focusBtn == 2 && dangerMode ? Theme::DangerRed : Theme::AccentCyan, 0.72f)), 1.4f);
             }
 
             if (rt->EndDraw() == D2DERR_RECREATE_TARGET) {
@@ -1470,8 +1504,24 @@ private:
                     Finish(false);
                     continue;
                 }
+                if (msg.wParam == VK_TAB || msg.wParam == VK_LEFT || msg.wParam == VK_RIGHT) {
+                    focusBtn = (focusBtn == 1) ? 2 : 1;
+                    kbFocusMoved = true;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    continue;
+                }
+                if (msg.wParam == VK_SPACE) {
+                    if (focusBtn == 1) Finish(false);
+                    else if (!dangerMode || kbFocusMoved) Finish(true);
+                    continue;
+                }
+                // Never allow accidental bare Enter to execute destructive confirmation unless user explicitly navigated to Confirm!
                 if (msg.wParam == VK_RETURN) {
-                    Finish(true);
+                    if (!dangerMode) {
+                        Finish(focusBtn == 2);
+                    } else if (kbFocusMoved) {
+                        Finish(focusBtn == 2);
+                    }
                     continue;
                 }
             }
@@ -1509,6 +1559,12 @@ private:
             case WM_PAINT:
                 self->OnPaint();
                 return 0;
+            case WM_SETCURSOR:
+                if (LOWORD(lp) == HTCLIENT) {
+                    SetCursor(LoadCursorW(nullptr, self->hoverBtn != 0 ? IDC_HAND : IDC_ARROW));
+                    return TRUE;
+                }
+                break;
             case WM_LBUTTONDOWN: {
                 float x = (float)(short)LOWORD(lp) / self->dpiScale;
                 float y = (float)(short)HIWORD(lp) / self->dpiScale;
@@ -1516,9 +1572,11 @@ private:
                 if (PtInDip(self->rcCancelBtn, x, y)) {
                     self->pressedBtn = 1;
                     SetCapture(h);
+                    InvalidateRect(h, nullptr, FALSE);
                 } else if (PtInDip(self->rcConfirmBtn, x, y)) {
                     self->pressedBtn = 2;
                     SetCapture(h);
+                    InvalidateRect(h, nullptr, FALSE);
                 }
                 return 0;
             }
@@ -1550,6 +1608,7 @@ private:
                 self->pressedBtn = 0;
                 if (GetCapture() == h) ReleaseCapture();
                 if (downBtn == 0) return 0;
+                InvalidateRect(h, nullptr, FALSE);
                 float x = (float)(short)LOWORD(lp) / self->dpiScale;
                 float y = (float)(short)HIWORD(lp) / self->dpiScale;
                 if (downBtn == 1 && PtInDip(self->rcCancelBtn, x, y)) self->Finish(false);
@@ -1557,7 +1616,7 @@ private:
                 return 0;
             }
             case WM_CAPTURECHANGED:
-                self->pressedBtn = 0;
+                if (self->pressedBtn != 0) { self->pressedBtn = 0; InvalidateRect(h, nullptr, FALSE); }
                 return 0;
             case WM_DPICHANGED: {
                 self->dpiScale = (float)HIWORD(wp) / 96.0f;
@@ -1655,7 +1714,7 @@ private:
         }
         int units = VisualWidthUnits(trimmed);
         if (units > kMaxSceneNameWidthUnits) {
-            errorHint = UiText(L"超出 8 视觉宽度上限（最多 4 个汉字或 8 个英文），请精简");
+            errorHint = UiText(L"名称过长（最多 4 个汉字或 8 个英文），请精简");
             SetFocus(hEdit);
             InvalidateRect(hwnd, nullptr, FALSE);
             return;
@@ -1722,7 +1781,7 @@ private:
             if (fmtLabel) rt->DrawTextW(lbl.c_str(), (UINT32)lbl.size(), fmtLabel.Get(), D2D1::RectF(20.0f, 48.0f, cw - 92.0f, 68.0f), brush.Get());
 
             wchar_t cntBuf[32]{};
-            wsprintfW(cntBuf, L"%d / %d 宽度", units, kMaxSceneNameWidthUnits);
+            wsprintfW(cntBuf, L"已用 %d / %d", units, kMaxSceneNameWidthUnits);
             std::wstring cnt = UiText(cntBuf);
             brush->SetColor(Rgba(overLimit ? Theme::DangerRed : Theme::AccentCyan, 0.96f));
             if (fmtCount) rt->DrawTextW(cnt.c_str(), (UINT32)cnt.size(), fmtCount.Get(), D2D1::RectF(cw - 94.0f, 48.0f, cw - 20.0f, 68.0f), brush.Get());
@@ -1735,22 +1794,19 @@ private:
                              Rgba(0xFFFFFF, 0.05f));
 
             std::wstring hint = errorHint.empty()
-                ? UiText(L"示例：通用、思考、开发、深度复盘、Coding（Enter 保存）")
+                ? UiText(L"示例：通用、产品、开发、写作、Coding（Enter 保存）")
                 : errorHint;
             brush->SetColor(errorHint.empty() ? Rgba(Theme::TextMuted, 0.92f) : Rgba(Theme::DangerRed, 0.96f));
             if (fmtLabel) rt->DrawTextW(hint.c_str(), (UINT32)hint.size(), fmtLabel.Get(), D2D1::RectF(20.0f, 118.0f, cw - 20.0f, 142.0f), brush.Get());
 
-            brush->SetColor(Rgba(hoverBtn == 1 ? 0x282F42 : 0x1D2230));
-            rt->FillRoundedRectangle(D2D1::RoundedRect(rcCancel, 7.0f, 7.0f), brush.Get());
-            DrawRim(rt.Get(), rcCancel, 7.0f, Rgba(0xFFFFFF, 0.12f), Rgba(0xFFFFFF, 0.05f));
-            brush->SetColor(Rgba(Theme::TextSecondary, hoverBtn == 1 ? 1.0f : 0.86f));
-            if (fmtBtn) rt->DrawTextW(L"取消", 2, fmtBtn.Get(), rcCancel, brush.Get());
-
-            brush->SetColor(Rgba(hoverBtn == 2 ? 0x4F8EF7 : 0x3B7BF6));
-            rt->FillRoundedRectangle(D2D1::RoundedRect(rcSave, 7.0f, 7.0f), brush.Get());
-            DrawRim(rt.Get(), rcSave, 7.0f, Rgba(0xFFFFFF, 0.28f), Rgba(0xFFFFFF, 0.08f));
-            brush->SetColor(Rgba(0xFFFFFF));
-            if (fmtBtn) rt->DrawTextW(L"保存", 2, fmtBtn.Get(), rcSave, brush.Get());
+            DrawDarkPillButton(rt.Get(), brush.Get(), fmtBtn.Get(), rcCancel, L"取消",
+                               hoverBtn == 1, 0x1D2230, 0x282F42, Theme::TextSecondary, 0.12f, pressedBtn == 1);
+            DrawDarkPillButton(rt.Get(), brush.Get(), fmtBtn.Get(), rcSave, L"保存",
+                               !overLimit && hoverBtn == 2,
+                               overLimit ? 0x1C2230 : 0x3B7BF6,
+                               overLimit ? 0x1C2230 : 0x4F8EF7,
+                               overLimit ? Theme::TextMuted : 0xFFFFFF,
+                               overLimit ? 0.08f : 0.28f, !overLimit && pressedBtn == 2);
 
             if (rt->EndDraw() == D2DERR_RECREATE_TARGET) { brush.Reset(); rt.Reset(); }
         }
@@ -1788,8 +1844,7 @@ private:
         }
         ApplyWin11DarkWindowAttributes(hwnd);
         hBrushBg = CreateSolidBrush(RGB(27, 31, 43));
-        hFont = CreateFontW(-(int)std::round(13.5f * dpiScale), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+        hFont = CreateUiInputFont(13.5f, dpiScale);
         hEdit = CreateWindowExW(0, L"EDIT", initName.c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
                                 0, 0, 100, 24, hwnd, (HMENU)3001, hInst, nullptr);
         if (hEdit) {
@@ -1851,11 +1906,17 @@ private:
                     else if (HIWORD(wp) == EN_CHANGE) { self->errorHint.clear(); InvalidateRect(h, nullptr, FALSE); }
                 }
                 return 0;
+            case WM_SETCURSOR:
+                if (LOWORD(lp) == HTCLIENT) {
+                    SetCursor(LoadCursorW(nullptr, self->hoverBtn != 0 ? IDC_HAND : IDC_ARROW));
+                    return TRUE;
+                }
+                break;
             case WM_PAINT: self->OnPaint(); return 0;
             case WM_LBUTTONDOWN: {
                 float x = (float)(short)LOWORD(lp) / self->dpiScale, y = (float)(short)HIWORD(lp) / self->dpiScale;
                 self->pressedBtn = PtIn(self->rcCancel, x, y) ? 1 : (PtIn(self->rcSave, x, y) ? 2 : 0);
-                if (self->pressedBtn) SetCapture(h);
+                if (self->pressedBtn) { SetCapture(h); InvalidateRect(h, nullptr, FALSE); }
                 return 0;
             }
             case WM_MOUSEMOVE: {
@@ -1872,12 +1933,30 @@ private:
             case WM_LBUTTONUP: {
                 int down = self->pressedBtn; self->pressedBtn = 0;
                 if (GetCapture() == h) ReleaseCapture();
+                if (down != 0) InvalidateRect(h, nullptr, FALSE);
                 float x = (float)(short)LOWORD(lp) / self->dpiScale, y = (float)(short)HIWORD(lp) / self->dpiScale;
                 if (down == 1 && PtIn(self->rcCancel, x, y)) { self->done = true; DestroyWindow(h); }
                 else if (down == 2 && PtIn(self->rcSave, x, y)) self->TryCommit();
                 return 0;
             }
-            case WM_CAPTURECHANGED: self->pressedBtn = 0; return 0;
+            case WM_CAPTURECHANGED:
+                if (self->pressedBtn != 0) { self->pressedBtn = 0; InvalidateRect(h, nullptr, FALSE); }
+                return 0;
+            case WM_DPICHANGED: {
+                self->dpiScale = (float)HIWORD(wp) / 96.0f;
+                self->brush.Reset(); self->rt.Reset();
+                auto* sug = reinterpret_cast<RECT*>(lp);
+                SetWindowPos(h, nullptr, sug->left, sug->top, sug->right - sug->left, sug->bottom - sug->top, SWP_NOZORDER | SWP_NOACTIVATE);
+                HFONT nf = CreateUiInputFont(13.5f, self->dpiScale);
+                if (nf) {
+                    if (self->hEdit) SendMessageW(self->hEdit, WM_SETFONT, (WPARAM)nf, TRUE);
+                    if (self->hFont) DeleteObject(self->hFont);
+                    self->hFont = nf;
+                }
+                self->Layout();
+                InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
             case WM_CLOSE: self->done = true; DestroyWindow(h); return 0;
             case WM_DESTROY: self->done = true; return 0;
             case WM_NCDESTROY: SetWindowLongPtrW(h, GWLP_USERDATA, 0); self->hwnd = nullptr; return 0;
@@ -1994,7 +2073,10 @@ private:
     }
 
     void DrawBtn(const D2D1_RECT_F& r, const wchar_t* txt, int zIdx, uint32_t bg, uint32_t bgHov, uint32_t fg, float rimA = 0.14f) {
-        DrawDarkPillButton(rt.Get(), brush.Get(), fmtBtn.Get(), r, txt, zIdx == hoverZoneIdx, bg, bgHov, fg, rimA);
+        bool isPressed = (zIdx >= 0 && zIdx < (int)zones.size() &&
+                          zones[(size_t)zIdx].kind == pressedKind &&
+                          zones[(size_t)zIdx].pid == pressedPid);
+        DrawDarkPillButton(rt.Get(), brush.Get(), fmtBtn.Get(), r, txt, zIdx == hoverZoneIdx, bg, bgHov, fg, rimA, isPressed);
     }
 
     [[gnu::noinline]] void OnPaint() {
@@ -2043,18 +2125,27 @@ private:
             int zNew = AddZone(1, rcNew);
             DrawBtn(rcNew, L"+ 新建 Prompt", zNew, 0x366EF0, 0x4B82F8, 0xFFFFFF, 0.25f);
 
-            // Inline hint / status bar
+            // Inline hint / status bar (plus quick '立即启用' button if this scene is currently hidden on dock)
+            bool sceneHidden = !state->scenes[(size_t)sceneIndex].enabled;
             std::wstring tip = statusText.empty()
-                ? UiText(L"勾选即放入此场景空槽，取消勾选仅移出此场景（保留词舱与统计）；点右侧「编辑」可修改正文")
+                ? UiText(sceneHidden
+                    ? L"此场景当前未在贴边面板显示，配置后可点击右侧「立即启用」"
+                    : L"勾选加入此场景，取消勾选仅移出场景、不删词舱内容")
                 : statusText;
-            uint32_t tipCol = statusText.empty() ? Theme::TextMuted : (statusIsErr ? Theme::DangerRed : Theme::CopyGreen);
+            uint32_t tipCol = statusText.empty() ? (sceneHidden ? 0xFBBF24 : Theme::TextMuted) : (statusIsErr ? Theme::DangerRed : Theme::CopyGreen);
+            float tipRight = sceneHidden ? (cw - 104.0f) : (cw - 18.0f);
             if (fmtBody) {
                 rt->DrawTextW(tip.c_str(), (UINT32)tip.size(), fmtBody.Get(),
-                              D2D1::RectF(18.0f, 62.0f, cw - 18.0f, 82.0f), Br(Rgba(tipCol, 0.95f)));
+                              D2D1::RectF(18.0f, 62.0f, tipRight, 84.0f), Br(Rgba(tipCol, 0.95f)));
+            }
+            if (sceneHidden) {
+                D2D1_RECT_F rcEn = D2D1::RectF(cw - 96.0f, 61.0f, cw - 18.0f, 83.0f);
+                int zEn = AddZone(3, rcEn);
+                DrawBtn(rcEn, L"立即启用", zEn, 0x1E3A5F, 0x284D7E, Theme::AccentCyan, 0.30f);
             }
 
             // Scrollable checklist viewport
-            float listTop = 86.0f;
+            float listTop = 88.0f;
             float listBot = ch - 52.0f;
             D2D1_RECT_F vp = D2D1::RectF(0.0f, listTop, cw, listBot);
             viewportH = std::max(60.0f, vp.bottom - vp.top);
@@ -2101,15 +2192,17 @@ private:
                     }
 
                     if (fmtTitle) {
+                        float titleA = checked ? 0.98f : (isFull ? 0.56f : 0.88f);
                         rt->DrawTextW(item->title.c_str(), (UINT32)item->title.size(), fmtTitle.Get(),
                                       D2D1::RectF(textLeft, card.top + 6.0f, editBtnR.left - 10.0f, card.top + 27.0f),
-                                      Br(Rgba(Theme::TextPrimary, checked ? 0.98f : 0.88f)));
+                                      Br(Rgba(Theme::TextPrimary, titleA)));
                     }
                     std::wstring prev = CollapseWhitespaceSingleLine(item->content, 78);
                     if (fmtBody) {
+                        float bodyA = checked ? 0.78f : (isFull ? 0.48f : 0.78f);
                         rt->DrawTextW(prev.c_str(), (UINT32)prev.size(), fmtBody.Get(),
                                       D2D1::RectF(cb.right + 10.0f, card.top + 29.0f, editBtnR.left - 10.0f, card.bottom - 5.0f),
-                                      Br(Rgba(Theme::TextSecondary, 0.78f)));
+                                      Br(Rgba(Theme::TextSecondary, bodyA)));
                     }
 
                     DrawBtn(editBtnR, L"编辑", zEd, 0x222736, 0x2D3448, Theme::TextSecondary, 0.10f);
@@ -2190,10 +2283,34 @@ private:
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
+    [[gnu::noinline]] void HandleEnableSceneNow() {
+        if (!state || !storage || state->scenes[(size_t)sceneIndex].enabled) return;
+        AppState candidate = *state;
+        candidate.SetSceneEnabled(sceneIndex, true);
+        if (!storage->Save(candidate)) {
+            statusText = UiText(storage->readOnlyRecoveryMode
+                ? L"只读保护模式：无法保存，请先恢复备份"
+                : L"保存失败：无法写入数据文件");
+            statusIsErr = true;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return;
+        }
+        *state = std::move(candidate);
+        statusText = UiText(L"已启用场景「" + state->scenes[(size_t)sceneIndex].name + L"」，贴边面板已同步显示");
+        statusIsErr = false;
+        NotifyMutated();
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+
     [[gnu::noinline]] void HandleNewPrompt() {
         if (!state || !storage) return;
+        bool wasFull = (state->CountMountedInScene(sceneIndex) >= 10);
         wchar_t hdBuf[96]{};
-        _snwprintf_s(hdBuf, _countof(hdBuf), _TRUNCATE, L"新建 Prompt 并加入「%ls」", state->scenes[(size_t)sceneIndex].name.c_str());
+        if (wasFull) {
+            wcscpy_s(hdBuf, L"新建 Prompt 到词舱（当前场景已满）");
+        } else {
+            _snwprintf_s(hdBuf, _countof(hdBuf), _TRUNCATE, L"新建 Prompt 并加入「%ls」", state->scenes[(size_t)sceneIndex].name.c_str());
+        }
         int mountedSlot = -1;
         std::wstring createdId;
         auto res = PromptEditorDialog::Show(hInst, hwnd, hdBuf, L"", L"",
@@ -2221,12 +2338,12 @@ private:
         scrollY = 0.0f;
         if (mountedSlot >= 0) {
             wchar_t mb[64]{};
-            wsprintfW(mb, L"已新建并装配到槽位 %02d", mountedSlot + 1);
+            wsprintfW(mb, L"已新建并放入槽位 %02d", mountedSlot + 1);
             statusText = UiText(mb);
             statusIsErr = false;
         } else {
-            statusText = UiText(L"已存入词舱（当前场景 10 槽已满，请先取消勾选其他条目）");
-            statusIsErr = true;
+            statusText = UiText(L"已存入词舱，取消勾选任意条目后即可加入此场景");
+            statusIsErr = false;
         }
         NotifyMutated();
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -2349,6 +2466,12 @@ private:
                 InvalidateRect(h, nullptr, FALSE);
                 return 0;
             }
+            case WM_SETCURSOR:
+                if (LOWORD(lp) == HTCLIENT) {
+                    SetCursor(LoadCursorW(nullptr, self->hoverZoneIdx >= 0 ? IDC_HAND : IDC_ARROW));
+                    return TRUE;
+                }
+                break;
             case WM_LBUTTONDOWN: {
                 float x = (float)(short)LOWORD(lp) / self->dpiScale;
                 float y = (float)(short)HIWORD(lp) / self->dpiScale;
@@ -2363,6 +2486,7 @@ private:
                     self->pressedKind = self->zones[(size_t)hz].kind;
                     self->pressedPid = self->zones[(size_t)hz].pid;
                     SetCapture(h);
+                    InvalidateRect(h, nullptr, FALSE);
                 }
                 return 0;
             }
@@ -2410,19 +2534,21 @@ private:
                 self->pressedKind = 0; self->pressedPid.clear();
                 if (GetCapture() == h) ReleaseCapture();
                 if (downK == 0) return 0;
+                InvalidateRect(h, nullptr, FALSE);
                 float x = (float)(short)LOWORD(lp) / self->dpiScale;
                 float y = (float)(short)HIWORD(lp) / self->dpiScale;
                 int hz = self->HitZone(x, y);
                 if (hz >= 0 && self->zones[(size_t)hz].kind == downK && self->zones[(size_t)hz].pid == downPid) {
                     if (downK == 1) self->HandleNewPrompt();
                     else if (downK == 2) { self->done = true; DestroyWindow(h); }
+                    else if (downK == 3) self->HandleEnableSceneNow();
                     else if (downK == 10) self->HandleTogglePrompt(downPid);
                     else if (downK == 11) self->HandleEditPrompt(downPid);
                 }
                 return 0;
             }
             case WM_CAPTURECHANGED:
-                self->pressedKind = 0; self->pressedPid.clear();
+                if (self->pressedKind != 0) { self->pressedKind = 0; self->pressedPid.clear(); InvalidateRect(h, nullptr, FALSE); }
                 self->scrollbar.dragging = false;
                 return 0;
             case WM_CLOSE: self->done = true; DestroyWindow(h); return 0;
@@ -2483,6 +2609,8 @@ private:
     int pressedZone = 0; // Press-release ownership
     int focusedEdit = 0; // 0 none, 1 title, 2 body
     bool trackingLeave = false;
+    bool dirtyConfirmArmed = false;
+    ULONGLONG dirtyConfirmTick = 0;
     bool done = false;
     Result result{};
     std::wstring inlineStatus;
@@ -2549,8 +2677,8 @@ private:
 
     void OpenXFallback() {
         bool copied = false;
-        if (state && storage) {
-            std::wstring diag = BuildSanitizedDiagnostics(*state, *storage, includeDiagnostics);
+        if (state && storage && isBug && includeDiagnostics) {
+            std::wstring diag = BuildSanitizedDiagnostics(*state, *storage, true);
             copied = CopyTextToClipboard(hwnd, diag);
         }
         INT_PTR r = reinterpret_cast<INT_PTR>(ShellExecuteW(hwnd, L"open", APP_X_URL_W, nullptr, nullptr, SW_SHOWNORMAL));
@@ -2561,7 +2689,7 @@ private:
             return;
         }
         result.outcome = Outcome::OpenedX;
-        result.includeDiagnostics = includeDiagnostics;
+        result.includeDiagnostics = isBug && includeDiagnostics;
         result.clipboardCopied = copied;
         result.bodyCopiedToClipboard = false;
         done = true;
@@ -2573,29 +2701,36 @@ private:
         std::wstring body = Trim(NormalizeLf(GetWndText(hEditBody)));
         std::wstring osStr = GetRealWindowsVersionString();
         std::wstring diag;
-        if (state && storage && includeDiagnostics) {
-            diag = BuildSanitizedDiagnostics(*state, *storage, isBug);
+        bool wantDiag = isBug && includeDiagnostics;
+        if (state && storage && wantDiag) {
+            diag = BuildSanitizedDiagnostics(*state, *storage, true);
         }
 
         bool bodyTruncated = false;
-        std::wstring url = BuildGitHubIssueUrl(isBug, title, body, osStr, diag, &bodyTruncated);
+        bool diagTruncated = false;
+        std::wstring url = BuildGitHubIssueUrl(isBug, title, body, osStr, diag, &bodyTruncated, &diagTruncated);
 
+        // Only touch user's clipboard when content/diagnostics exceeded URL limit and could not be pre-filled!
+        // Copy BEFORE opening GitHub so a clipboard failure NEVER tells the user to paste stale clipboard content into a public Issue!
         bool copied = false;
-        if (bodyTruncated) {
-            std::wstring fullClip = body;
-            if (!diag.empty()) {
-                if (!fullClip.empty()) fullClip += L"\n\n---\n\n";
-                fullClip += diag;
+        if (bodyTruncated || (diagTruncated && !diag.empty())) {
+            std::wstring clipPayload;
+            if (bodyTruncated) {
+                clipPayload = body;
+                if (diagTruncated && !diag.empty()) {
+                    if (!clipPayload.empty()) clipPayload += L"\n\n---\n\n";
+                    clipPayload += diag;
+                }
+            } else {
+                clipPayload = diag;
             }
-            copied = CopyTextToClipboard(hwnd, fullClip);
+            copied = CopyTextToClipboard(hwnd, clipPayload);
             if (!copied) {
-                inlineStatus = UiText(L"正文较长且写入剪贴板失败，请释放剪贴板占用后重试");
+                inlineStatus = UiText(L"内容较长且写入剪贴板失败，请释放剪贴板占用后重试");
                 inlineStatusOk = false;
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return;
             }
-        } else if (!diag.empty()) {
-            copied = CopyTextToClipboard(hwnd, diag);
         }
 
         INT_PTR r = reinterpret_cast<INT_PTR>(ShellExecuteW(hwnd, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
@@ -2605,17 +2740,33 @@ private:
             InvalidateRect(hwnd, nullptr, FALSE);
             return;
         }
-        DiagLogger::Instance().LogFmt("INFO", "FEEDBACK", L"Opened GitHub Issue form (type=%ls, diag=%d, bodyClip=%d, clipOk=%d)",
-                                      isBug ? L"bug" : L"feature", includeDiagnostics ? 1 : 0, bodyTruncated ? 1 : 0, copied ? 1 : 0);
+        DiagLogger::Instance().LogFmt("INFO", "FEEDBACK", L"Opened GitHub Issue form (type=%ls, diag=%d, bodyClip=%d, diagClip=%d, clipOk=%d)",
+                                      isBug ? L"bug" : L"feature", wantDiag ? 1 : 0, bodyTruncated ? 1 : 0, diagTruncated ? 1 : 0, copied ? 1 : 0);
         result.outcome = Outcome::OpenedGitHub;
-        result.includeDiagnostics = includeDiagnostics;
+        result.includeDiagnostics = diagTruncated;
         result.clipboardCopied = copied;
         result.bodyCopiedToClipboard = bodyTruncated && copied;
         done = true;
         DestroyWindow(hwnd);
     }
 
+    bool HasDraft() const {
+        if (!hEditTitle || !hEditBody) return false;
+        return !Trim(GetWndText(hEditTitle)).empty() || !Trim(GetWndText(hEditBody)).empty();
+    }
+
     void Cancel() {
+        if (HasDraft()) {
+            ULONGLONG now = GetTickCount64();
+            if (!dirtyConfirmArmed || (now - dirtyConfirmTick) > 4500) {
+                dirtyConfirmArmed = true;
+                dirtyConfirmTick = now;
+                inlineStatus = UiText(L"已输入反馈内容，再按一次 Esc 或关闭即可放弃");
+                inlineStatusOk = false;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return;
+            }
+        }
         result.outcome = Outcome::Cancelled;
         done = true;
         DestroyWindow(hwnd);
@@ -2639,25 +2790,24 @@ private:
             SetWindowPos(hEditTitle, nullptr, titleX, titleY, std::max(40, titleW), titleH, SWP_NOZORDER | SWP_NOACTIVATE);
         }
 
+        float bodyBotReserve = isBug ? 110.0f : 80.0f;
         int bodyX = (int)(26.0f * dpiScale);
         int bodyY = (int)(182.0f * dpiScale);
         int bodyW = (int)((cw - 60.0f) * dpiScale);
-        int bodyH = (int)((ch - 298.0f) * dpiScale);
+        int bodyH = (int)((ch - 188.0f - bodyBotReserve) * dpiScale);
         if (hEditBody) {
             SetWindowPos(hEditBody, nullptr, bodyX, bodyY, std::max(40, bodyW), std::max(60, bodyH), SWP_NOZORDER | SWP_NOACTIVATE);
         }
-        bodyScroll.SetTrackLayout(D2D1::RectF(20.0f, 176.0f, cw - 20.0f, ch - 110.0f), dpiScale);
+        bodyScroll.SetTrackLayout(D2D1::RectF(20.0f, 176.0f, cw - 20.0f, ch - bodyBotReserve), dpiScale);
 
-        rcDiagRow   = D2D1::RectF(20.0f, ch - 102.0f, cw - 20.0f, ch - 76.0f);
-        rcXLink     = D2D1::RectF(20.0f, ch - 46.0f, cw - 258.0f, ch - 14.0f);
-        rcCopyBtn   = D2D1::RectF(cw - 246.0f, ch - 46.0f, cw - 146.0f, ch - 14.0f);
+        rcDiagRow   = isBug ? D2D1::RectF(20.0f, ch - 102.0f, cw - 20.0f, ch - 76.0f) : D2D1::RectF(0, 0, 0, 0);
+        rcXLink     = D2D1::RectF(20.0f, ch - 46.0f, cw - (isBug ? 258.0f : 152.0f), ch - 14.0f);
+        rcCopyBtn   = isBug ? D2D1::RectF(cw - 246.0f, ch - 46.0f, cw - 146.0f, ch - 14.0f) : D2D1::RectF(0, 0, 0, 0);
         rcSubmitBtn = D2D1::RectF(cw - 138.0f, ch - 46.0f, cw - 20.0f, ch - 14.0f);
     }
 
     void RebuildEditFont() {
-        HFONT nextFont = CreateFontW(-(int)std::round(13.0f * dpiScale), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                     CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+        HFONT nextFont = CreateUiInputFont(13.0f, dpiScale);
         if (nextFont) {
             if (hEditTitle) SendMessageW(hEditTitle, WM_SETFONT, (WPARAM)nextFont, TRUE);
             if (hEditBody)  SendMessageW(hEditBody,  WM_SETFONT, (WPARAM)nextFont, TRUE);
@@ -2759,21 +2909,24 @@ private:
                 rt->DrawTextW(lbl2.c_str(), (UINT32)lbl2.size(), fmtLabel.Get(),
                               D2D1::RectF(20.0f, 156.0f, cw - 20.0f, 174.0f), Br(Rgba(Theme::TextSecondary)));
             }
-            D2D1_RECT_F bodyBox = D2D1::RectF(20.0f, 176.0f, cw - 20.0f, ch - 110.0f);
+            float bodyBotReserve = isBug ? 110.0f : 80.0f;
+            D2D1_RECT_F bodyBox = D2D1::RectF(20.0f, 176.0f, cw - 20.0f, ch - bodyBotReserve);
             rt->FillRoundedRectangle(D2D1::RoundedRect(bodyBox, 7.0f, 7.0f), Br(Rgba(Theme::CardBg)));
             DrawRim(rt.Get(), bodyBox, 7.0f,
                              focusedEdit == 2 ? Rgba(Theme::AccentBlue, 0.48f) : Rgba(0xFFFFFF, 0.14f),
                              focusedEdit == 2 ? Rgba(Theme::AccentBlue, 0.14f) : Rgba(0xFFFFFF, 0.06f));
             bodyScroll.Draw(rt.Get(), brush.Get());
 
-            // Diagnostics checkbox row
-            D2D1_RECT_F cb = D2D1::RectF(rcDiagRow.left, rcDiagRow.top + 4.0f, rcDiagRow.left + 16.0f, rcDiagRow.top + 20.0f);
-            DrawDarkCheckbox(rt.Get(), brush.Get(), cb, includeDiagnostics, hoverZone == 3);
-            std::wstring diagTxt = UiText(L"自动附带脱敏环境与诊断摘要并同步复制到剪贴板（绝不含 Prompt 内容）");
-            if (fmtHint) {
-                rt->DrawTextW(diagTxt.c_str(), (UINT32)diagTxt.size(), fmtHint.Get(),
-                              D2D1::RectF(cb.right + 8.0f, rcDiagRow.top + 2.0f, rcDiagRow.right, rcDiagRow.bottom),
-                              Br(Rgba(hoverZone == 3 ? Theme::TextPrimary : Theme::TextSecondary, 0.94f)));
+            // Diagnostics checkbox row (ONLY shown in Bug report mode -- not needed for feature requests!)
+            if (isBug) {
+                D2D1_RECT_F cb = D2D1::RectF(rcDiagRow.left, rcDiagRow.top + 4.0f, rcDiagRow.left + 16.0f, rcDiagRow.top + 20.0f);
+                DrawDarkCheckbox(rt.Get(), brush.Get(), cb, includeDiagnostics, hoverZone == 3);
+                std::wstring diagTxt = UiText(L"附带脱敏环境与诊断摘要（绝不含任何 Prompt 内容）");
+                if (fmtHint) {
+                    rt->DrawTextW(diagTxt.c_str(), (UINT32)diagTxt.size(), fmtHint.Get(),
+                                  D2D1::RectF(cb.right + 8.0f, rcDiagRow.top + 2.0f, rcDiagRow.right, rcDiagRow.bottom),
+                                  Br(Rgba(hoverZone == 3 ? Theme::TextPrimary : Theme::TextSecondary, 0.94f)));
+                }
             }
 
             // Inline status line
@@ -2782,38 +2935,26 @@ private:
                               D2D1::RectF(20.0f, ch - 72.0f, cw - 20.0f, ch - 52.0f),
                               Br(Rgba(inlineStatusOk ? Theme::CopyGreen : Theme::DangerRed, 0.95f)));
             } else if (fmtHint) {
-                std::wstring tip = UiText(L"反馈统一沉淀在 GitHub Issues，提交后可在页面直接粘贴截图或追踪修复进度");
+                std::wstring tip = UiText(L"反馈统一沉淀在 GitHub Issues，提交后可在页面直接粘贴截图或追踪进度");
                 rt->DrawTextW(tip.c_str(), (UINT32)tip.size(), fmtHint.Get(),
                               D2D1::RectF(20.0f, ch - 72.0f, cw - 20.0f, ch - 52.0f),
                               Br(Rgba(Theme::TextMuted, 0.92f)));
             }
 
             // Bottom left X fallback link
-            std::wstring xTxt = UiText(L"无 GitHub 账号？前往 X (" APP_X_HANDLE_W L")");
+            std::wstring xTxt = UiText(L"无 GitHub 账号？前往 X（" APP_X_HANDLE_W L"）");
             if (fmtHint) {
                 rt->DrawTextW(xTxt.c_str(), (UINT32)xTxt.size(), fmtHint.Get(),
                               D2D1::RectF(rcXLink.left, rcXLink.top + 8.0f, rcXLink.right, rcXLink.bottom),
                               Br(Rgba(hoverZone == 4 ? Theme::AccentCyan : Theme::AccentBlue, hoverZone == 4 ? 1.0f : 0.88f)));
             }
 
-            // Copy diagnostics button
-            rt->FillRoundedRectangle(D2D1::RoundedRect(rcCopyBtn, 7.0f, 7.0f),
-                                     Br(Rgba(hoverZone == 5 ? 0x282F42 : 0x1D2230, 1.0f)));
-            DrawRim(rt.Get(), rcCopyBtn, 7.0f, Rgba(0xFFFFFF, 0.14f), Rgba(0xFFFFFF, 0.05f));
-            std::wstring sCopy = UiText(L"复制诊断信息");
-            if (fmtBtn) {
-                rt->DrawTextW(sCopy.c_str(), (UINT32)sCopy.size(), fmtBtn.Get(), rcCopyBtn,
-                              Br(Rgba(Theme::TextSecondary, hoverZone == 5 ? 1.0f : 0.88f)));
+            if (isBug) {
+                DrawDarkPillButton(rt.Get(), brush.Get(), fmtBtn.Get(), rcCopyBtn, L"复制诊断信息",
+                                   hoverZone == 5, 0x1D2230, 0x282F42, Theme::TextSecondary, 0.14f, pressedZone == 5);
             }
-
-            // Submit to GitHub button
-            rt->FillRoundedRectangle(D2D1::RoundedRect(rcSubmitBtn, 7.0f, 7.0f),
-                                     Br(Rgba(hoverZone == 6 ? 0x4F8EF7 : 0x3B7BF6, 1.0f)));
-            DrawRim(rt.Get(), rcSubmitBtn, 7.0f, Rgba(0xFFFFFF, 0.28f), Rgba(0xFFFFFF, 0.08f));
-            std::wstring sSub = UiText(L"前往 GitHub 提交");
-            if (fmtBtn) {
-                rt->DrawTextW(sSub.c_str(), (UINT32)sSub.size(), fmtBtn.Get(), rcSubmitBtn, Br(Rgba(0xFFFFFF, 1.0f)));
-            }
+            DrawDarkPillButton(rt.Get(), brush.Get(), fmtBtn.Get(), rcSubmitBtn, L"前往 GitHub 提交",
+                               hoverZone == 6, 0x3B7BF6, 0x4F8EF7, 0xFFFFFF, 0.28f, pressedZone == 6);
 
             if (rt->EndDraw() == D2DERR_RECREATE_TARGET) {
                 brush.Reset();
@@ -2830,9 +2971,9 @@ private:
     int HitZone(float x, float y) const {
         if (PtInDip(rcBugTab, x, y)) return 1;
         if (PtInDip(rcFeatTab, x, y)) return 2;
-        if (PtInDip(rcDiagRow, x, y)) return 3;
+        if (isBug && PtInDip(rcDiagRow, x, y)) return 3;
         if (PtInDip(rcXLink, x, y)) return 4;
-        if (PtInDip(rcCopyBtn, x, y)) return 5;
+        if (isBug && PtInDip(rcCopyBtn, x, y)) return 5;
         if (PtInDip(rcSubmitBtn, x, y)) return 6;
         return 0;
     }
@@ -2887,6 +3028,7 @@ private:
             bool isOwnMsg = (msg.hwnd == hwnd || IsChild(hwnd, msg.hwnd));
             if (isOwnMsg && msg.message == WM_KEYDOWN) {
                 if (msg.wParam == VK_ESCAPE) {
+                    if ((msg.lParam & 0x40000000) != 0) continue; // Ignore auto-repeat hold
                     Cancel();
                     continue;
                 }
@@ -2894,14 +3036,25 @@ private:
                     SubmitToGitHub();
                     continue;
                 }
+                if (msg.wParam == VK_RETURN && msg.hwnd == hEditTitle) {
+                    SetFocus(hEditBody);
+                    continue;
+                }
                 if (msg.wParam == 'A' && (GetKeyState(VK_CONTROL) & 0x8000) && !(GetKeyState(VK_MENU) & 0x8000) &&
                     (msg.hwnd == hEditTitle || msg.hwnd == hEditBody)) {
                     SendMessageW(msg.hwnd, EM_SETSEL, 0, -1);
                     continue;
                 }
-                if (msg.wParam == VK_TAB && msg.hwnd == hEditTitle) {
-                    SetFocus(hEditBody);
-                    continue;
+                if (msg.wParam == VK_TAB) {
+                    bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                    if (!shift && msg.hwnd == hEditTitle) {
+                        SetFocus(hEditBody);
+                        continue;
+                    }
+                    if (shift && msg.hwnd == hEditBody) {
+                        SetFocus(hEditTitle);
+                        continue;
+                    }
                 }
             }
             TranslateMessage(&msg);
@@ -2953,12 +3106,25 @@ private:
                             self->focusedEdit = 0;
                             InvalidateRect(h, nullptr, FALSE);
                         }
-                    } else if (id == 3002 && (code == EN_CHANGE || code == EN_UPDATE || code == EN_VSCROLL)) {
+                    } else if (code == EN_CHANGE) {
+                        if (self->dirtyConfirmArmed) {
+                            self->dirtyConfirmArmed = false;
+                            self->inlineStatus.clear();
+                            InvalidateRect(h, nullptr, FALSE);
+                        }
+                        if (id == 3002) self->bodyScroll.SyncAndNotifyParent(false);
+                    } else if (id == 3002 && (code == EN_UPDATE || code == EN_VSCROLL)) {
                         self->bodyScroll.SyncAndNotifyParent(false);
                     }
                 }
                 return 0;
             }
+            case WM_SETCURSOR:
+                if (LOWORD(lp) == HTCLIENT) {
+                    SetCursor(LoadCursorW(nullptr, self->hoverZone != 0 ? IDC_HAND : IDC_ARROW));
+                    return TRUE;
+                }
+                break;
             case WM_PAINT:
                 self->OnPaint();
                 return 0;
@@ -2976,6 +3142,7 @@ private:
                 if (hz > 0) {
                     self->pressedZone = hz;
                     SetCapture(h);
+                    InvalidateRect(h, nullptr, FALSE);
                 }
                 return 0;
             }
@@ -3015,6 +3182,7 @@ private:
                 self->pressedZone = 0;
                 if (GetCapture() == h) ReleaseCapture();
                 if (downZone == 0) return 0;
+                InvalidateRect(h, nullptr, FALSE);
                 float x = (float)(short)LOWORD(lp) / self->dpiScale;
                 float y = (float)(short)HIWORD(lp) / self->dpiScale;
                 int hz = self->HitZone(x, y);
@@ -3022,10 +3190,12 @@ private:
                 if (hz == 1) {
                     self->isBug = true;
                     self->includeDiagnostics = true;
+                    self->LayoutChildControls();
                     InvalidateRect(h, nullptr, FALSE);
                 } else if (hz == 2) {
                     self->isBug = false;
                     self->includeDiagnostics = false;
+                    self->LayoutChildControls();
                     InvalidateRect(h, nullptr, FALSE);
                 } else if (hz == 3) {
                     self->includeDiagnostics = !self->includeDiagnostics;
@@ -3040,7 +3210,7 @@ private:
                 return 0;
             }
             case WM_CAPTURECHANGED:
-                self->pressedZone = 0;
+                if (self->pressedZone != 0) { self->pressedZone = 0; InvalidateRect(h, nullptr, FALSE); }
                 self->bodyScroll.OnParentCaptureChanged();
                 return 0;
             case WM_DPICHANGED: {
@@ -3076,6 +3246,7 @@ private:
 // Vault & Usage Leaderboard Management Window (Dual-Tab Direct2D Center)
 // ============================================================================
 class VaultWindow {
+    friend int RunHeadlessSelfTest(const std::wstring& testDir);
 public:
     HINSTANCE hInst = nullptr;
     HWND hwnd = nullptr;
@@ -3125,33 +3296,41 @@ public:
     // Dark capsule viewport scrollbar shared across all 3 tabs
     DarkViewportScrollbar viewportScroll;
 
-    // 5-second undo-delete snapshot (restores across all 4 scenes cleanly!)
+    // 5-second undo snapshot (supports both Prompt deletion across 4 scenes AND Scene slot clearing!)
     struct UndoDeleteEntry {
         bool active = false;
+        bool isClearScene = false;
         PromptItem item{};
         size_t origIndex = 0;
         std::array<int, kMaxScenes> origSlots{ -1, -1, -1, -1 };
+        int clearedSceneIdx = -1;
+        std::array<std::wstring, 10> clearedSceneSlots{};
         ULONGLONG expireTick = 0;
     } undoDelete;
+
+    bool pendingScrollToUpdate = false;
+    std::wstring lastMenuTriggerId;
+    int lastMenuTriggerKind = 0;
 
     // Inline feedback states (no ugly Win32 MessageBox)
     std::wstring copiedFlashId;
     ULONGLONG copiedFlashTick = 0;
     std::wstring toastMessage;
     bool toastIsError = false;
+    bool toastShowsUndo = false;
     ULONGLONG toastTick = 0;
     ULONGLONG toastDurationMs = 2600;
 
     struct HitZone {
         // 1:Tab0, 2:Tab1, 7:Tab2(Settings), 3:New, 4:Import, 5:Export, 6:ClearAssign, 8:ClearSearch,
-        // 10:Copy, 11:SlotAssign, 12:Edit, 13:Delete, 14:Duplicate,
+        // 10:Copy, 11:SlotAssign, 12:Edit, 13:Delete, 14:Duplicate, 15:CardMore, 16:DisableAutoStart, 17:NewFromSearch,
         // 20:ToggleHoverBubble, 21:ToggleAutoStart, 22:ResetDockEdge, 23:OpenDataDir, 24:OpenLog,
         // 25:CheckUpdate, 26:InstallUpdate, 27:OpenReleasesPage, 28:ToggleAutoUpdate,
         // 29:OpenGitHubHome, 30:OpenXHome, 31:OpenFeedback, 32:RestoreFromBackup,
         // 33:EdgeRight, 34:EdgeLeft, 35:UndoDelete, 36:EdgeFloat,
         // 37:TrayOpensVault, 38:TrayTogglesDock, 39:CopyDataDir, 40:ReplayOnboarding, 41:SelectCard,
-        // 48:ExportV2Compat, 50..53:ToggleSceneEnabled(0..3), 54..57:ConfigScenePrompts(0..3),
-        // 60..63:RenameScene(0..3), 64:OpenKhazixX, 65:OpenKhazixGitHub
+        // 50..53:ToggleSceneEnabled(0..3), 54..57:ConfigScenePrompts(0..3),
+        // 60..63:RenameScene(0..3), 64:OpenKhazixX, 65:OpenKhazixGitHub, 70..73:SwitchActiveScene(0..3)
         int kind = 0;
         std::wstring promptId;
         D2D1_RECT_F rect{};
@@ -3224,10 +3403,11 @@ public:
         return true;
     }
 
-    void Open(int tab = 0, int targetSlot = -1) {
+    void Open(int tab = 0, int targetSlot = -1, bool scrollToUpdate = false) {
         activeTab = tab;
         assignTargetSlot = targetSlot;
         scrollY = 0.0f;
+        pendingScrollToUpdate = (tab == 2 && scrollToUpdate);
         InvalidateCaches();
 
         if (!hwnd || !IsWindow(hwnd)) {
@@ -3258,10 +3438,17 @@ public:
         UpdateSearchVisibility();
         ShowWindow(hwnd, IsIconic(hwnd) ? SW_RESTORE : SW_SHOWNORMAL);
         SetForegroundWindow(hwnd);
+        if (activeTab == 0 && hSearchEdit && IsWindow(hSearchEdit)) {
+            SetFocus(hSearchEdit);
+        }
         if (storage && storage->readOnlyRecoveryMode && !storage->loadFailureHint.empty()) {
             ShowToast(storage->loadFailureHint, true);
         }
         InvalidateRect(hwnd, nullptr, FALSE);
+    }
+
+    void OpenSettingsAtUpdate() {
+        Open(2, -1, true);
     }
 
     void ShowOrFocus(int defaultTab = 0) {
@@ -3358,17 +3545,19 @@ public:
         if (editorModalOpen || !state || !storage || sceneIdx < 0 || sceneIdx >= kMaxScenes) return false;
         int mounted = state->CountMountedInScene(sceneIdx);
         if (mounted == 0) return false;
+        std::wstring sceneName = state->scenes[(size_t)sceneIdx].name;
         wchar_t body[256]{};
         _snwprintf_s(body, _countof(body), _TRUNCATE,
                       L"确定要清空场景「%ls」的 %d 个已装配槽位吗？\n\n"
-                      L"所有 Prompt 正文、历史复制次数与其他场景编排都会完整保留在词舱中，不会删除任何条目。",
-                      state->scenes[(size_t)sceneIdx].name.c_str(), mounted);
+                      L"所有 Prompt 正文、使用次数与其他场景编排都会完整保留在词舱中，不会删除任何条目。",
+                      sceneName.c_str(), mounted);
         HWND parent = (hwnd && IsWindowVisible(hwnd)) ? hwnd : nullptr;
         editorModalOpen = true;
-        bool confirmed = DarkConfirmDialog::Show(hInst, parent, L"清空当前场景槽位", body, L"确认清空", L"取消");
+        bool confirmed = DarkConfirmDialog::Show(hInst, parent, L"清空「" + sceneName + L"」槽位", body, L"确认清空", L"取消", true);
         editorModalOpen = false;
         if (!confirmed) return false;
 
+        auto prevSlots = state->scenes[(size_t)sceneIdx].slots;
         AppState candidate = *state;
         candidate.ClearSceneSlots(sceneIdx);
         if (!storage->Save(candidate)) {
@@ -3376,27 +3565,38 @@ public:
             return false;
         }
         *state = std::move(candidate);
+        undoDelete = UndoDeleteEntry{};
+        undoDelete.active = true;
+        undoDelete.isClearScene = true;
+        undoDelete.clearedSceneIdx = sceneIdx;
+        undoDelete.clearedSceneSlots = prevSlots;
+        undoDelete.expireTick = GetTickCount64() + 5000;
         InvalidateCaches();
         if (onStateChanged) onStateChanged();
-        ShowToast(L"已清空场景「" + state->scenes[(size_t)sceneIdx].name + L"」槽位（词舱数据已保留）", false);
+        ShowToast(L"已清空「" + sceneName + L"」槽位（词舱已保留）", false, 5000, true);
         RefreshIfOpen();
         return true;
     }
 
-    bool OpenNewPromptModal(int targetSlot = -1, int* outMountedSlot = nullptr) {
+    bool OpenNewPromptModal(int targetSlot = -1, int* outMountedSlot = nullptr, const std::wstring& initTitle = L"", bool preserveOccupied = false) {
         if (outMountedSlot) *outMountedSlot = -1;
         if (editorModalOpen) return false;
         HWND parent = (hwnd && IsWindowVisible(hwnd)) ? hwnd : nullptr;
+        int effectiveTarget = targetSlot;
+        if (preserveOccupied && state && effectiveTarget >= 0 && effectiveTarget < 10 &&
+            state->FindById(state->ActiveSlots()[(size_t)effectiveTarget]) != nullptr) {
+            effectiveTarget = state->FindFirstEmptySlot();
+        }
         std::wstring slotTag = (state && state->IsMultiSceneActive())
-            ? (L"「" + state->ActiveScene().name + L" · 槽位 " + FormatSlotNum(targetSlot) + L"」")
-            : (L"槽位 " + FormatSlotNum(targetSlot));
-        std::wstring hd = (targetSlot >= 0)
+            ? (L"「" + state->ActiveScene().name + L" · 槽位 " + FormatSlotNum(effectiveTarget) + L"」")
+            : (L"槽位 " + FormatSlotNum(effectiveTarget));
+        std::wstring hd = (effectiveTarget >= 0)
             ? (L"\x65B0\x5EFA Prompt \x5E76\x653E\x5165" + slotTag)
             : L"\x65B0\x5EFA Prompt \x5230\x8BCD\x8231";
         int mountedSlot = -1;
         editorModalOpen = true;
-        auto res = PromptEditorDialog::Show(hInst, parent, hd, L"", L"",
-            [this, targetSlot, &mountedSlot](const std::wstring& title, const std::wstring& content, std::wstring& outErr) -> bool {
+        auto res = PromptEditorDialog::Show(hInst, parent, hd, initTitle, L"",
+            [this, effectiveTarget, preserveOccupied, &mountedSlot](const std::wstring& title, const std::wstring& content, std::wstring& outErr) -> bool {
                 AppState candidate = *state;
                 PromptItem item{};
                 item.id = GeneratePromptId(&candidate);
@@ -3405,9 +3605,15 @@ public:
                 item.createdAt = NowUnixSeconds();
                 candidate.vault.insert(candidate.vault.begin(), item);
 
-                if (targetSlot >= 0 && targetSlot < 10) {
-                    candidate.AssignToSlot(targetSlot, item.id);
-                    mountedSlot = targetSlot;
+                if (effectiveTarget >= 0 && effectiveTarget < 10) {
+                    int assignIdx = effectiveTarget;
+                    if (preserveOccupied && candidate.FindById(candidate.ActiveSlots()[(size_t)assignIdx]) != nullptr) {
+                        assignIdx = candidate.FindFirstEmptySlot(); // Never clobber an occupied slot during onboarding!
+                    }
+                    if (assignIdx >= 0 && assignIdx < 10) {
+                        candidate.AssignToSlot(assignIdx, item.id);
+                        mountedSlot = assignIdx;
+                    }
                 } else {
                     int emptySlot = candidate.FindFirstEmptySlot();
                     if (emptySlot >= 0) {
@@ -3429,6 +3635,13 @@ public:
         if (!res.accepted) return false;
 
         if (outMountedSlot) *outMountedSlot = mountedSlot;
+        // Clear stale search filter so the newly created Prompt is immediately visible at the top!
+        if (!searchQuery.empty()) {
+            searchQuery.clear();
+            if (hSearchEdit && IsWindow(hSearchEdit)) SetWindowTextW(hSearchEdit, L"");
+        }
+        scrollY = 0.0f;
+        selectedVaultRow = 0;
         InvalidateCaches();
         if (onStateChanged) onStateChanged();
         if (mountedSlot >= 0) {
@@ -3476,14 +3689,14 @@ public:
         RefreshIfOpen();
     }
 
-    void ExportBackupDialog(bool compatV2 = false) {
+    void ExportBackupDialog() {
         std::wstring fileBuf(4096, L'\0');
-        const wchar_t* defName = compatV2 ? L"PromptPod-backup-v2.json" : L"PromptPod-backup.json";
-        wcsncpy_s(fileBuf.data(), fileBuf.size(), defName, _TRUNCATE);
+        wcsncpy_s(fileBuf.data(), fileBuf.size(), L"PromptPod-backup.json", _TRUNCATE);
         OPENFILENAMEW ofn{};
         ofn.lStructSize = sizeof(ofn);
         ofn.hwndOwner = (hwnd && IsWindowVisible(hwnd)) ? hwnd : nullptr;
-        ofn.lpstrFilter = L"JSON Backup (*.json)\0*.json\0All Files (*.*)\0*.*\0";
+        ofn.lpstrFilter = L"\x8BCD\x8231\x5907\x4EFD (*.json)\0*.json\0\x65E7\x7248\x517C\x5BB9\x5907\x4EFD v2 (*.json)\0*.json\0";
+        ofn.nFilterIndex = 1;
         ofn.lpstrFile = fileBuf.data();
         ofn.nMaxFile = (DWORD)fileBuf.size();
         ofn.lpstrDefExt = L"json";
@@ -3493,8 +3706,9 @@ public:
                 ShowToast(L"禁止覆盖现役 data.json 或 .bak，请另选备份路径", true);
                 return;
             }
+            bool compatV2 = (ofn.nFilterIndex == 2);
             if (StorageManager::WriteAllBytesAtomic(fileBuf.c_str(), SerializeStateToJson(*state, compatV2))) {
-                ShowToast(compatV2 ? L"已导出旧版兼容备份（v2，含全部词舱与主场景）" : L"\x5DF2\x5BFC\x51FA JSON \x5907\x4EFD", false);
+                ShowToast(compatV2 ? L"已导出旧版兼容备份（含全部词舱与主场景）" : L"\x5DF2\x5BFC\x51FA JSON \x5907\x4EFD", false);
             } else {
                 ShowToast(L"\x5BFC\x51FA\x5931\x8D25\xFF1A\x65E0\x6CD5\x5199\x5165\x76EE\x6807\x8DEF\x5F84", true);
             }
@@ -3508,7 +3722,7 @@ public:
         OPENFILENAMEW ofn{};
         ofn.lStructSize = sizeof(ofn);
         ofn.hwndOwner = (hwnd && IsWindowVisible(hwnd)) ? hwnd : nullptr;
-        ofn.lpstrFilter = L"JSON Backup (*.json)\0*.json\0All Files (*.*)\0*.*\0";
+        ofn.lpstrFilter = L"\x8BCD\x8231\x5907\x4EFD (*.json)\0*.json\0\x6240\x6709\x6587\x4EF6 (*.*)\0*.*\0";
         ofn.lpstrFile = fileBuf.data();
         ofn.nMaxFile = (DWORD)fileBuf.size();
         ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
@@ -3525,22 +3739,20 @@ public:
             if (imported.IsMultiSceneActive()) {
                 _snwprintf_s(
                     confirmBody, _countof(confirmBody), _TRUNCATE,
-                    L"即将导入 %u 条 Prompt（含 %d 组多场景台面，当前场景已装配 %d / 10 格），替换当前本地 %u 条记录。\n\n"
-                    L"安全保护：确认后系统将先自动留存本地快照（data.pre-import.<时间戳>.json），"
-                    L"并保留本机当前的贴边位置与交互偏好。",
+                    L"即将导入 %u 条 Prompt（含 %d 组场景，当前场景已装配 %d / 10 格），替换本地现有的 %u 条记录。\n\n"
+                    L"覆盖前会自动备份当前词库到数据目录，并保留本机的贴边位置与偏好设置。",
                     (unsigned)imported.vault.size(), imported.EnabledSceneCount(), importedMounted, (unsigned)state->vault.size());
             } else {
                 _snwprintf_s(
                     confirmBody, _countof(confirmBody), _TRUNCATE,
-                    L"即将导入 %u 条 Prompt（已装配 %d / 10 个台面槽位），替换当前本地 %u 条记录。\n\n"
-                    L"安全保护：确认后系统将先自动留存本地快照（data.pre-import.<时间戳>.json），"
-                    L"并保留本机当前的贴边位置与交互偏好。",
+                    L"即将导入 %u 条 Prompt（已装配 %d / 10 格），替换本地现有的 %u 条记录。\n\n"
+                    L"覆盖前会自动备份当前词库到数据目录，并保留本机的贴边位置与偏好设置。",
                     (unsigned)imported.vault.size(), importedMounted, (unsigned)state->vault.size());
             }
 
             HWND parent = (hwnd && IsWindowVisible(hwnd)) ? hwnd : nullptr;
             editorModalOpen = true;
-            bool confirmed = DarkConfirmDialog::Show(hInst, parent, L"确认导入 JSON 备份", confirmBody, L"确认导入", L"取消");
+            bool confirmed = DarkConfirmDialog::Show(hInst, parent, L"确认导入备份并覆盖词库", confirmBody, L"确认导入", L"取消", true);
             editorModalOpen = false;
             if (!confirmed) {
                 return;
@@ -3609,14 +3821,16 @@ public:
             return false;
         }
         *state = std::move(candidate);
+        undoDelete = UndoDeleteEntry{};
         undoDelete.active = true;
+        undoDelete.isClearScene = false;
         undoDelete.item = std::move(removedItem);
         undoDelete.origIndex = foundIdx;
         undoDelete.origSlots = prevSlots;
         undoDelete.expireTick = GetTickCount64() + 5000;
         InvalidateCaches();
         if (onStateChanged) onStateChanged();
-        ShowToast(L"已删除「" + CollapseWhitespaceSingleLine(undoDelete.item.title, 18) + L"」", false, 5000);
+        ShowToast(L"已删除「" + CollapseWhitespaceSingleLine(undoDelete.item.title, 18) + L"」", false, 5000, true);
         return true;
     }
 
@@ -3627,25 +3841,38 @@ public:
             return false;
         }
         AppState candidate = *state;
-        if (!candidate.FindById(undoDelete.item.id)) {
-            size_t insIdx = std::min(undoDelete.origIndex, candidate.vault.size());
-            candidate.vault.insert(candidate.vault.begin() + (ptrdiff_t)insIdx, undoDelete.item);
-        }
-        for (int sc = 0; sc < kMaxScenes; ++sc) {
-            int origSl = undoDelete.origSlots[(size_t)sc];
-            if (origSl >= 0 && origSl < 10 && candidate.scenes[(size_t)sc].slots[(size_t)origSl].empty()) {
-                candidate.scenes[(size_t)sc].slots[(size_t)origSl] = undoDelete.item.id;
+        bool wasClearScene = undoDelete.isClearScene;
+        if (wasClearScene) {
+            if (undoDelete.clearedSceneIdx >= 0 && undoDelete.clearedSceneIdx < kMaxScenes) {
+                if (candidate.CountMountedInScene(undoDelete.clearedSceneIdx) > 0) {
+                    undoDelete.active = false;
+                    ShowToast(L"该场景已重新编排，未覆盖现有槽位", false);
+                    return false;
+                }
+                candidate.scenes[(size_t)undoDelete.clearedSceneIdx].slots = undoDelete.clearedSceneSlots;
+                candidate.SanitizeSlots();
+            }
+        } else {
+            if (!candidate.FindById(undoDelete.item.id)) {
+                size_t insIdx = std::min(undoDelete.origIndex, candidate.vault.size());
+                candidate.vault.insert(candidate.vault.begin() + (ptrdiff_t)insIdx, undoDelete.item);
+            }
+            for (int sc = 0; sc < kMaxScenes; ++sc) {
+                int origSl = undoDelete.origSlots[(size_t)sc];
+                if (origSl >= 0 && origSl < 10 && candidate.scenes[(size_t)sc].slots[(size_t)origSl].empty()) {
+                    candidate.scenes[(size_t)sc].slots[(size_t)origSl] = undoDelete.item.id;
+                }
             }
         }
         if (!storage->Save(candidate)) {
-            ShowToast(L"撤销删除失败：无法写入数据文件", true);
+            ShowToast(L"撤销失败：无法写入数据文件", true);
             return false;
         }
         *state = std::move(candidate);
         undoDelete.active = false;
         InvalidateCaches();
         if (onStateChanged) onStateChanged();
-        ShowToast(L"已撤销删除并恢复原槽位与统计", false);
+        ShowToast(wasClearScene ? L"已恢复该场景原有槽位" : L"已撤销删除并恢复原槽位与统计", false);
         return true;
     }
 
@@ -3682,7 +3909,8 @@ private:
         return b;
     }
 
-    void ShowToast(const std::wstring& msg, bool isErr, ULONGLONG durationMs = 2600) {
+    void ShowToast(const std::wstring& msg, bool isErr, ULONGLONG durationMs = 2600, bool keepUndo = false) {
+        toastShowsUndo = (keepUndo && undoDelete.active);
         toastMessage = UiText(msg);
         toastIsError = isErr;
         toastTick = GetTickCount64();
@@ -3691,6 +3919,27 @@ private:
             SetTimer(hwnd, kTimerFeedback, 120, nullptr);
             InvalidateRect(hwnd, nullptr, FALSE);
         }
+    }
+
+    void AssignPromptToTargetSlot(const std::wstring& promptId) {
+        if (!state || !storage || assignTargetSlot < 0 || assignTargetSlot >= 10) return;
+        int assigned = assignTargetSlot;
+        AppState candidate = *state;
+        candidate.AssignToSlot(assigned, promptId);
+        if (!storage->Save(candidate)) {
+            ShowToast(L"\x4FDD\x5B58\x5931\x8D25\xFF1A\x65E0\x6CD5\x66F4\x65B0\x69FD\x4F4D", true);
+            return;
+        }
+        *state = std::move(candidate);
+        assignTargetSlot = -1;
+        InvalidateCaches();
+        UpdateSearchVisibility();
+        if (onStateChanged) onStateChanged();
+        std::wstring dest = state->IsMultiSceneActive()
+            ? (L"「" + state->ActiveScene().name + L" · 槽位 " + FormatSlotNum(assigned) + L"」")
+            : (L"槽位 " + FormatSlotNum(assigned));
+        ShowToast(L"\x5DF2\x653E\x5165" + dest, false);
+        if (hwnd) InvalidateRect(hwnd, nullptr, FALSE);
     }
 
     void EnsureVaultCache() {
@@ -3776,6 +4025,11 @@ private:
     bool HandleShortcutKey(WPARAM vk, bool fromSearchEdit) {
         bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+        // When a Vault popup menu is open, it exclusively owns navigation/confirm/Esc and blocks bleed-through shortcuts!
+        if (popupMenu && popupMenu->IsOpenFor(MenuOwner::Vault)) {
+            if (popupMenu->HandleForwardedKey(vk)) return true;
+            if (vk == VK_TAB || (ctrl && !alt && (vk == 'Z' || vk == 'F' || vk == 'N'))) return true;
+        }
         if (ctrl && !alt && vk == 'F') {
             if (activeTab != 0) {
                 activeTab = 0;
@@ -3797,13 +4051,17 @@ private:
             SendMessageW(hSearchEdit, EM_SETSEL, 0, -1);
             return true;
         }
-        if (ctrl && !alt && vk == 'Z' && !fromSearchEdit && undoDelete.active) {
+        if (ctrl && !alt && vk == 'Z' && (!fromSearchEdit || searchQuery.empty()) && undoDelete.active) {
             UndoLastDelete();
             return true;
         }
         if (vk == VK_ESCAPE) {
             if (activeTab == 0 && !searchQuery.empty()) {
                 ClearSearchQueryAndFocus();
+            } else if (assignTargetSlot >= 0) {
+                assignTargetSlot = -1;
+                UpdateSearchVisibility();
+                InvalidateRect(hwnd, nullptr, FALSE);
             } else {
                 PostMessageW(hwnd, WM_CLOSE, 0, 0);
             }
@@ -3833,7 +4091,8 @@ private:
                     selectedVaultRow = rowIdx;
                     size_t vi = cachedFilteredIndices[(size_t)rowIdx];
                     if (vi < state->vault.size()) {
-                        CopyPromptById(state->vault[vi].id);
+                        if (assignTargetSlot >= 0) AssignPromptToTargetSlot(state->vault[vi].id);
+                        else CopyPromptById(state->vault[vi].id);
                     }
                 }
                 return true;
@@ -3862,14 +4121,20 @@ private:
     }
 
     void RebuildSearchFont() {
-        HFONT nextFont = CreateFontW(-(int)std::round(12.5f * dpiScale), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                     CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+        HFONT nextFont = CreateUiInputFont(12.5f, dpiScale);
         if (nextFont) {
             if (hSearchEdit) SendMessageW(hSearchEdit, WM_SETFONT, (WPARAM)nextFont, TRUE);
             if (hSearchFont) DeleteObject(hSearchFont);
             hSearchFont = nextFont;
         }
+    }
+
+    void UpdateSearchCueBanner() {
+        if (!hSearchEdit || !IsWindow(hSearchEdit)) return;
+        std::wstring cue = (assignTargetSlot >= 0 && assignTargetSlot < 10)
+            ? UiText(L"搜索要放入槽位 " + FormatSlotNum(assignTargetSlot) + L" 的 Prompt（↑↓ 选择，Enter 放入）")
+            : UiText(L"搜索标题或正文（↑↓ 选择，Enter 复制，Esc 清空）");
+        SendMessageW(hSearchEdit, 0x1501 /*EM_SETCUEBANNER*/, TRUE, reinterpret_cast<LPARAM>(cue.c_str()));
     }
 
     void CreateSearchControl() {
@@ -3887,9 +4152,7 @@ private:
                 SetWindowLongPtrW(hSearchEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(SearchEditSubProc)));
         }
         RebuildSearchFont();
-        // Cue banner placeholder
-        SendMessageW(hSearchEdit, 0x1501 /*EM_SETCUEBANNER*/, TRUE,
-                     (LPARAM)L"搜索标题或正文（↑↓ 选择，Enter 复制，Esc 清空）");
+        UpdateSearchCueBanner();
         PositionSearchControl();
     }
 
@@ -3898,7 +4161,7 @@ private:
         if (storage && storage->readOnlyRecoveryMode) {
             topY += 48.0f;
         }
-        if (assignTargetSlot >= 0 && assignTargetSlot < 10) {
+        if ((activeTab == 0 || activeTab == 1) && assignTargetSlot >= 0 && assignTargetSlot < 10) {
             topY += 40.0f;
         }
         return topY;
@@ -3919,6 +4182,7 @@ private:
 
     void UpdateSearchVisibility() {
         if (!hSearchEdit) return;
+        UpdateSearchCueBanner();
         PositionSearchControl();
         ShowWindow(hSearchEdit, activeTab == 0 ? SW_SHOW : SW_HIDE);
     }
@@ -4010,7 +4274,10 @@ private:
 
     [[gnu::noinline]] void DrawPillButton(const D2D1_RECT_F& r, const wchar_t* text, int zoneIdx,
                                           uint32_t baseBg, uint32_t hoverBg, uint32_t textHex, float borderAlpha = 0.12f) {
-        DrawDarkPillButton(rt.Get(), brush.Get(), fmtBadge.Get(), r, text, zoneIdx == hoverZoneIdx, baseBg, hoverBg, textHex, borderAlpha);
+        bool isPressed = (zoneIdx >= 0 && zoneIdx < (int)hitZones.size() &&
+                          hitZones[(size_t)zoneIdx].kind == pressedZoneKind &&
+                          hitZones[(size_t)zoneIdx].promptId == pressedZonePromptId);
+        DrawDarkPillButton(rt.Get(), brush.Get(), fmtBadge.Get(), r, text, zoneIdx == hoverZoneIdx, baseBg, hoverBg, textHex, borderAlpha, isPressed);
     }
 
     void DrawPillButton(const D2D1_RECT_F& r, const std::wstring& text, int zoneIdx,
@@ -4159,7 +4426,7 @@ private:
         }
 
         wchar_t t0Buf[64]{};
-        wsprintfW(t0Buf, L"\x8BCD\x8231\x6536\x85CF (%u)", (unsigned)state->vault.size());
+        wsprintfW(t0Buf, L"\x8BCD\x8231\x6536\x85CF %u", (unsigned)state->vault.size());
         std::wstring sTab0 = UiText(t0Buf);
         std::wstring sTab1 = UiText(L"\x4F7F\x7528\x6392\x884C");
         std::wstring sTab2 = UiText(L"\x8BBE\x7F6E");
@@ -4174,6 +4441,45 @@ private:
         if (updater && updater->HasAvailableUpdate()) {
             rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(tab2R.right - 10.0f, tab2R.top + 8.0f), 3.4f, 3.4f),
                             Br(Rgba(Theme::AccentCyan, 0.98f)));
+        }
+
+        // Top-bar quick scene switcher pills (ONLY when multi-scene active & viewing Vault / Leaderboard!)
+        if (state->IsMultiSceneActive() && (activeTab == 0 || activeTab == 1)) {
+            int vis[kMaxScenes]{};
+            int cnt = state->GetEnabledScenes(vis);
+            int actIdx = state->EffectiveActiveSceneIndex();
+            float areaLeft = 320.0f;
+            float areaRight = (activeTab == 0) ? (cw - 134.0f) : (cw - 18.0f);
+            float avail = std::max(0.0f, areaRight - areaLeft);
+            float gap = 4.0f;
+            float widths[kMaxScenes]{};
+            float sumW = 0.0f;
+            for (int p = 0; p < cnt; ++p) {
+                int units = std::max(2, VisualWidthUnits(state->scenes[(size_t)vis[p]].name));
+                widths[p] = std::clamp((float)units * 7.2f + 16.0f, 40.0f, 74.0f);
+                sumW += widths[p];
+            }
+            float maxSum = std::max(0.0f, avail - (float)(cnt - 1) * gap);
+            if (sumW > maxSum && sumW > 1.0f) {
+                float scale = maxSum / sumW;
+                for (int p = 0; p < cnt; ++p) widths[p] *= scale;
+            }
+            if (maxSum >= (float)cnt * 32.0f) {
+                float pl = areaLeft;
+                for (int p = 0; p < cnt; ++p) {
+                    int s = vis[p];
+                    bool isAct = (s == actIdx);
+                    D2D1_RECT_F pr = D2D1::RectF(pl, 15.0f, pl + widths[p], 41.0f);
+                    int zSc = AddZone(70 + s, pr);
+                    uint32_t acc = Theme::SceneTextAccent(s);
+                    DrawPillButton(pr, state->scenes[(size_t)s].name, zSc,
+                                   isAct ? 0x202A40 : 0x151923,
+                                   isAct ? 0x283552 : 0x222838,
+                                   isAct ? acc : Theme::TextSecondary,
+                                   isAct ? 0.34f : 0.08f);
+                    pl += widths[p] + gap;
+                }
+            }
         }
 
         // Top-right action bar scoped strictly by Tab: only Tab 0 shows '+ New Prompt'; Tab 1 & 2 stay clean
@@ -4192,10 +4498,12 @@ private:
             DrawRim(rt.Get(), rban, 7.0f, Rgba(0xF59E0B, 0.55f), Rgba(0xF59E0B, 0.16f));
 
             bool canRestore = storage->recoveredFromBackup;
-            float rightReserve = canRestore ? 220.0f : 112.0f;
+            float rightReserve = canRestore ? 220.0f : 196.0f;
             std::wstring rtxt = UiText(canRestore
-                ? L"只读保护模式：原 data.json 损坏未覆盖，当前展示上次备份"
-                : L"只读保护模式：原 data.json 损坏未覆盖，当前展示临时默认数据");
+                ? L"数据文件异常，已进入只读保护（原文件已保留，当前展示上次备份）"
+                : (!storage->loadFailureHint.empty()
+                    ? storage->loadFailureHint
+                    : L"数据文件异常，已进入只读保护（原文件已保留，可导入备份恢复）"));
             if (fmtCardBody) {
                 rt->DrawTextW(rtxt.c_str(), (UINT32)rtxt.size(), fmtCardBody.Get(),
                               D2D1::RectF(rban.left + 12.0f, rban.top, rban.right - rightReserve, rban.bottom),
@@ -4205,6 +4513,10 @@ private:
                 D2D1_RECT_F rcRestore = D2D1::RectF(rban.right - 210.0f, rban.top + 6.0f, rban.right - 106.0f, rban.bottom - 6.0f);
                 int zRest = AddZone(32, rcRestore);
                 DrawPillButton(rcRestore, L"一键恢复备份", zRest, 0xB45309, 0xD97706, 0xFFFFFF, 0.25f);
+            } else {
+                D2D1_RECT_F rcImp = D2D1::RectF(rban.right - 186.0f, rban.top + 6.0f, rban.right - 106.0f, rban.bottom - 6.0f);
+                int zImp = AddZone(4, rcImp);
+                DrawPillButton(rcImp, L"导入备份", zImp, 0xB45309, 0xD97706, 0xFFFFFF, 0.25f);
             }
             D2D1_RECT_F rcOpenDir = D2D1::RectF(rban.right - 98.0f, rban.top + 6.0f, rban.right - 8.0f, rban.bottom - 6.0f);
             int zDir = AddZone(23, rcOpenDir);
@@ -4212,8 +4524,8 @@ private:
             contentTop += 48.0f;
         }
 
-        // Optional slot assignment mode banner
-        if (assignTargetSlot >= 0 && assignTargetSlot < 10) {
+        // Optional slot assignment mode banner (ONLY shown on Vault / Leaderboard, hidden on Settings!)
+        if ((activeTab == 0 || activeTab == 1) && assignTargetSlot >= 0 && assignTargetSlot < 10) {
             D2D1_RECT_F ban = D2D1::RectF(18.0f, contentTop - 2.0f, cw - 18.0f, contentTop + 30.0f);
             rt->FillRoundedRectangle(D2D1::RoundedRect(ban, 7.0f, 7.0f), Br(Rgba(Theme::AccentBlue, 0.14f)));
             DrawRim(rt.Get(), ban, 7.0f, Rgba(Theme::AccentCyan, 0.40f), Rgba(Theme::AccentBlue, 0.18f));
@@ -4221,9 +4533,10 @@ private:
             std::wstring targetLabel = state->IsMultiSceneActive()
                 ? (state->ActiveScene().name + L" \x00B7 \x69FD\x4F4D " + FormatSlotNum(assignTargetSlot))
                 : (L"\x69FD\x4F4D " + FormatSlotNum(assignTargetSlot));
-            std::wstring btxt = UiText(L"\x6B63\x5728\x4E3A\x300C" + targetLabel +
-                                       L"\x300D\x6311\x9009\x66FF\x6362\x9879 -- \x70B9\x51FB\x4EFB\x610F\x6761\x76EE\x53F3\x4FA7\x7684\x300C\x6362\x5165 " +
-                                       FormatSlotNum(assignTargetSlot) + L"\x300D\x5373\x53EF\x5B8C\x6210");
+            std::wstring btxt = UiText(L"正在为「" + targetLabel +
+                                       (activeTab == 0
+                                           ? (L"」挑选 Prompt -- 点「放入 " + FormatSlotNum(assignTargetSlot) + L"」、双击条目或按 Enter 即可完成")
+                                           : (L"」挑选 Prompt -- 点「放入 " + FormatSlotNum(assignTargetSlot) + L"」或双击条目即可完成（Esc 取消）")));
             if (fmtCardBody) {
                 rt->DrawTextW(btxt.c_str(), (UINT32)btxt.size(), fmtCardBody.Get(),
                               D2D1::RectF(ban.left + 12.0f, ban.top, ban.right - 88.0f, ban.bottom),
@@ -4312,7 +4625,7 @@ private:
                             if (fmtBadge) rt->DrawTextW(sp.c_str(), (UINT32)sp.size(), fmtBadge.Get(), statusPill, Br(Rgba(Theme::AccentCyan, 0.95f)));
                         } else {
                             rt->FillRoundedRectangle(D2D1::RoundedRect(statusPill, 5.0f, 5.0f), Br(Rgba(0xFFFFFF, 0.05f)));
-                            std::wstring sp = UiText(L"\x8BCD\x8231\x5F85\x547D");
+                            std::wstring sp = UiText(L"\x672A\x88C5\x914D");
                             if (fmtBadge) rt->DrawTextW(sp.c_str(), (UINT32)sp.size(), fmtBadge.Get(), statusPill, Br(Rgba(Theme::TextMuted, 0.95f)));
                         }
                     } else {
@@ -4350,53 +4663,52 @@ private:
                                 if (fmtBadge) rt->DrawTextW(os.c_str(), (UINT32)os.size(), fmtBadge.Get(), subPill, Br(Rgba(0xA5B4FC, 0.92f)));
                             }
                         } else {
-                            D2D1_RECT_F statusPill = D2D1::RectF(pillRight, card.top + 11.0f, pillRight + 62.0f, card.top + 31.0f);
+                            D2D1_RECT_F statusPill = D2D1::RectF(pillRight, card.top + 11.0f, pillRight + 56.0f, card.top + 31.0f);
                             pillRight = statusPill.right;
                             rt->FillRoundedRectangle(D2D1::RoundedRect(statusPill, 5.0f, 5.0f), Br(Rgba(0xFFFFFF, 0.05f)));
-                            std::wstring sp = UiText(L"\x8BCD\x8231\x5F85\x547D");
+                            std::wstring sp = UiText(L"\x672A\x88C5\x914D");
                             if (fmtBadge) rt->DrawTextW(sp.c_str(), (UINT32)sp.size(), fmtBadge.Get(), statusPill, Br(Rgba(Theme::TextMuted, 0.95f)));
                         }
                     }
 
-                    // Prompt title + copy count badge (5 compact actions occupy 268 DIP on right)
-                    float actionLeft = card.right - 268.0f;
+                    // Prompt title + optional usage count (hide '0 次'; right bar converged to 3 primary + '···' = 206 DIP)
+                    float actionLeft = card.right - 206.0f;
+                    float countReserve = (item.useCount > 0) ? 62.0f : 8.0f;
                     if (fmtCardTitle) {
                         rt->DrawTextW(item.title.c_str(), (UINT32)item.title.size(), fmtCardTitle.Get(),
-                                      D2D1::RectF(pillRight + 8.0f, card.top + 9.0f, actionLeft - 68.0f, card.top + 33.0f),
+                                      D2D1::RectF(pillRight + 8.0f, card.top + 9.0f, actionLeft - countReserve, card.top + 33.0f),
                                       Br(Rgba(Theme::TextPrimary, 0.98f)));
                     }
 
-                    wchar_t cntBuf[48]{};
-                    wsprintfW(cntBuf, L"%I64u \x6B21", (unsigned long long)item.useCount);
-                    std::wstring cntStr = UiText(cntBuf);
-                    if (fmtBadge) {
+                    if (item.useCount > 0 && fmtBadge) {
+                        wchar_t cntBuf[48]{};
+                        wsprintfW(cntBuf, L"%I64u \x6B21", (unsigned long long)item.useCount);
+                        std::wstring cntStr = UiText(cntBuf);
                         rt->DrawTextW(cntStr.c_str(), (UINT32)cntStr.size(), fmtBadge.Get(),
-                                      D2D1::RectF(actionLeft - 66.0f, card.top + 11.0f, actionLeft - 6.0f, card.top + 31.0f),
+                                      D2D1::RectF(actionLeft - 60.0f, card.top + 11.0f, actionLeft - 4.0f, card.top + 31.0f),
                                       Br(Rgba(Theme::TextSecondary, 0.85f)));
                     }
 
                     // Body preview (context snippet centered on match when searching!)
-                    std::wstring preview = BuildSearchPreviewSnippet(item.content, searchQuery, 102);
+                    std::wstring preview = BuildSearchPreviewSnippet(item.content, searchQuery, 108);
                     if (fmtCardBody) {
                         rt->DrawTextW(preview.c_str(), (UINT32)preview.size(), fmtCardBody.Get(),
                                       D2D1::RectF(card.left + leftContentOffset, card.top + 37.0f, actionLeft - 8.0f, card.bottom - 8.0f),
                                       Br(Rgba(Theme::TextSecondary, 0.80f)));
                     }
 
-                    // 5 Action buttons on right: Copy (48) | Slot (60) | Edit (44) | Duplicate (44) | Delete (44)
+                    // 4 clean actions: Copy (48) | Slot (60) | Edit (44) | More '···' (32) -> destructive Delete tucked safely inside More/Right-Click!
                     float btnTop = card.top + 19.0f;
                     float btnBot = card.top + 49.0f;
-                    D2D1_RECT_F rCopy   = D2D1::RectF(card.right - 264.0f, btnTop, card.right - 216.0f, btnBot);
-                    D2D1_RECT_F rAssign = D2D1::RectF(card.right - 211.0f, btnTop, card.right - 151.0f, btnBot);
-                    D2D1_RECT_F rEdit   = D2D1::RectF(card.right - 146.0f, btnTop, card.right - 102.0f, btnBot);
-                    D2D1_RECT_F rDup    = D2D1::RectF(card.right - 97.0f,  btnTop, card.right - 53.0f,  btnBot);
-                    D2D1_RECT_F rDel    = D2D1::RectF(card.right - 48.0f,  btnTop, card.right - 8.0f,   btnBot);
+                    D2D1_RECT_F rCopy   = D2D1::RectF(card.right - 202.0f, btnTop, card.right - 154.0f, btnBot);
+                    D2D1_RECT_F rAssign = D2D1::RectF(card.right - 149.0f, btnTop, card.right - 89.0f,  btnBot);
+                    D2D1_RECT_F rEdit   = D2D1::RectF(card.right - 84.0f,  btnTop, card.right - 40.0f,  btnBot);
+                    D2D1_RECT_F rMore   = D2D1::RectF(card.right - 36.0f,  btnTop, card.right - 8.0f,   btnBot);
 
                     int zCopy   = AddClippedZone(10, rCopy, listViewport, item.id);
                     int zAssign = AddClippedZone(11, rAssign, listViewport, item.id);
                     int zEdit   = AddClippedZone(12, rEdit, listViewport, item.id);
-                    int zDup    = AddClippedZone(14, rDup, listViewport, item.id);
-                    int zDel    = AddClippedZone(13, rDel, listViewport, item.id);
+                    int zMore   = AddClippedZone(15, rMore, listViewport, item.id);
 
                     bool isCopiedFlash = (copiedFlashId == item.id && nowTick - copiedFlashTick < 1100);
                     if (isCopiedFlash) {
@@ -4406,7 +4718,7 @@ private:
                     }
 
                     std::wstring assignLabel = (assignTargetSlot >= 0)
-                        ? (L"\x6362\x5165 " + FormatSlotNum(assignTargetSlot))
+                        ? (L"\x653E\x5165 " + FormatSlotNum(assignTargetSlot))
                         : L"\x69FD\x4F4D \x25BE";
                     DrawPillButton(rAssign, assignLabel, zAssign,
                                    assignTargetSlot >= 0 ? 0x1E3A5F : 0x222736,
@@ -4414,8 +4726,7 @@ private:
                                    assignTargetSlot >= 0 ? Theme::AccentCyan : Theme::AccentBlue);
 
                     DrawPillButton(rEdit, L"\x7F16\x8F91", zEdit, 0x222736, 0x2D3448, Theme::TextSecondary);
-                    DrawPillButton(rDup,  L"\x526F\x672C", zDup,  0x222736, 0x2D3448, Theme::TextSecondary);
-                    DrawPillButton(rDel,  L"\x5220\x9664", zDel,  0x222736, 0x3A2028, Theme::DangerRed);
+                    DrawPillButton(rMore, L"\x00B7\x00B7\x00B7", zMore, 0x1D2230, 0x2B3348, Theme::TextSecondary, 0.08f);
                 }
                 y += 76.0f;
             }
@@ -4423,10 +4734,18 @@ private:
             if (visibleCount == 0 && fmtCardBody) {
                 std::wstring emptyMsg = searchQuery.empty()
                     ? UiText(L"\x8BCD\x8231\x6682\x65E0 Prompt\xFF0C\x70B9\x51FB\x53F3\x4E0A\x89D2\x300C+ \x65B0\x5EFA Prompt\x300D\x5F00\x59CB\x79EF\x7D2F")
-                    : UiText(L"\x672A\x627E\x5230\x5339\x914D\x7684 Prompt");
+                    : UiText(L"未找到包含「" + CollapseWhitespaceSingleLine(searchQuery, 20) + L"」的 Prompt");
                 rt->DrawTextW(emptyMsg.c_str(), (UINT32)emptyMsg.size(), fmtCardBody.Get(),
-                              D2D1::RectF(24.0f, contentTop + 40.0f, cw - 24.0f, contentTop + 80.0f),
+                              D2D1::RectF(24.0f, contentTop + 28.0f, cw - 24.0f, contentTop + 56.0f),
                               Br(Rgba(Theme::TextMuted, 0.95f)));
+                if (!searchQuery.empty()) {
+                    D2D1_RECT_F rcClrEmpty = D2D1::RectF(24.0f, contentTop + 62.0f, 108.0f, contentTop + 90.0f);
+                    D2D1_RECT_F rcNewEmpty = D2D1::RectF(118.0f, contentTop + 62.0f, 246.0f, contentTop + 90.0f);
+                    int zCE = AddClippedZone(8,  rcClrEmpty, listViewport);
+                    int zNE = AddClippedZone(17, rcNewEmpty, listViewport);
+                    DrawPillButton(rcClrEmpty, L"清空搜索", zCE, 0x222736, 0x2D3448, Theme::TextSecondary);
+                    DrawPillButton(rcNewEmpty, L"+ 新建此 Prompt", zNE, 0x1E3A5F, 0x284D7E, Theme::AccentCyan, 0.25f);
+                }
             }
 
             rt->PopAxisAlignedClip();
@@ -4512,7 +4831,7 @@ private:
                     std::wstring sTag;
                     uint32_t sTagCol = Theme::TextMuted;
                     if (!state->IsMultiSceneActive()) {
-                        sTag = (slotIdx >= 0) ? UiText(L"\x69FD\x4F4D " + FormatSlotNum(slotIdx)) : UiText(L"\x8BCD\x8231\x5F85\x547D");
+                        sTag = (slotIdx >= 0) ? UiText(L"\x69FD\x4F4D " + FormatSlotNum(slotIdx)) : UiText(L"\x672A\x88C5\x914D");
                         sTagCol = (slotIdx >= 0) ? Theme::AccentCyan : Theme::TextMuted;
                     } else if (slotIdx >= 0) {
                         sTag = UiText(state->ActiveScene().name + L" \x00B7 " + FormatSlotNum(slotIdx));
@@ -4523,7 +4842,7 @@ private:
                             sTag = UiText(state->scenes[(size_t)os].name + L" \x00B7 " + FormatSlotNum(osl));
                             sTagCol = Theme::AccentBlue;
                         } else {
-                            sTag = UiText(L"\x8BCD\x8231\x5F85\x547D");
+                            sTag = UiText(L"\x672A\x88C5\x914D");
                         }
                     }
                     if (fmtBadge) {
@@ -4546,10 +4865,10 @@ private:
                         if (barGrad) rt->FillRoundedRectangle(D2D1::RoundedRect(fillR, 4.0f, 4.0f), barGrad.Get());
                     }
 
-                    // Count + Copy button + Slot Assign button
+                    // Count + Copy button + Slot Assign button (honest '放入 XX' in assignTargetSlot mode!)
                     wchar_t cText[48]{};
                     int pct = totalUses > 0 ? (int)((item->useCount * 100ULL + totalUses / 2) / totalUses) : 0;
-                    wsprintfW(cText, L"%I64u \x6B21 (%d%%)", (unsigned long long)item->useCount, pct);
+                    wsprintfW(cText, L"%I64u \x6B21\xFF08%d%%\xFF09", (unsigned long long)item->useCount, pct);
                     std::wstring cs = UiText(cText);
                     if (fmtBadge) {
                         rt->DrawTextW(cs.c_str(), (UINT32)cs.size(), fmtBadge.Get(),
@@ -4567,7 +4886,13 @@ private:
                     } else {
                         DrawPillButton(rCopy, L"\x590D\x5236", zCopy, 0x222736, 0x2D3448, Theme::TextPrimary);
                     }
-                    DrawPillButton(rAssign, L"\x69FD\x4F4D \x25BE", zAssign, 0x222736, 0x2D3448, Theme::AccentBlue);
+                    std::wstring rkAssignLbl = (assignTargetSlot >= 0)
+                        ? (L"\x653E\x5165 " + FormatSlotNum(assignTargetSlot))
+                        : L"\x69FD\x4F4D \x25BE";
+                    DrawPillButton(rAssign, rkAssignLbl, zAssign,
+                                   assignTargetSlot >= 0 ? 0x1E3A5F : 0x222736,
+                                   assignTargetSlot >= 0 ? 0x284D7E : 0x2D3448,
+                                   assignTargetSlot >= 0 ? Theme::AccentCyan : Theme::AccentBlue);
                 }
                 y += 65.0f;
             }
@@ -4599,6 +4924,11 @@ private:
             float totalSettingsH = 6.0f + (24.0f + sec1H + 14.0f) + (24.0f + sec2H + 14.0f)
                                  + (24.0f + sec3H + 14.0f) + (24.0f + sec4H + 18.0f);
             maxScrollY = std::max(0.0f, totalSettingsH - lastViewportH);
+            if (pendingScrollToUpdate) {
+                pendingScrollToUpdate = false;
+                float sec2Top = 6.0f + (24.0f + sec1H + 14.0f);
+                scrollY = std::clamp(sec2Top - 8.0f, 0.0f, maxScrollY);
+            }
             scrollY = std::clamp(scrollY, 0.0f, maxScrollY);
 
             rt->PushAxisAlignedClip(settingsViewport, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
@@ -4643,21 +4973,21 @@ private:
                     DrawToggleSwitch(sw, state->showHoverBubble, zRow);
                 }
                 DrawRowText(g, ry, 64.0f, 82.0f, settingsViewport, L"悬停预览正文",
-                            L"鼠标停留在台面实槽满 180 ms 时，侧边弹出纯穿透气泡预览完整 Prompt 内容");
+                            L"鼠标悬停在槽位上时，侧边浮现预览气泡（左键可随时复制全文）");
                 ry += 64.0f;
                 DrawRowDivider(g, ry, settingsViewport);
 
-                // Row 1.3: 点击托盘图标行为 (Option A default: 打开词舱)
-                DrawRowText(g, ry, 66.0f, 206.0f, settingsViewport, L"点击托盘图标行为",
-                            L"左键单击或双击系统托盘图标时执行的唯一主动作");
+                // Row 1.3: 点击托盘图标 (Option A default: 打开词舱)
+                DrawRowText(g, ry, 66.0f, 206.0f, settingsViewport, L"点击托盘图标",
+                            L"左键点击右下角托盘图标时的默认操作");
                 if (ry + 66.0f >= settingsViewport.top && ry <= settingsViewport.bottom) {
                     float bt = ry + 19.0f, bb = ry + 47.0f;
                     D2D1_RECT_F bVault = D2D1::RectF(g.right - 196.0f, bt, g.right - 118.0f, bb);
                     D2D1_RECT_F bDock  = D2D1::RectF(g.right - 114.0f, bt, g.right - 16.0f,  bb);
                     int zV = AddClippedZone(37, bVault, settingsViewport);
                     int zD = AddClippedZone(38, bDock,  settingsViewport);
-                    DrawSegPill(bVault, L"打开词舱",     state->trayClickOpensVault,  zV);
-                    DrawSegPill(bDock,  L"切换贴边面板", !state->trayClickOpensVault, zD);
+                    DrawSegPill(bVault, L"打开词舱",  state->trayClickOpensVault,  zV);
+                    DrawSegPill(bDock,  L"展开 / 收起", !state->trayClickOpensVault, zD);
                 }
                 ry += 66.0f;
                 DrawRowDivider(g, ry, settingsViewport);
@@ -4667,8 +4997,8 @@ private:
                     int enabledCnt = state->EnabledSceneCount();
                     int actIdx = state->EffectiveActiveSceneIndex();
                     DrawRowText(g, ry, 72.0f, 118.0f, settingsViewport,
-                                L"场景台面（多选，最多 4 组 × 10 槽位）",
-                                L"勾选要在贴边面板显示的场景（至少保留 1 组；仅勾选 1 组时自动隐藏底栏回归极简，取消勾选保留编排）");
+                                L"场景台面",
+                                L"勾选要显示在贴边面板的场景（仅选 1 组时自动隐藏底栏，取消勾选不丢数据）");
                     if (ry + 72.0f >= settingsViewport.top && ry <= settingsViewport.bottom) {
                         D2D1_RECT_F badgeR = D2D1::RectF(g.right - 108.0f, ry + 11.0f, g.right - 16.0f, ry + 33.0f);
                         rt->FillRoundedRectangle(D2D1::RoundedRect(badgeR, 6.0f, 6.0f),
@@ -4684,6 +5014,7 @@ private:
                             const auto& sc = state->scenes[(size_t)s];
                             bool isEn = sc.enabled;
                             bool isAct = (isEn && s == actIdx);
+                            bool isLockedLast = (isEn && enabledCnt <= 1);
                             uint32_t accTop = Theme::AccentCyan, accBot = Theme::AccentIndigo;
                             Theme::SceneAccentColors(s, accTop, accBot);
                             uint32_t txtAcc = Theme::SceneTextAccent(s);
@@ -4696,7 +5027,7 @@ private:
                             int zTog = AddClippedZone(50 + s, toggleHit, settingsViewport);
                             int zCfg = AddClippedZone(54 + s, btnCfg, settingsViewport);
                             int zRen = AddClippedZone(60 + s, btnRen, settingsViewport);
-                            bool rowHov = (zTog == hoverZoneIdx);
+                            bool rowHov = (!isLockedLast && zTog == hoverZoneIdx);
 
                             rt->FillRoundedRectangle(D2D1::RoundedRect(itemCard, 7.0f, 7.0f),
                                                      Br(Rgba(rowHov ? 0x242A3B : (isEn ? 0x1A2030 : 0x131722), 0.96f)));
@@ -4705,7 +5036,7 @@ private:
                                     Rgba(0xFFFFFF, 0.03f));
 
                             D2D1_RECT_F cb = D2D1::RectF(itemCard.left + 10.0f, itemCard.top + 11.0f, itemCard.left + 26.0f, itemCard.top + 27.0f);
-                            DrawDarkCheckbox(rt.Get(), brush.Get(), cb, isEn, rowHov, txtAcc);
+                            DrawDarkCheckbox(rt.Get(), brush.Get(), cb, isEn, rowHov, txtAcc, isLockedLast);
 
                             rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cb.right + 12.0f, (itemCard.top + itemCard.bottom) * 0.5f), 3.6f, 3.6f),
                                             Br(Rgba(accTop, isEn ? 0.96f : 0.42f)));
@@ -4744,14 +5075,17 @@ private:
                 D2D1_RECT_F g = DrawGroupContainer(sy, sec2H, cw, settingsViewport, highlightUp);
                 float ry = sy;
 
-                // Row 2.1: 登录 Windows 时启动 (handles StaleOtherPath explicitly!)
+                // Row 2.1: 开机自动启动 (handles StaleOtherPath explicitly with both rebind AND disable!)
                 bool staleAuto = (autoSt == AutoStart::Status::StaleOtherPath);
                 bool autoOn = (autoSt == AutoStart::Status::EnabledCurrent);
                 if (ry + rowAutoStartH >= settingsViewport.top && ry <= settingsViewport.bottom) {
                     if (staleAuto) {
-                        D2D1_RECT_F btnFix = D2D1::RectF(g.right - 114.0f, ry + 22.0f, g.right - 16.0f, ry + 52.0f);
+                        D2D1_RECT_F btnOff = D2D1::RectF(g.right - 196.0f, ry + 22.0f, g.right - 120.0f, ry + 52.0f);
+                        D2D1_RECT_F btnFix = D2D1::RectF(g.right - 114.0f, ry + 22.0f, g.right - 16.0f,  ry + 52.0f);
+                        int zOff = AddClippedZone(16, btnOff, settingsViewport);
                         int zFix = AddClippedZone(21, btnFix, settingsViewport);
-                        DrawPillButton(btnFix, L"点击修复路径", zFix, 0xB45309, 0xD97706, 0xFFFFFF, 0.25f);
+                        DrawPillButton(btnOff, L"关闭自启",   zOff, 0x222736, 0x2D3448, Theme::TextSecondary);
+                        DrawPillButton(btnFix, L"改为当前位置", zFix, 0xB45309, 0xD97706, 0xFFFFFF, 0.25f);
                     } else {
                         D2D1_RECT_F rowHit = D2D1::RectF(g.left + 4.0f, ry + 2.0f, g.right - 4.0f, ry + rowAutoStartH - 2.0f);
                         int zRow = AddClippedZone(21, rowHit, settingsViewport);
@@ -4762,10 +5096,10 @@ private:
                         DrawToggleSwitch(sw, autoOn, zRow);
                     }
                 }
-                DrawRowText(g, ry, rowAutoStartH, staleAuto ? 128.0f : 82.0f, settingsViewport,
-                            L"登录 Windows 时启动",
-                            staleAuto ? L"检测到开机自启指向已移动的旧程序路径，点击右侧按钮一键重新绑定到当前位置"
-                                      : L"开机后静默贴边待命（写入当前用户注册表，无需管理员权限）",
+                DrawRowText(g, ry, rowAutoStartH, staleAuto ? 208.0f : 82.0f, settingsViewport,
+                            L"开机自动启动",
+                            staleAuto ? L"开机自启当前指向另一个目录的程序副本，可切换为当前位置或关闭"
+                                      : L"开机后自动隐藏在屏幕边缘待命，无需管理员权限",
                             true, staleAuto ? 0xFCD34D : Theme::TextSecondary);
                 ry += rowAutoStartH;
                 DrawRowDivider(g, ry, settingsViewport);
@@ -4781,7 +5115,7 @@ private:
                     DrawToggleSwitch(sw, state->autoCheckUpdates, zRow);
                 }
                 DrawRowText(g, ry, 66.0f, 82.0f, settingsViewport, L"启动时自动检查更新",
-                            L"启动时距上次成功检查满 24 小时静默检查一次，仅在有新版本时温和提示");
+                            L"每天启动时静默检查一次新版本，无弹窗打扰");
                 ry += 66.0f;
                 DrawRowDivider(g, ry, settingsViewport);
 
@@ -4790,7 +5124,7 @@ private:
                     ? (L"发现新版本 v" + upSnap.latestVersion + L"（当前 v" APP_VERSION_W L"）")
                     : std::wstring(L"软件更新 · 当前 v" APP_VERSION_W);
                 const wchar_t* upDesc = upSnap.statusText.empty()
-                    ? L"通过官方 GitHub Releases 检测更新，支持 SHA-256 校验与原地无损替换"
+                    ? L"从官方 GitHub Releases 自动检查并安全更新，保留全部词库"
                     : upSnap.statusText.c_str();
                 float upRightRes = (upSnap.phase == UpdatePhase::Available || upSnap.phase == UpdatePhase::Error) ? 214.0f : 118.0f;
                 DrawRowText(g, ry, hasReleaseNotes ? 66.0f : rowUpdateH, upRightRes, settingsViewport, upTitle.c_str(), upDesc,
@@ -4856,20 +5190,17 @@ private:
                 D2D1_RECT_F g = DrawGroupContainer(sy, sec3H, cw, settingsViewport);
                 float ry = sy;
 
-                // Row 3.1: 导出备份 / 导出旧版兼容备份 (v2) / 导入备份
-                DrawRowText(g, ry, 68.0f, 276.0f, settingsViewport, L"JSON 备份与恢复",
-                            L"导出全部词舱与场景，导出旧版 v2 兼容备份，或安全导入（自动快照）");
+                // Row 3.1: 数据备份与恢复 (clean 2-button layout; legacy v2 format tucked into save dialog file type!)
+                DrawRowText(g, ry, 68.0f, 190.0f, settingsViewport, L"数据备份与恢复",
+                            L"导出或导入全部词舱与场景配置，导入前会自动备份现有数据");
                 if (ry + 68.0f >= settingsViewport.top && ry <= settingsViewport.bottom) {
                     float bt = ry + 20.0f, bb = ry + 48.0f;
-                    D2D1_RECT_F bExpV2 = D2D1::RectF(g.right - 266.0f, bt, g.right - 180.0f, bb);
-                    D2D1_RECT_F bExp   = D2D1::RectF(g.right - 174.0f, bt, g.right - 98.0f,  bb);
-                    D2D1_RECT_F bImp   = D2D1::RectF(g.right - 92.0f,  bt, g.right - 16.0f,  bb);
-                    int zV2  = AddClippedZone(48, bExpV2, settingsViewport);
-                    int zExp = AddClippedZone(5,  bExp,   settingsViewport);
-                    int zImp = AddClippedZone(4,  bImp,   settingsViewport);
-                    DrawPillButton(bExpV2, L"导出旧版 v2", zV2,  0x1B1F2B, 0x262C3D, Theme::TextSecondary);
-                    DrawPillButton(bExp,   L"导出备份",    zExp, 0x222736, 0x2D3448, Theme::TextPrimary);
-                    DrawPillButton(bImp,   L"导入备份",    zImp, 0x222736, 0x2D3448, Theme::AccentCyan);
+                    D2D1_RECT_F bExp = D2D1::RectF(g.right - 178.0f, bt, g.right - 100.0f, bb);
+                    D2D1_RECT_F bImp = D2D1::RectF(g.right - 94.0f,  bt, g.right - 16.0f,  bb);
+                    int zExp = AddClippedZone(5, bExp, settingsViewport);
+                    int zImp = AddClippedZone(4, bImp, settingsViewport);
+                    DrawPillButton(bExp, L"导出备份", zExp, 0x222736, 0x2D3448, Theme::TextPrimary);
+                    DrawPillButton(bImp, L"导入备份", zImp, 0x222736, 0x2D3448, Theme::AccentCyan);
                 }
                 ry += 68.0f;
                 DrawRowDivider(g, ry, settingsViewport);
@@ -4900,18 +5231,18 @@ private:
 
                 // Row 4.1: 快速上手引导
                 DrawRowText(g, ry, 62.0f, 118.0f, settingsViewport, L"快速上手引导",
-                            L"随时重播 3 步贴边实操引导，熟悉零焦点复制与槽位管理");
+                            L"重新体验 3 步引导，快速熟悉复制、添加与停靠方式");
                 if (ry + 62.0f >= settingsViewport.top && ry <= settingsViewport.bottom) {
                     D2D1_RECT_F bGuide = D2D1::RectF(g.right - 108.0f, ry + 17.0f, g.right - 16.0f, ry + 45.0f);
                     int zG = AddClippedZone(40, bGuide, settingsViewport);
-                    DrawPillButton(bGuide, L"快速上手引导", zG, 0x222736, 0x2D3448, Theme::AccentCyan);
+                    DrawPillButton(bGuide, L"重新引导", zG, 0x222736, 0x2D3448, Theme::AccentCyan);
                 }
                 ry += 62.0f;
                 DrawRowDivider(g, ry, settingsViewport);
 
                 // Row 4.2: 意见反馈 & 次级外链
                 DrawRowText(g, ry, 68.0f, 294.0f, settingsViewport, L"意见反馈与社区",
-                            L"反馈 Bug 或功能建议，或访问 GitHub 主页与作者 X (" APP_X_HANDLE_W L")");
+                            L"反馈 Bug 或功能建议，或访问 GitHub 主页与作者 X（" APP_X_HANDLE_W L"）");
                 if (ry + 68.0f >= settingsViewport.top && ry <= settingsViewport.bottom) {
                     float bt = ry + 20.0f, bb = ry + 48.0f;
                     D2D1_RECT_F btnGh = D2D1::RectF(g.right - 284.0f, bt, g.right - 196.0f, bb);
@@ -4945,8 +5276,8 @@ private:
             viewportScroll.Draw(rt.Get(), brush.Get(), scrollY, maxScrollY, lastViewportH);
         }
 
-        // Bottom inline Toast notification (with inline '撤销删除' button during 5s undo window!)
-        bool undoLive = (undoDelete.active && nowTick < undoDelete.expireTick);
+        // Bottom inline Toast notification (with inline '撤销' button only when toastShowsUndo is true!)
+        bool undoLive = (toastShowsUndo && undoDelete.active && nowTick < undoDelete.expireTick);
         if (!toastMessage.empty() && nowTick - toastTick < toastDurationMs) {
             float tw = std::min(cw - 40.0f, undoLive ? 410.0f : 368.0f);
             D2D1_RECT_F tr = D2D1::RectF((cw - tw) * 0.5f, ch - 48.0f, (cw + tw) * 0.5f, ch - 14.0f);
@@ -4963,7 +5294,7 @@ private:
                 }
                 D2D1_RECT_F btnUndo = D2D1::RectF(tr.right - 84.0f, tr.top + 5.0f, tr.right - 8.0f, tr.bottom - 5.0f);
                 int zUndo = AddZone(35, btnUndo);
-                DrawPillButton(btnUndo, L"撤销删除", zUndo, 0x264B7A, 0x3366A8, Theme::AccentCyan, 0.35f);
+                DrawPillButton(btnUndo, undoDelete.isClearScene ? L"撤销清空" : L"撤销删除", zUndo, 0x264B7A, 0x3366A8, Theme::AccentCyan, 0.35f);
             } else if (fmtBadge) {
                 rt->DrawTextW(toastMessage.c_str(), (UINT32)toastMessage.size(), fmtBadge.Get(), tr,
                               Br(Rgba(toastIsError ? Theme::DangerRed : Theme::CopyGreen, 0.98f)));
@@ -5013,9 +5344,10 @@ private:
                 200,
                 state->IsMultiSceneActive()
                     ? L"\x79FB\x51FA\x5F53\x524D\x573A\x666F\xFF08\x4FDD\x7559\x5728\x8BCD\x8231\xFF09"
-                    : L"\x79FB\x56DE\x8BCD\x8231\xFF08\x817E\x7A7A\x5F53\x524D\x69FD\x4F4D\xFF09",
-                L"", false, true));
+                    : L"\x79FB\x51FA\x69FD\x4F4D\xFF08\x4FDD\x7559\x5728\x8BCD\x8231\xFF09"));
         }
+        lastMenuTriggerKind = 11;
+        lastMenuTriggerId = promptId;
         popupMenu->ShowAt(screenPt, items, [this, promptId](int cmd) {
             if (cmd >= 100 && cmd < 110) {
                 int target = cmd - 100;
@@ -5030,7 +5362,7 @@ private:
                 std::wstring dest = state->IsMultiSceneActive()
                     ? (L"「" + state->ActiveScene().name + L" · 槽位 " + FormatSlotNum(target) + L"」")
                     : (L"槽位 " + FormatSlotNum(target));
-                ShowToast(L"\x5DF2\x88C5\x914D\x5230" + dest, false);
+                ShowToast(L"\x5DF2\x653E\x5165" + dest, false);
                 RefreshIfOpen();
             } else if (cmd == 200) {
                 // Re-query current slot dynamically so stale slot index can never clear another item
@@ -5039,16 +5371,47 @@ private:
                     AppState candidate = *state;
                     candidate.ActiveSlots()[(size_t)liveSlot].clear();
                     if (!storage->Save(candidate)) {
-                        ShowToast(L"\x4FDD\x5B58\x5931\x8D25\xFF1A\x65E0\x6CD5\x79FB\x56DE\x8BCD\x8231", true);
+                        ShowToast(L"\x4FDD\x5B58\x5931\x8D25\xFF1A\x65E0\x6CD5\x79FB\x51FA\x69FD\x4F4D", true);
                         return;
                     }
                     *state = std::move(candidate);
                     if (onStateChanged) onStateChanged();
-                    ShowToast(state->IsMultiSceneActive() ? L"已移出当前场景（词舱数据已保留）" : L"\x5DF2\x79FB\x56DE\x8BCD\x8231", false);
+                    ShowToast(state->IsMultiSceneActive() ? L"已移出当前场景（词舱已保留）" : L"已移出槽位（词舱已保留）", false);
                     RefreshIfOpen();
                 }
             }
         }, 268.0f, MenuOwner::Vault);
+    }
+
+    void ShowCardMoreMenu(const std::wstring& promptId, POINT screenPt, bool includePrimaryActions = false) {
+        if (!popupMenu || !state) return;
+        const PromptItem* item = state->FindById(promptId);
+        if (!item) return;
+        std::vector<DarkMenuItem> items;
+        if (includePrimaryActions) {
+            items.push_back(DarkMenuItem::Header(CollapseWhitespaceSingleLine(item->title, 18)));
+            items.push_back(DarkMenuItem::Action(1, L"\x590D\x5236\x5168\x6587"));
+            items.push_back(DarkMenuItem::Action(2, assignTargetSlot >= 0
+                ? (L"\x653E\x5165\x69FD\x4F4D " + FormatSlotNum(assignTargetSlot))
+                : L"\x653E\x5165\x6216\x66FF\x6362\x69FD\x4F4D..."));
+            items.push_back(DarkMenuItem::Action(3, L"\x7F16\x8F91 Prompt..."));
+            items.push_back(DarkMenuItem::Separator());
+        }
+        items.push_back(DarkMenuItem::Action(4, L"\x521B\x5EFA\x526F\x672C"));
+        items.push_back(DarkMenuItem::Separator());
+        items.push_back(DarkMenuItem::Action(5, L"\x5220\x9664\x6B64 Prompt", L"", false, true));
+
+        lastMenuTriggerKind = 15;
+        lastMenuTriggerId = promptId;
+        popupMenu->ShowAt(screenPt, items, [this, promptId, screenPt](int cmd) {
+            if (cmd == 1) CopyPromptById(promptId);
+            else if (cmd == 2) {
+                if (assignTargetSlot >= 0) AssignPromptToTargetSlot(promptId);
+                else ShowSlotAssignPopup(promptId, screenPt);
+            } else if (cmd == 3) OpenEditPromptModal(promptId);
+            else if (cmd == 4) DuplicatePrompt(promptId);
+            else if (cmd == 5) DeletePromptWithUndo(promptId);
+        }, 196.0f, MenuOwner::Vault);
     }
 
     void OnZoneClick(int idx, POINT screenPt) {
@@ -5059,6 +5422,7 @@ private:
                 activeTab = 0;
                 scrollY = 0.0f;
                 UpdateSearchVisibility();
+                if (hSearchEdit && IsWindow(hSearchEdit)) SetFocus(hSearchEdit);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 break;
             case 2:
@@ -5073,6 +5437,26 @@ private:
                 UpdateSearchVisibility();
                 InvalidateRect(hwnd, nullptr, FALSE);
                 break;
+            case 70:
+            case 71:
+            case 72:
+            case 73: {
+                int scIdx = z.kind - 70;
+                if (scIdx >= 0 && scIdx < kMaxScenes && state->scenes[(size_t)scIdx].enabled &&
+                    scIdx != state->EffectiveActiveSceneIndex()) {
+                    AppState candidate = *state;
+                    candidate.activeSceneIndex = scIdx;
+                    if (!storage->Save(candidate)) {
+                        ShowToast(L"切换场景失败：当前处于只读保护或配置文件不可写", true);
+                        break;
+                    }
+                    *state = std::move(candidate);
+                    InvalidateCaches();
+                    if (onStateChanged) onStateChanged();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                break;
+            }
             case 20: {
                 state->showHoverBubble = !state->showHoverBubble;
                 if (!storage->Save(*state)) {
@@ -5084,17 +5468,26 @@ private:
                 InvalidateRect(hwnd, nullptr, FALSE);
                 break;
             }
+            case 16: {
+                if (AutoStart::SetEnabled(false)) {
+                    ShowToast(L"已关闭开机自动启动", false);
+                } else {
+                    ShowToast(L"修改开机自启失败", true);
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+                break;
+            }
             case 21: {
                 auto st = AutoStart::GetStatus();
                 bool next = (st != AutoStart::Status::EnabledCurrent);
                 if (AutoStart::SetEnabled(next)) {
                     if (st == AutoStart::Status::StaleOtherPath) {
-                        ShowToast(L"已将开机自启路径修复到当前位置", false);
+                        ShowToast(L"已将开机自动启动切换为当前位置", false);
                     } else {
-                        ShowToast(next ? L"已开启登录 Windows 时启动" : L"已关闭登录 Windows 时启动", false);
+                        ShowToast(next ? L"已开启开机自动启动" : L"已关闭开机自动启动", false);
                     }
                 } else {
-                    ShowToast(L"修改开机自启注册表失败", true);
+                    ShowToast(L"修改开机自启失败", true);
                 }
                 InvalidateRect(hwnd, nullptr, FALSE);
                 break;
@@ -5158,7 +5551,7 @@ private:
                 AppState candidate = *state;
                 bool wasEnabled = candidate.scenes[(size_t)scIdx].enabled;
                 if (!candidate.ToggleSceneEnabled(scIdx)) {
-                    ShowToast(L"至少需保留 1 个启用场景", true);
+                    ShowToast(L"至少需保留 1 个启用场景", false);
                     break;
                 }
                 if (!storage->Save(candidate)) {
@@ -5199,8 +5592,8 @@ private:
                 if (r <= 32) ShowToast(L"打开卡兹克 GitHub 主页失败", true);
                 break;
             }
-            case 48: {
-                ExportBackupDialog(true);
+            case 17: {
+                OpenNewPromptModal(assignTargetSlot, nullptr, CollapseWhitespaceSingleLine(searchQuery, 24));
                 break;
             }
             case 8: {
@@ -5313,26 +5706,24 @@ private:
             }
             case 11: { // Assign to slot
                 if (assignTargetSlot >= 0 && assignTargetSlot < 10) {
-                    int assigned = assignTargetSlot;
-                    AppState candidate = *state;
-                    candidate.AssignToSlot(assigned, z.promptId);
-                    if (!storage->Save(candidate)) {
-                        ShowToast(L"\x4FDD\x5B58\x5931\x8D25\xFF1A\x65E0\x6CD5\x66F4\x65B0\x69FD\x4F4D", true);
+                    AssignPromptToTargetSlot(z.promptId);
+                } else {
+                    if (popupMenu && popupMenu->WasJustClosedByOutsideClickAt(MenuOwner::Vault, screenPt) &&
+                        lastMenuTriggerKind == 11 && lastMenuTriggerId == z.promptId) {
+                        lastMenuTriggerKind = 0;
                         break;
                     }
-                    *state = std::move(candidate);
-                    assignTargetSlot = -1;
-                    InvalidateCaches();
-                    UpdateSearchVisibility();
-                    if (onStateChanged) onStateChanged();
-                    std::wstring dest = state->IsMultiSceneActive()
-                        ? (L"「" + state->ActiveScene().name + L" · 槽位 " + FormatSlotNum(assigned) + L"」")
-                        : (L"槽位 " + FormatSlotNum(assigned));
-                    ShowToast(L"\x5DF2\x6362\x5165" + dest, false);
-                    InvalidateRect(hwnd, nullptr, FALSE);
-                } else {
                     ShowSlotAssignPopup(z.promptId, screenPt);
                 }
+                break;
+            }
+            case 15: { // Card '···' more menu (toggle cleanly if just closed by clicking same button)
+                if (popupMenu && popupMenu->WasJustClosedByOutsideClickAt(MenuOwner::Vault, screenPt) &&
+                    lastMenuTriggerKind == 15 && lastMenuTriggerId == z.promptId) {
+                    lastMenuTriggerKind = 0;
+                    break;
+                }
+                ShowCardMoreMenu(z.promptId, screenPt, false);
                 break;
             }
             case 12:
@@ -5416,18 +5807,81 @@ private:
                 InvalidateRect(h, nullptr, FALSE);
                 return 0;
             }
+            case WM_SETCURSOR:
+                if (LOWORD(lp) == HTCLIENT) {
+                    if (self->isVaultDragging) {
+                        SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+                    } else if (self->hoverZoneIdx >= 0) {
+                        SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                    } else {
+                        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+                    }
+                    return TRUE;
+                }
+                break;
+            case WM_RBUTTONUP: {
+                RECT crc{};
+                GetClientRect(h, &crc);
+                float cw = (float)(crc.right - crc.left) / self->dpiScale;
+                float ch = (float)(crc.bottom - crc.top) / self->dpiScale;
+                float dx = (float)(short)LOWORD(lp) / self->dpiScale;
+                float dy = (float)(short)HIWORD(lp) / self->dpiScale;
+                if (dx < 20.0f || dx > cw - 20.0f || dy > ch - 8.0f) return 0;
+                POINT spt{ (short)LOWORD(lp), (short)HIWORD(lp) };
+                ClientToScreen(h, &spt);
+                if (self->activeTab == 0 && dy >= self->vaultListTopDip) {
+                    self->EnsureVaultCache();
+                    float relY = (dy - self->vaultListTopDip) + self->scrollY;
+                    int idx = (int)std::floor(relY / 76.0f);
+                    if (idx >= 0 && idx < (int)self->cachedFilteredIndices.size() && (relY - idx * 76.0f) <= 68.0f) {
+                        size_t vi = self->cachedFilteredIndices[(size_t)idx];
+                        if (vi < self->state->vault.size()) {
+                            self->selectedVaultRow = idx;
+                            InvalidateRect(h, nullptr, FALSE);
+                            self->ShowCardMoreMenu(self->state->vault[vi].id, spt, true);
+                        }
+                    }
+                } else if (self->activeTab == 1 && dy >= self->rankListTopDip) {
+                    self->EnsureRankCache();
+                    float relY = (dy - self->rankListTopDip) + self->scrollY;
+                    int idx = (int)std::floor(relY / 65.0f);
+                    if (idx >= 0 && idx < (int)self->cachedRankedIndices.size() && (relY - idx * 65.0f) <= 58.0f) {
+                        size_t vi = self->cachedRankedIndices[(size_t)idx];
+                        if (vi < self->state->vault.size()) {
+                            self->ShowCardMoreMenu(self->state->vault[vi].id, spt, true);
+                        }
+                    }
+                }
+                return 0;
+            }
             case WM_LBUTTONDBLCLK: {
-                if (self->activeTab == 1) {
-                    float dx = (float)(short)LOWORD(lp) / self->dpiScale;
-                    float dy = (float)(short)HIWORD(lp) / self->dpiScale;
-                    if (self->HitTestZones(dx, dy) < 0 && dy >= self->rankListTopDip) {
+                RECT crc{};
+                GetClientRect(h, &crc);
+                float cw = (float)(crc.right - crc.left) / self->dpiScale;
+                float ch = (float)(crc.bottom - crc.top) / self->dpiScale;
+                float dx = (float)(short)LOWORD(lp) / self->dpiScale;
+                float dy = (float)(short)HIWORD(lp) / self->dpiScale;
+                if (dx >= 20.0f && dx <= cw - 20.0f && dy <= ch - 8.0f && self->HitTestZones(dx, dy) < 0) {
+                    if (self->activeTab == 0 && dy >= self->vaultListTopDip) {
+                        self->EnsureVaultCache();
+                        float relY = (dy - self->vaultListTopDip) + self->scrollY;
+                        int idx = (int)std::floor(relY / 76.0f);
+                        if (idx >= 0 && idx < (int)self->cachedFilteredIndices.size() && (relY - idx * 76.0f) <= 68.0f) {
+                            size_t vi = self->cachedFilteredIndices[(size_t)idx];
+                            if (vi < self->state->vault.size()) {
+                                if (self->assignTargetSlot >= 0) self->AssignPromptToTargetSlot(self->state->vault[vi].id);
+                                else self->OpenEditPromptModal(self->state->vault[vi].id);
+                            }
+                        }
+                    } else if (self->activeTab == 1 && dy >= self->rankListTopDip) {
                         self->EnsureRankCache();
                         float relY = (dy - self->rankListTopDip) + self->scrollY;
                         int idx = (int)std::floor(relY / 65.0f);
                         if (idx >= 0 && idx < (int)self->cachedRankedIndices.size() && (relY - idx * 65.0f) <= 58.0f) {
                             size_t vi = self->cachedRankedIndices[(size_t)idx];
                             if (vi < self->state->vault.size()) {
-                                self->OpenEditPromptModal(self->state->vault[vi].id);
+                                if (self->assignTargetSlot >= 0) self->AssignPromptToTargetSlot(self->state->vault[vi].id);
+                                else self->OpenEditPromptModal(self->state->vault[vi].id);
                             }
                         }
                     }
@@ -5452,13 +5906,14 @@ private:
                     self->pressedZoneKind = self->hitZones[(size_t)hit].kind;
                     self->pressedZonePromptId = self->hitZones[(size_t)hit].promptId;
                     SetCapture(h);
+                    InvalidateRect(h, nullptr, FALSE);
                     return 0;
                 }
                 if (self->activeTab == 0) {
                     RECT crc{};
                     GetClientRect(h, &crc);
                     float cw = (float)(crc.right - crc.left) / self->dpiScale;
-                    if (dx >= 18.0f && dx <= cw - 288.0f && dy >= self->vaultListTopDip) {
+                    if (dx >= 18.0f && dx <= cw - 226.0f && dy >= self->vaultListTopDip) {
                         self->EnsureVaultCache();
                         float relY = (dy - self->vaultListTopDip) + self->scrollY;
                         int rowIdx = (int)std::floor(relY / 76.0f);
@@ -5563,6 +6018,7 @@ private:
                 self->pressedZonePromptId.clear();
                 if (GetCapture() == h) ReleaseCapture();
                 if (downKind == 0) return 0;
+                InvalidateRect(h, nullptr, FALSE);
 
                 float dx = (float)(short)LOWORD(lp) / self->dpiScale;
                 float dy = (float)(short)HIWORD(lp) / self->dpiScale;
@@ -5577,6 +6033,7 @@ private:
             }
             case WM_CAPTURECHANGED:
             case WM_CANCELMODE: {
+                bool hadPressed = (self->pressedZoneKind != 0);
                 self->pressedZoneKind = 0;
                 self->pressedZonePromptId.clear();
                 self->viewportScroll.dragging = false;
@@ -5589,6 +6046,8 @@ private:
                         self->storage->Save(*self->state);
                         self->InvalidateCaches();
                     }
+                    InvalidateRect(h, nullptr, FALSE);
+                } else if (hadPressed) {
                     InvalidateRect(h, nullptr, FALSE);
                 }
                 return 0;

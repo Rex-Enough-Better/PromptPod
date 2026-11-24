@@ -145,7 +145,7 @@ try {
     & g++.exe `
         -std=c++17 -Os -s -DNDEBUG -fno-ident -Wall -Wextra -Wno-missing-field-initializers `
         -finput-charset=UTF-8 -fwide-exec-charset=UTF-16LE `
-        -fno-rtti -ffunction-sections -fdata-sections "-Wl,--gc-sections" `
+        -fno-exceptions -fno-rtti -ffunction-sections -fdata-sections "-Wl,--gc-sections" `
         -static -static-libgcc -static-libstdc++ `
         -municode -mwindows `
         "main.cpp" $resObj `

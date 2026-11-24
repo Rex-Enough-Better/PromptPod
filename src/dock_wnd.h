@@ -58,7 +58,8 @@ public:
     ComPtr<IDWriteTextFormat> fmtLabel;
 
     OnboardingStep step = OnboardingStep::Inactive;
-    int targetSlot = 2; // Default Slot 03 (0-based index 2)
+    int step1Slot = 0;  // Dynamically resolved first non-empty slot
+    int targetSlot = 2; // Dynamically resolved first empty slot (-1 when full)
     bool step1Done = false;
     bool step2Done = false;
     bool shown = false;
@@ -66,12 +67,13 @@ public:
     int winX = 0;
     int winY = 0;
     bool placeOnLeft = true;
-    int hoverZone = 0;   // 1:Skip, 2:Next/SkipStep, 3:CreateBtn, 4:RightEdge, 5:LeftEdge, 6:AutoStart, 7:Finish
+    int hoverZone = 0;   // 1:Skip, 2:Next/SkipStep, 3:CreateBtn, 4:RightEdge, 5:LeftEdge, 6:AutoStart, 7:Finish, 8:Step1CopyBtn
     int pressedZone = 0;
     bool trackingLeave = false;
 
     const AppState* state = nullptr;
     std::function<void()> onSkipOrFinish;
+    std::function<void(int)> onTriggerCopy;
     std::function<void(int)> onRequestCreatePrompt;
     std::function<void(DockEdge)> onSelectEdge;
     std::function<void()> onToggleAutoStart;
@@ -114,10 +116,11 @@ public:
         return step != OnboardingStep::Inactive;
     }
 
-    void Start(int preferredEmptySlot) {
-        targetSlot = (preferredEmptySlot >= 0 && preferredEmptySlot < 10) ? preferredEmptySlot : 2;
-        step = OnboardingStep::Step1Copy;
-        step1Done = false;
+    void Start(int copySlot, int preferredEmptySlot) {
+        step1Slot = (copySlot >= 0 && copySlot < 10) ? copySlot : -1;
+        targetSlot = (preferredEmptySlot >= 0 && preferredEmptySlot < 10) ? preferredEmptySlot : -1;
+        step = (step1Slot >= 0) ? OnboardingStep::Step1Copy : OnboardingStep::Step2Create;
+        step1Done = (step1Slot < 0);
         step2Done = false;
         hoverZone = 0;
         pressedZone = 0;
@@ -279,11 +282,13 @@ public:
         };
 
         wchar_t slotBuf[8]{};
-        wsprintfW(slotBuf, L"%02d", targetSlot + 1);
+        if (targetSlot >= 0) wsprintfW(slotBuf, L"%02d", targetSlot + 1);
+        wchar_t step1Buf[8]{};
+        wsprintfW(step1Buf, L"%02d", (step1Slot >= 0 ? step1Slot : 0) + 1);
 
         if (step == OnboardingStep::Step1Copy) {
-            std::wstring title = UiText(L"试一次零焦点复制");
-            std::wstring body = UiText(L"点击旁侧台面「01」槽位，立即将完整 Prompt 写入剪贴板，原编辑器或浏览器光标绝不丢失。");
+            std::wstring title = UiText(L"点一下，直接复制");
+            std::wstring body = UiText(L"点击旁侧高亮槽位即可复制全文，不会打断你正在输入的光标。");
             if (fmtTitle) {
                 rt->DrawTextW(title.c_str(), (UINT32)title.size(), fmtTitle.Get(),
                               D2D1::RectF(box.left + 14.0f, box.top + 46.0f, box.right - 14.0f, box.top + 70.0f),
@@ -298,23 +303,24 @@ public:
                 D2D1_RECT_F okBox = D2D1::RectF(box.left + 14.0f, box.bottom - 48.0f, box.right - 14.0f, box.bottom - 14.0f);
                 rt->FillRoundedRectangle(D2D1::RoundedRect(okBox, 7.0f, 7.0f), canvas.Brush(Rgba(0x14533D, 0.95f)));
                 DrawRim(rt, okBox, 7.0f, Rgba(Theme::CopyGreen, 0.55f), Rgba(0xFFFFFF, 0.06f));
-                std::wstring okTxt = UiText(L"✓ 已完成零焦点复制，进入下一步...");
+                std::wstring okTxt = UiText(L"✓ 已复制到剪贴板，即将进入下一步...");
                 if (fmtBtn) {
                     rt->DrawTextW(okTxt.c_str(), (UINT32)okTxt.size(), fmtBtn.Get(), okBox, canvas.Brush(Rgba(Theme::CopyGreen, 1.0f)));
                 }
             } else {
-                D2D1_RECT_F hintPill = D2D1::RectF(box.left + 14.0f, box.bottom - 46.0f, box.right - 92.0f, box.bottom - 14.0f);
-                rt->FillRoundedRectangle(D2D1::RoundedRect(hintPill, 7.0f, 7.0f), canvas.Brush(Rgba(Theme::AccentCyan, 0.12f)));
-                std::wstring ht = UiText(L"请点击台面 01 槽位");
-                if (fmtBtn) {
-                    rt->DrawTextW(ht.c_str(), (UINT32)ht.size(), fmtBtn.Get(), hintPill, canvas.Brush(Rgba(Theme::AccentCyan, 0.96f)));
-                }
+                rcPrimaryBtn = D2D1::RectF(box.left + 14.0f, box.bottom - 46.0f, box.right - 92.0f, box.bottom - 14.0f);
+                std::wstring ht = placeOnLeft
+                    ? (L"试着复制槽位 " + std::wstring(step1Buf) + L" →")
+                    : (L"← 试着复制槽位 " + std::wstring(step1Buf));
+                drawPill(rcPrimaryBtn, ht, hoverZone == 8, 0x16324A, 0x1E4668, Theme::AccentCyan, 0.30f);
                 rcNextLink = D2D1::RectF(box.right - 84.0f, box.bottom - 46.0f, box.right - 14.0f, box.bottom - 14.0f);
                 drawPill(rcNextLink, L"下一步", hoverZone == 2, 0x1D2230, 0x282F42, Theme::TextSecondary, 0.12f);
             }
         } else if (step == OnboardingStep::Step2Create) {
             std::wstring title = UiText(L"存入你的第一条 Prompt");
-            std::wstring body = UiText(L"台面已为你留出 03 ~ 10 空位。点击高亮空槽 " + std::wstring(slotBuf) + L" 或下方按钮，存入你最常用的提示词。");
+            std::wstring body = (targetSlot >= 0)
+                ? UiText(L"点击高亮空槽 " + std::wstring(slotBuf) + L" 或下方按钮，存入你最常用的提示词。")
+                : UiText(L"当前台面 10 槽已满，点下方按钮新建将直接存入词舱。");
             if (fmtTitle) {
                 rt->DrawTextW(title.c_str(), (UINT32)title.size(), fmtTitle.Get(),
                               D2D1::RectF(box.left + 14.0f, box.top + 46.0f, box.right - 14.0f, box.top + 70.0f),
@@ -329,13 +335,16 @@ public:
                 D2D1_RECT_F okBox = D2D1::RectF(box.left + 14.0f, box.bottom - 48.0f, box.right - 14.0f, box.bottom - 14.0f);
                 rt->FillRoundedRectangle(D2D1::RoundedRect(okBox, 7.0f, 7.0f), canvas.Brush(Rgba(0x14533D, 0.95f)));
                 DrawRim(rt, okBox, 7.0f, Rgba(Theme::CopyGreen, 0.55f), Rgba(0xFFFFFF, 0.06f));
-                std::wstring okTxt = UiText(L"✓ 已放入槽位 " + std::wstring(slotBuf) + L"，进入下一步...");
+                std::wstring okTxt = (targetSlot >= 0)
+                    ? UiText(L"✓ 已放入槽位 " + std::wstring(slotBuf) + L"，进入下一步...")
+                    : UiText(L"✓ 已存入词舱，进入下一步...");
                 if (fmtBtn) {
                     rt->DrawTextW(okTxt.c_str(), (UINT32)okTxt.size(), fmtBtn.Get(), okBox, canvas.Brush(Rgba(Theme::CopyGreen, 1.0f)));
                 }
             } else {
                 rcPrimaryBtn = D2D1::RectF(box.left + 14.0f, box.bottom - 46.0f, box.right - 98.0f, box.bottom - 14.0f);
-                drawPill(rcPrimaryBtn, L"+ 存入槽位 " + std::wstring(slotBuf), hoverZone == 3, 0x366EF0, 0x4B82F8, 0xFFFFFF, 0.28f);
+                std::wstring addBtn = (targetSlot >= 0) ? (L"+ 放入槽位 " + std::wstring(slotBuf)) : L"+ 新建 Prompt";
+                drawPill(rcPrimaryBtn, addBtn, hoverZone == 3, 0x366EF0, 0x4B82F8, 0xFFFFFF, 0.28f);
                 rcNextLink = D2D1::RectF(box.right - 90.0f, box.bottom - 46.0f, box.right - 14.0f, box.bottom - 14.0f);
                 drawPill(rcNextLink, L"暂不添加", hoverZone == 2, 0x1D2230, 0x282F42, Theme::TextSecondary, 0.12f);
             }
@@ -365,7 +374,7 @@ public:
             rt->FillRoundedRectangle(D2D1::RoundedRect(rcAutoStartRow, 7.0f, 7.0f),
                                      canvas.Brush(Rgba(hoverZone == 6 ? 0x222838 : 0x181C26, 0.95f)));
             DrawRim(rt, rcAutoStartRow, 7.0f, Rgba(0xFFFFFF, 0.08f), Rgba(0xFFFFFF, 0.03f));
-            std::wstring autoLbl = UiText(L"开机自动启动（静默贴边待命）");
+            std::wstring autoLbl = UiText(L"开机自动启动（静默待命）");
             if (fmtLabel) {
                 rt->DrawTextW(autoLbl.c_str(), (UINT32)autoLbl.size(), fmtLabel.Get(),
                               D2D1::RectF(rcAutoStartRow.left + 10.0f, rcAutoStartRow.top, rcAutoStartRow.right - 56.0f, rcAutoStartRow.bottom),
@@ -383,7 +392,7 @@ public:
 
             // Primary finish button
             rcPrimaryBtn = D2D1::RectF(box.left + 14.0f, box.bottom - 46.0f, box.right - 14.0f, box.bottom - 14.0f);
-            drawPill(rcPrimaryBtn, L"开始使用（收起至边缘微光把手）", hoverZone == 7, 0x366EF0, 0x4B82F8, 0xFFFFFF, 0.28f);
+            drawPill(rcPrimaryBtn, L"完成设置，开始使用", hoverZone == 7, 0x366EF0, 0x4B82F8, 0xFFFFFF, 0.28f);
         }
 
         return canvas.EndAndPresent(hwnd, winX, winY);
@@ -408,6 +417,7 @@ private:
     int HitZone(float x, float y) const {
         if (PtInDip(rcSkip, x, y)) return 1;
         if (step == OnboardingStep::Step1Copy) {
+            if (!step1Done && PtInDip(rcPrimaryBtn, x, y)) return 8;
             if (PtInDip(rcNextLink, x, y)) return 2;
         } else if (step == OnboardingStep::Step2Create) {
             if (PtInDip(rcPrimaryBtn, x, y)) return 3;
@@ -448,6 +458,12 @@ private:
         switch (msg) {
             case WM_MOUSEACTIVATE:
                 return MA_NOACTIVATE;
+            case WM_SETCURSOR:
+                if (LOWORD(lp) == HTCLIENT) {
+                    SetCursor(LoadCursorW(nullptr, self->hoverZone != 0 ? IDC_HAND : IDC_ARROW));
+                    return TRUE;
+                }
+                break;
             case WM_TIMER:
                 if (wp == kTimerAdvance) {
                     KillTimer(h, kTimerAdvance);
@@ -504,6 +520,8 @@ private:
                     if (self->onSelectEdge) self->onSelectEdge(DockEdge::Left);
                 } else if (hz == 6) {
                     if (self->onToggleAutoStart) self->onToggleAutoStart();
+                } else if (hz == 8) {
+                    if (self->onTriggerCopy && self->step1Slot >= 0) self->onTriggerCopy(self->step1Slot);
                 }
                 return 0;
             }
@@ -565,6 +583,7 @@ public:
     int hoverSlot = -1;       // 0..9
     int hoverSceneBtn = -1;   // Actual scene index 0..3 when ShowSceneBar()
     bool hoverRedockBtn = false;
+    bool hoverMenuBtn = false;
     bool handleHovered = false;
     bool mouseTracking = false;
     int bubblePendingSlot = -1;
@@ -575,6 +594,7 @@ public:
     int pressedEmptySlot = -1;
     int pressedSceneBtn = -1;
     bool pressedRedockBtn = false;
+    bool pressedMenuBtn = false;
     bool isSlotDragging = false;
     POINT slotDragStartScreen{};
     float slotDragGrabOffsetDipY = 0.0f;
@@ -631,6 +651,13 @@ public:
     bool lastPresentOk = false;
     int consecutiveRenderFails = 0;
     int lastLoggedMode = -1; // 0 = collapsed, 1 = expanded/floating
+    int lastRenderedSceneIdx = -1;
+    std::wstring dockToastText;
+    bool dockToastIsError = false;
+    bool dockToastHasUndo = false;
+    ULONGLONG dockToastExpireTick = 0;
+    bool hoverDockUndoBtn = false;
+    bool pressedDockUndoBtn = false;
     int displaySyncStage = 0;
     bool displaySyncQueued = false;
     std::wstring queuedSyncReason;
@@ -668,6 +695,7 @@ public:
     static constexpr UINT_PTR kTimerWatchdog    = 5007;
     static constexpr UINT_PTR kTimerRenderRetry = 5008;
     static constexpr UINT_PTR kTimerQuickVerify = 5009;
+    static constexpr UINT_PTR kTimerDockToast   = 5010;
 
     bool Init(HINSTANCE inst, AppState* st, StorageManager* stor, DarkPopupMenu* menu, VaultWindow* vault,
               std::function<void(POINT)> appMenuCb, bool showInitial = true) {
@@ -722,6 +750,9 @@ public:
         onboardingWnd.onSkipOrFinish = [this]() {
             FinishOnboarding(true);
         };
+        onboardingWnd.onTriggerCopy = [this](int slotIdx) {
+            TriggerSlotCopy(slotIdx);
+        };
         onboardingWnd.onRequestCreatePrompt = [this](int targetSlot) {
             TriggerOnboardingCreatePrompt(targetSlot);
         };
@@ -758,6 +789,78 @@ public:
         return true;
     }
 
+    bool IsDockToastActive() const {
+        return !dockToastText.empty() && dockToastExpireTick != 0 && GetTickCount64() < dockToastExpireTick;
+    }
+
+    D2D1_RECT_F DockToastRectDip() const {
+        D2D1_RECT_F pb = PanelBoxDip();
+        return D2D1::RectF(pb.left + Theme::PaddingX, pb.bottom - 36.0f, pb.right - Theme::PaddingX, pb.bottom - 8.0f);
+    }
+
+    D2D1_RECT_F DockToastUndoBtnRectDip() const {
+        D2D1_RECT_F tr = DockToastRectDip();
+        return D2D1::RectF(tr.right - 50.0f, tr.top + 3.0f, tr.right - 4.0f, tr.bottom - 3.0f);
+    }
+
+    bool HitTestDockUndoBtnDip(float dx, float dy) const {
+        if (!IsDockToastActive() || !dockToastHasUndo) return false;
+        D2D1_RECT_F r = DockToastUndoBtnRectDip();
+        return dx >= r.left && dx <= r.right && dy >= r.top && dy <= r.bottom;
+    }
+
+    void ClearDockToast() {
+        dockToastText.clear();
+        dockToastIsError = false;
+        dockToastHasUndo = false;
+        dockToastExpireTick = 0;
+        hoverDockUndoBtn = false;
+        pressedDockUndoBtn = false;
+        if (hwnd) KillTimer(hwnd, kTimerDockToast);
+    }
+
+    void ShowDockToast(const std::wstring& msg, bool isErr, ULONGLONG durationMs = 3000, bool withUndoClear = false) {
+        dockToastText = UiText(msg);
+        dockToastIsError = isErr;
+        dockToastHasUndo = withUndoClear;
+        dockToastExpireTick = GetTickCount64() + durationMs;
+        hoverDockUndoBtn = false;
+        pressedDockUndoBtn = false;
+        if (hwnd) {
+            SetTimer(hwnd, kTimerDockToast, (UINT)durationMs, nullptr);
+            if (state && state->dockEdge != DockEdge::None) {
+                holdOpenUntilTick = std::max(holdOpenUntilTick, dockToastExpireTick);
+                if (IsCompactCollapsedMode()) ExpandAndReveal((DWORD)durationMs);
+                else EnsureLeaveWatchTimer();
+            }
+            RenderAndPresent("dock-toast");
+        }
+    }
+
+    void ClearSceneTransientState() {
+        if (hwnd) {
+            KillTimer(hwnd, kTimerBubbleHover);
+            KillTimer(hwnd, kTimerAutoRetract);
+        }
+        pendingAutoRetract = false;
+        ++retractGen;
+        bubblePendingSlot = -1;
+        bubbleHoverDeadline = 0;
+        hoverBubble.HideImmediate();
+        hoverSlot = -1;
+        copiedSlot = -1;
+        copiedTick = 0;
+        copyFailedSlot = -1;
+        copyFailedTick = 0;
+        slotScrollDip = 0.0f;
+        slotHoverAnim.fill(0.0f);
+        slotShiftOffsetDip.fill(0.0f);
+        if (onboardingWnd.IsActive() && onboardingWnd.step == OnboardingStep::Step2Create && !onboardingWnd.step2Done && state) {
+            onboardingWnd.targetSlot = state->FindFirstEmptySlot();
+            onboardingWnd.Render();
+        }
+    }
+
     void Refresh() {
         if (!hwnd) return;
         if (!state->showHoverBubble) {
@@ -765,6 +868,13 @@ public:
             bubblePendingSlot = -1;
             bubbleHoverDeadline = 0;
             hoverBubble.HideImmediate();
+        }
+        if (state) {
+            int liveScene = state->EffectiveActiveSceneIndex();
+            if (lastRenderedSceneIdx >= 0 && liveScene != lastRenderedSceneIdx) {
+                ClearSceneTransientState();
+            }
+            lastRenderedSceneIdx = liveScene;
         }
         RenderAndPresent("refresh");
     }
@@ -828,6 +938,7 @@ public:
         hoverSlot = -1;
         hoverSceneBtn = -1;
         hoverRedockBtn = false;
+        hoverMenuBtn = false;
         handleHovered = false;
         StartSpringTo(0.0f);
     }
@@ -839,28 +950,15 @@ public:
     void SwitchActiveScene(int nextIdx) {
         if (!state || nextIdx < 0 || nextIdx >= kMaxScenes || !state->scenes[(size_t)nextIdx].enabled) return;
         if (nextIdx == state->EffectiveActiveSceneIndex()) return;
-        state->activeSceneIndex = nextIdx;
-
-        // Clear all transient slot state & cancel pending auto-retract on scene switch
-        if (hwnd) {
-            KillTimer(hwnd, kTimerBubbleHover);
-            KillTimer(hwnd, kTimerAutoRetract);
+        AppState candidate = *state;
+        candidate.activeSceneIndex = nextIdx;
+        if (storage && !storage->Save(candidate)) {
+            ShowDockToast(L"切换场景失败：处于只读保护，请右键打开设置", true, 3200);
+            return;
         }
-        pendingAutoRetract = false;
-        ++retractGen;
-        bubblePendingSlot = -1;
-        bubbleHoverDeadline = 0;
-        hoverBubble.HideImmediate();
-        hoverSlot = -1;
-        copiedSlot = -1;
-        copiedTick = 0;
-        copyFailedSlot = -1;
-        copyFailedTick = 0;
-        slotScrollDip = 0.0f;
-        slotHoverAnim.fill(0.0f);
-        slotShiftOffsetDip.fill(0.0f);
-
-        if (storage) storage->Save(*state);
+        *state = std::move(candidate);
+        lastRenderedSceneIdx = nextIdx;
+        ClearSceneTransientState();
         if (vaultWnd) vaultWnd->RefreshIfOpen();
         if (hwnd) RenderAndPresent("scene-switch");
     }
@@ -871,11 +969,34 @@ public:
             state->dockEdge = DockEdge::Right;
             state->dockRatioY = 0.32;
         }
-        int targetEmpty = state->FindFirstEmptySlot();
-        if (targetEmpty < 0) targetEmpty = 2; // Fallback to slot 03 on full-deck replay
-        onboardingWnd.Start(targetEmpty);
+        auto findFirstFilled = [&]() -> int {
+            const auto& sl = state->ActiveSlots();
+            for (int i = 0; i < 10; ++i) {
+                if (state->FindById(sl[(size_t)i]) != nullptr) return i;
+            }
+            return -1;
+        };
+        int copySlot = findFirstFilled();
+        if (copySlot < 0) {
+            // Current scene is empty; switch to the first enabled scene that has a mounted prompt
+            int vis[kMaxScenes]{};
+            int cnt = state->GetEnabledScenes(vis);
+            for (int p = 0; p < cnt; ++p) {
+                if (state->CountMountedInScene(vis[p]) > 0) {
+                    state->activeSceneIndex = vis[p];
+                    copySlot = findFirstFilled();
+                    break;
+                }
+            }
+        }
+        int targetEmpty = state->FindFirstEmptySlot(); // -1 when all 10 slots are full
+        onboardingWnd.Start(copySlot, targetEmpty);
         KillTimer(hwnd, kTimerHoverExpand);
         KillTimer(hwnd, kTimerAutoRetract);
+        KillTimer(hwnd, kTimerBubbleHover);
+        bubblePendingSlot = -1;
+        bubbleHoverDeadline = 0;
+        hoverBubble.HideImmediate();
         pendingAutoRetract = false;
         ++retractGen;
         holdOpenUntilTick = 0;
@@ -883,8 +1004,8 @@ public:
         expandSpring.Snap(1.0f);
         RenderAndPresent(isReplay ? "onboarding-replay" : "onboarding-start");
         SyncOnboardingPosition();
-        DiagLogger::Instance().LogFmt("INFO", "ONBOARD", L"Started 3-step onboarding (replay=%d, targetSlot=%02d)",
-                                      isReplay ? 1 : 0, targetEmpty + 1);
+        DiagLogger::Instance().LogFmt("INFO", "ONBOARD", L"Started 3-step onboarding (replay=%d, step1=%d, targetSlot=%d)",
+                                      isReplay ? 1 : 0, copySlot + 1, targetEmpty + 1);
     }
 
     void FinishOnboarding(bool animateCapsuleGlow = true) {
@@ -909,11 +1030,15 @@ public:
     }
 
     void TriggerOnboardingCreatePrompt(int targetSlot) {
-        if (!vaultWnd) return;
+        if (!vaultWnd || !state) return;
+        int safeSlot = targetSlot;
+        if (safeSlot >= 0 && safeSlot < 10 && state->FindById(state->ActiveSlots()[(size_t)safeSlot]) != nullptr) {
+            safeSlot = state->FindFirstEmptySlot();
+        }
         int mountedSlot = -1;
-        bool created = vaultWnd->OpenNewPromptModal(targetSlot, &mountedSlot);
+        bool created = vaultWnd->OpenNewPromptModal(safeSlot, &mountedSlot, L"", true);
         if (created && onboardingWnd.IsActive()) {
-            onboardingWnd.NotifyPromptCreated(mountedSlot >= 0 ? mountedSlot : targetSlot);
+            onboardingWnd.NotifyPromptCreated(mountedSlot >= 0 ? mountedSlot : safeSlot);
             RenderAndPresent("onboarding-created");
         }
     }
@@ -1229,6 +1354,8 @@ private:
         pressedEmptySlot = -1;
         pressedSceneBtn = -1;
         pressedRedockBtn = false;
+        pressedMenuBtn = false;
+        pressedDockUndoBtn = false;
         if (GetCapture() == hwnd) ReleaseCapture();
         if (hadSlotDrag) {
             storage->Save(*state);
@@ -1321,7 +1448,7 @@ private:
 
     void SyncHoverBubble(bool immediate) {
         if (!hwnd || !state || !state->showHoverBubble || hoverSlot < 0 || hoverSlot >= 10 ||
-            isDragging || isSlotDragging || IsDockMenuOpen() ||
+            isDragging || isSlotDragging || IsDockMenuOpen() || IsOnboardingActive() ||
             IsCompactCollapsedMode() || expandSpring.target < 0.5f) {
             KillTimer(hwnd, kTimerBubbleHover);
             bubblePendingSlot = -1;
@@ -1390,7 +1517,12 @@ private:
 
     D2D1_RECT_F HeaderRedockBtnRectDip() const {
         D2D1_RECT_F pb = PanelBoxDip();
-        return D2D1::RectF(pb.right - 56.0f, pb.top + 8.0f, pb.right - 10.0f, pb.top + 28.0f);
+        return D2D1::RectF(pb.right - 84.0f, pb.top + 8.0f, pb.right - 38.0f, pb.top + 28.0f);
+    }
+
+    D2D1_RECT_F HeaderMenuBtnRectDip() const {
+        D2D1_RECT_F pb = PanelBoxDip();
+        return D2D1::RectF(pb.right - 34.0f, pb.top + 8.0f, pb.right - 10.0f, pb.top + 28.0f);
     }
 
     // Scene buttons occupy the exact original footer button bar geometry (no extra outer trough)
@@ -1776,29 +1908,49 @@ private:
             }
             bool isReadOnlyWarn = (storage && storage->readOnlyRecoveryMode);
             bool showRedockBtn = (state->dockEdge == DockEdge::None && !isDragging && !isReadOnlyWarn);
-            if (showRedockBtn) {
-                D2D1_RECT_F rb = HeaderRedockBtnRectDip();
-                rt->FillRoundedRectangle(D2D1::RoundedRect(rb, 5.5f, 5.5f),
-                                         canvas.Brush(Rgba(hoverRedockBtn ? 0x264B7A : 0x1E3354, 0.96f * panelAlpha)));
-                DrawRim(rt, rb, 5.5f,
-                                 Rgba(Theme::AccentCyan, (hoverRedockBtn ? 0.65f : 0.38f) * panelAlpha),
-                                 Rgba(0xFFFFFF, 0.06f * panelAlpha), 1.0f);
-                std::wstring rdTxt = UiText(L"贴边");
-                if (fmtFooterBtn) {
-                    rt->DrawTextW(rdTxt.c_str(), (UINT32)rdTxt.size(), fmtFooterBtn.Get(), rb,
-                                  canvas.Brush(Rgba(Theme::AccentCyan, 0.98f * panelAlpha)));
-                }
-            } else {
-                std::wstring hSub = UiText(isReadOnlyWarn
-                    ? L"只读保护 · 点此恢复"
-                    : (renderAsFloating ? L"拖至边缘贴靠" : L"拖拽排序 · 右键管理"));
+            if (isReadOnlyWarn) {
+                std::wstring hSub = UiText(L"只读保护 · 点此恢复");
                 if (fmtHeaderSub) {
-                    D2D1_COLOR_F subCol = isReadOnlyWarn
-                        ? Rgba(0xFBBF24, 0.96f * panelAlpha)
-                        : Rgba(Theme::TextMuted, 0.88f * panelAlpha);
                     rt->DrawTextW(hSub.c_str(), (UINT32)hSub.size(), fmtHeaderSub.Get(),
                                   D2D1::RectF(pb.left + 126.0f, pb.top + 4.0f, pb.right - 10.0f, pb.top + 32.0f),
-                                  canvas.Brush(subCol));
+                                  canvas.Brush(Rgba(0xFBBF24, 0.96f * panelAlpha)));
+                }
+            } else if (isDragging && renderAsFloating) {
+                std::wstring hSub = UiText(L"拖至边缘贴靠");
+                if (fmtHeaderSub) {
+                    rt->DrawTextW(hSub.c_str(), (UINT32)hSub.size(), fmtHeaderSub.Get(),
+                                  D2D1::RectF(pb.left + 126.0f, pb.top + 4.0f, pb.right - 10.0f, pb.top + 32.0f),
+                                  canvas.Brush(Rgba(Theme::TextMuted, 0.88f * panelAlpha)));
+                }
+            } else {
+                if (showRedockBtn) {
+                    D2D1_RECT_F rb = HeaderRedockBtnRectDip();
+                    uint32_t rdBg = pressedRedockBtn ? 0x162944 : (hoverRedockBtn ? 0x264B7A : 0x1E3354);
+                    rt->FillRoundedRectangle(D2D1::RoundedRect(rb, 5.5f, 5.5f),
+                                             canvas.Brush(Rgba(rdBg, 0.96f * panelAlpha)));
+                    DrawRim(rt, rb, 5.5f,
+                                     Rgba(Theme::AccentCyan, (hoverRedockBtn ? 0.65f : 0.38f) * panelAlpha),
+                                     Rgba(0xFFFFFF, 0.06f * panelAlpha), 1.0f);
+                    std::wstring rdTxt = UiText(L"贴边");
+                    if (fmtFooterBtn) {
+                        rt->DrawTextW(rdTxt.c_str(), (UINT32)rdTxt.size(), fmtFooterBtn.Get(), rb,
+                                      canvas.Brush(Rgba(Theme::AccentCyan, 0.98f * panelAlpha)));
+                    }
+                }
+                // Quiet, self-explanatory top-right '···' button for app menu (zero height cost)
+                D2D1_RECT_F mb = HeaderMenuBtnRectDip();
+                if (hoverMenuBtn || pressedMenuBtn) {
+                    uint32_t mBg = pressedMenuBtn ? 0x1A2030 : 0x242B3D;
+                    rt->FillRoundedRectangle(D2D1::RoundedRect(mb, 5.5f, 5.5f),
+                                             canvas.Brush(Rgba(mBg, 0.95f * panelAlpha)));
+                    DrawRim(rt, mb, 5.5f, Rgba(Theme::AccentCyan, 0.35f * panelAlpha), Rgba(0xFFFFFF, 0.05f * panelAlpha), 1.0f);
+                }
+                float mcy = (mb.top + mb.bottom) * 0.5f;
+                float mcx = (mb.left + mb.right) * 0.5f;
+                auto* dotBr = canvas.Brush(Rgba((hoverMenuBtn || pressedMenuBtn) ? Theme::AccentCyan : Theme::TextMuted,
+                                                ((hoverMenuBtn || pressedMenuBtn) ? 0.96f : 0.68f) * panelAlpha));
+                for (int d = -1; d <= 1; ++d) {
+                    rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(mcx + (float)d * 5.0f, mcy), 1.35f, 1.35f), dotBr);
                 }
             }
         }
@@ -1808,9 +1960,10 @@ private:
         rt->PushAxisAlignedClip(slotVp, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
         ULONGLONG nowTick = GetTickCount64();
+        int firstEmptySlot = state->FindFirstEmptySlot();
         int onboardHighlightSlot = (onboardingWnd.step == OnboardingStep::Step2Create && !onboardingWnd.step2Done)
             ? onboardingWnd.targetSlot
-            : ((onboardingWnd.step == OnboardingStep::Step1Copy && !onboardingWnd.step1Done) ? 0 : -1);
+            : ((onboardingWnd.step == OnboardingStep::Step1Copy && !onboardingWnd.step1Done) ? onboardingWnd.step1Slot : -1);
         for (int i = 0; i < 10; ++i) {
             D2D1_RECT_F sr = SlotRectDip(i);
             if (sr.bottom < slotVp.top - 4.0f || sr.top > slotVp.bottom + 4.0f) continue;
@@ -1845,8 +1998,11 @@ private:
             D2D1_RECT_F card = D2D1::RectF(sr.left + nudge, sr.top + yShift, sr.right + nudge, sr.bottom + yShift);
 
             if (item) {
-                D2D1_COLOR_F baseFill = LerpColor(Rgba(Theme::CardBg, 0.86f * panelAlpha),
-                                                  Rgba(Theme::CardHoverBg, 0.98f * panelAlpha), hovT);
+                bool isSlotPressed = (!isSlotDragging && pressedSlot == i);
+                D2D1_COLOR_F baseFill = isSlotPressed
+                    ? Rgba(0x1D2434, 0.98f * panelAlpha)
+                    : LerpColor(Rgba(Theme::CardBg, 0.86f * panelAlpha),
+                                Rgba(Theme::CardHoverBg, 0.98f * panelAlpha), hovT);
                 if (failT > 0.0f) {
                     baseFill = LerpColor(baseFill, Rgba(0x4A1822, 0.98f * panelAlpha), std::min(1.0f, failT * 1.4f));
                 } else if (flashT > 0.0f) {
@@ -1911,34 +2067,40 @@ private:
                                   canvas.Brush(Rgba(hovT > 0.3f ? 0xFFFFFF : Theme::TextPrimary, 0.96f * panelAlpha)));
                 }
             } else {
-                // Empty '+' slot (highlighted during Onboarding Step 2)
+                // Empty '+' slot: keep first empty / onboarding / hovered informative, others quiet to eliminate visual clutter
                 bool isOnboardTarget = (i == onboardHighlightSlot);
+                bool isPressedEmpty = (pressedEmptySlot == i);
                 D2D1_COLOR_F emptyFill = isOnboardTarget
                     ? Rgba(0x16263A, 0.92f * panelAlpha)
-                    : LerpColor(Rgba(Theme::CardEmptyBg, 0.52f * panelAlpha),
-                                Rgba(Theme::CardBg, 0.85f * panelAlpha), hovT);
+                    : (isPressedEmpty
+                        ? Rgba(0x181D29, 0.90f * panelAlpha)
+                        : LerpColor(Rgba(Theme::CardEmptyBg, 0.44f * panelAlpha),
+                                    Rgba(Theme::CardBg, 0.85f * panelAlpha), hovT));
                 rt->FillRoundedRectangle(D2D1::RoundedRect(card, Theme::SlotRadius, Theme::SlotRadius), canvas.Brush(emptyFill));
                 DrawRim(rt, card, Theme::SlotRadius,
                                  isOnboardTarget ? Rgba(Theme::AccentCyan, 0.85f * panelAlpha)
-                                                 : LerpColor(Rgba(0xFFFFFF, 0.04f * panelAlpha), Rgba(Theme::AccentBlue, 0.28f * panelAlpha), hovT),
+                                                 : LerpColor(Rgba(0xFFFFFF, 0.035f * panelAlpha), Rgba(Theme::AccentBlue, 0.28f * panelAlpha), hovT),
                                  Rgba(0xFFFFFF, 0.02f * panelAlpha), isOnboardTarget ? 1.4f : 1.0f);
 
                 D2D1_RECT_F idxBox = D2D1::RectF(card.left + 7.0f, card.top + 8.0f, card.left + 31.0f, card.bottom - 8.0f);
                 if (fmtSlotIdx) {
                     rt->DrawTextW(idxBuf, 2, fmtSlotIdx.Get(), idxBox,
                                   canvas.Brush(isOnboardTarget ? Rgba(Theme::AccentCyan, 0.98f * panelAlpha)
-                                                               : Rgba(Theme::TextMuted, (0.55f + 0.35f * hovT) * panelAlpha)));
+                                                               : Rgba(Theme::TextMuted, ((i == firstEmptySlot ? 0.58f : 0.34f) + 0.45f * hovT) * panelAlpha)));
                 }
-                std::wstring emptyLbl = UiText(isOnboardTarget
-                    ? L"+ 添加我的第一条 Prompt"
-                    : (hovT > 0.35f ? L"+ 添加或从词舱选入" : L"+ 添加我的 Prompt"));
-                if (fmtSlotEmpty) {
+                bool showEmptyText = isOnboardTarget || (i == firstEmptySlot) || (hovT > 0.12f);
+                if (showEmptyText && fmtSlotEmpty) {
+                    std::wstring emptyLbl = UiText(isOnboardTarget
+                        ? L"+ 添加我的第一条 Prompt"
+                        : (hovT > 0.25f ? L"+ 添加或从词舱选入" : L"+ 添加 Prompt"));
+                    float lblAlpha = (isOnboardTarget || i == firstEmptySlot) ? 1.0f : std::clamp((hovT - 0.12f) / 0.55f, 0.0f, 1.0f);
+                    D2D1_COLOR_F txtCol = isOnboardTarget
+                        ? Rgba(Theme::AccentCyan, 0.98f * panelAlpha)
+                        : LerpColor(Rgba(Theme::TextMuted, 0.62f * panelAlpha * lblAlpha),
+                                    Rgba(Theme::TextSecondary, 0.95f * panelAlpha * lblAlpha), hovT);
                     rt->DrawTextW(emptyLbl.c_str(), (UINT32)emptyLbl.size(), fmtSlotEmpty.Get(),
                                   D2D1::RectF(idxBox.right + 8.0f, card.top, card.right - 10.0f, card.bottom),
-                                  canvas.Brush(isOnboardTarget
-                                               ? Rgba(Theme::AccentCyan, 0.98f * panelAlpha)
-                                               : LerpColor(Rgba(Theme::TextMuted, 0.68f * panelAlpha),
-                                                           Rgba(Theme::TextSecondary, 0.95f * panelAlpha), hovT)));
+                                  canvas.Brush(txtCol));
                 }
             }
         }
@@ -2007,11 +2169,12 @@ private:
                 D2D1_RECT_F sr = SceneBtnRectDip(p, cnt);
                 bool active = (s == actIdx);
                 bool hov = (s == hoverSceneBtn);
+                bool prs = (s == pressedSceneBtn);
                 uint32_t sceneTextHex = Theme::SceneTextAccent(s);
 
                 D2D1_COLOR_F fillCol = active
-                    ? Rgba(hov ? 0x26324B : 0x202A40, 0.96f * panelAlpha)
-                    : Rgba(hov ? 0x242A3B : 0x171B26, (hov ? 0.95f : 0.72f) * panelAlpha);
+                    ? Rgba(prs ? 0x1A2438 : (hov ? 0x26324B : 0x202A40), 0.96f * panelAlpha)
+                    : Rgba(prs ? 0x1D2333 : (hov ? 0x242A3B : 0x171B26), (hov || prs ? 0.95f : 0.72f) * panelAlpha);
                 D2D1_COLOR_F rimTop = active
                     ? Rgba(sceneTextHex, (hov ? 0.58f : 0.44f) * panelAlpha)
                     : Rgba(hov ? Theme::AccentBlue : 0xFFFFFF, (hov ? 0.32f : 0.06f) * panelAlpha);
@@ -2033,6 +2196,31 @@ private:
             }
         }
 
+        // --- In-place non-focus-stealing Dock Toast (read-only save failure / 5s clear-scene Undo!) ---
+        if (IsDockToastActive()) {
+            D2D1_RECT_F tr = DockToastRectDip();
+            uint32_t bgHex = dockToastIsError ? 0x3B1820 : (dockToastHasUndo ? 0x1A2438 : 0x162925);
+            uint32_t rimHex = dockToastIsError ? Theme::DangerRed : (dockToastHasUndo ? Theme::AccentCyan : Theme::CopyGreen);
+            rt->FillRoundedRectangle(D2D1::RoundedRect(tr, 7.0f, 7.0f), canvas.Brush(Rgba(bgHex, 0.98f * panelAlpha)));
+            DrawRim(rt, tr, 7.0f, Rgba(rimHex, 0.55f * panelAlpha), Rgba(0xFFFFFF, 0.06f * panelAlpha), 1.0f);
+            float txtRight = dockToastHasUndo ? (tr.right - 54.0f) : (tr.right - 8.0f);
+            if (fmtSlotTitle) {
+                rt->DrawTextW(dockToastText.c_str(), (UINT32)dockToastText.size(), fmtSlotTitle.Get(),
+                              D2D1::RectF(tr.left + 9.0f, tr.top, txtRight, tr.bottom),
+                              canvas.Brush(Rgba(dockToastIsError ? 0xFCA5A5 : Theme::TextPrimary, 0.98f * panelAlpha)));
+            }
+            if (dockToastHasUndo && fmtFooterBtnCompact) {
+                D2D1_RECT_F ur = DockToastUndoBtnRectDip();
+                uint32_t uBg = pressedDockUndoBtn ? 0x1C395E : (hoverDockUndoBtn ? 0x3366A8 : 0x264B7A);
+                rt->FillRoundedRectangle(D2D1::RoundedRect(ur, 5.0f, 5.0f), canvas.Brush(Rgba(uBg, 0.98f * panelAlpha)));
+                DrawRim(rt, ur, 5.0f, Rgba(Theme::AccentCyan, 0.45f * panelAlpha), Rgba(0xFFFFFF, 0.08f * panelAlpha), 1.0f);
+                std::wstring uTxt = L"\x64A4\x9500";
+                rt->DrawTextW(uTxt.c_str(), (UINT32)uTxt.size(), fmtFooterBtnCompact.Get(), ur,
+                              canvas.Brush(Rgba(Theme::AccentCyan, 0.98f * panelAlpha)));
+            }
+        }
+
+        if (state) lastRenderedSceneIdx = state->EffectiveActiveSceneIndex();
         rt->PopAxisAlignedClip();
 
         int prevX = curWinX, prevY = curWinY;
@@ -2066,6 +2254,13 @@ private:
         if (storage && storage->readOnlyRecoveryMode) return false;
         D2D1_RECT_F rb = HeaderRedockBtnRectDip();
         return dx >= rb.left && dx <= rb.right && dy >= rb.top && dy <= rb.bottom;
+    }
+
+    bool HitTestMenuBtnDip(float dx, float dy) const {
+        if (!state || isDragging) return false;
+        if (storage && storage->readOnlyRecoveryMode) return false;
+        D2D1_RECT_F mb = HeaderMenuBtnRectDip();
+        return dx >= mb.left && dx <= mb.right && dy >= mb.top && dy <= mb.bottom;
     }
 
     void HitTestExpandedDip(float dx, float dy, int& outSlot, bool& outHeader) const {
@@ -2172,7 +2367,9 @@ private:
             items.push_back(DarkMenuItem::Header(current ? L"\x4ECE\x8BCD\x8231\x5FEB\x901F\x66FF\x6362" : L"\x4ECE\x8BCD\x8231\x5FEB\x901F\x9009\x5165"));
             for (size_t k = 0; k < bench.size(); ++k) {
                 wchar_t hint[32]{};
-                wsprintfW(hint, L"%I64u \x6B21", (unsigned long long)bench[k]->useCount);
+                if (bench[k]->useCount > 0) {
+                    wsprintfW(hint, L"%I64u \x6B21", (unsigned long long)bench[k]->useCount);
+                }
                 items.push_back(DarkMenuItem::Action(1000 + (int)k, bench[k]->title, hint));
             }
         }
@@ -2180,10 +2377,14 @@ private:
 
         if (!emptySlotMode && current) {
             items.push_back(DarkMenuItem::Separator());
-            items.push_back(DarkMenuItem::Action(4, L"\x4E0A\x79FB\x4E00\x683C", L"", false, false, slotIdx == 0));
-            items.push_back(DarkMenuItem::Action(5, L"\x4E0B\x79FB\x4E00\x683C", L"", false, false, slotIdx == 9));
+            if (slotIdx > 0) items.push_back(DarkMenuItem::Action(4, L"\x4E0A\x79FB\x4E00\x683C"));
+            if (slotIdx < 9) items.push_back(DarkMenuItem::Action(5, L"\x4E0B\x79FB\x4E00\x683C"));
             items.push_back(DarkMenuItem::Separator());
-            items.push_back(DarkMenuItem::Action(6, L"\x79FB\x56DE\x8BCD\x8231\xFF08\x817E\x7A7A\x69FD\x4F4D\xFF09", L"", false, true));
+            items.push_back(DarkMenuItem::Action(
+                6,
+                ShowSceneBar()
+                    ? L"\x79FB\x51FA\x5F53\x524D\x573A\x666F\xFF08\x4FDD\x7559\x5728\x8BCD\x8231\xFF09"
+                    : L"\x79FB\x51FA\x69FD\x4F4D\xFF08\x4FDD\x7559\x5728\x8BCD\x8231\xFF09"));
         }
         items.push_back(DarkMenuItem::Separator());
         items.push_back(DarkMenuItem::Action(7, L"\x6253\x5F00\x8BBE\x7F6E..."));
@@ -2194,6 +2395,17 @@ private:
         std::wstring curId = current ? current->id : L"";
 
         popupMenu->ShowAt(screenPt, items, [this, slotIdx, curId, benchIds](int cmd) {
+            auto commitMut = [&](std::function<void(AppState&)> mut) {
+                AppState candidate = *state;
+                mut(candidate);
+                if (!storage->Save(candidate)) {
+                    ShowDockToast(L"保存失败：处于只读保护，请右键打开设置", true, 3200);
+                    return;
+                }
+                *state = std::move(candidate);
+                if (vaultWnd) vaultWnd->RefreshIfOpen();
+                RenderAndPresent();
+            };
             if (cmd == 1 && !curId.empty() && vaultWnd) {
                 vaultWnd->OpenEditPromptModal(curId);
             } else if (cmd == 2 && vaultWnd) {
@@ -2205,29 +2417,26 @@ private:
             } else if (cmd == 3 && vaultWnd) {
                 vaultWnd->Open(0, slotIdx);
             } else if (cmd == 4 && slotIdx > 0) {
-                auto& sl = state->ActiveSlots();
-                std::swap(sl[(size_t)slotIdx], sl[(size_t)(slotIdx - 1)]);
-                storage->Save(*state);
-                if (vaultWnd) vaultWnd->RefreshIfOpen();
-                RenderAndPresent();
+                commitMut([slotIdx](AppState& c) {
+                    auto& sl = c.ActiveSlots();
+                    std::swap(sl[(size_t)slotIdx], sl[(size_t)(slotIdx - 1)]);
+                });
             } else if (cmd == 5 && slotIdx < 9) {
-                auto& sl = state->ActiveSlots();
-                std::swap(sl[(size_t)slotIdx], sl[(size_t)(slotIdx + 1)]);
-                storage->Save(*state);
-                if (vaultWnd) vaultWnd->RefreshIfOpen();
-                RenderAndPresent();
+                commitMut([slotIdx](AppState& c) {
+                    auto& sl = c.ActiveSlots();
+                    std::swap(sl[(size_t)slotIdx], sl[(size_t)(slotIdx + 1)]);
+                });
             } else if (cmd == 6) {
-                state->ActiveSlots()[(size_t)slotIdx].clear();
-                storage->Save(*state);
-                if (vaultWnd) vaultWnd->RefreshIfOpen();
-                RenderAndPresent();
+                commitMut([slotIdx](AppState& c) {
+                    c.ActiveSlots()[(size_t)slotIdx].clear();
+                });
             } else if (cmd == 7 && vaultWnd) {
                 vaultWnd->Open(2, -1);
             } else if (cmd >= 1000 && (size_t)(cmd - 1000) < benchIds.size()) {
-                state->AssignToSlot(slotIdx, benchIds[(size_t)(cmd - 1000)]);
-                storage->Save(*state);
-                if (vaultWnd) vaultWnd->RefreshIfOpen();
-                RenderAndPresent();
+                std::wstring chosenId = benchIds[(size_t)(cmd - 1000)];
+                commitMut([slotIdx, &chosenId](AppState& c) {
+                    c.AssignToSlot(slotIdx, chosenId);
+                });
             }
         }, 250.0f, MenuOwner::Dock);
     }
@@ -2239,7 +2448,9 @@ private:
         items.push_back(DarkMenuItem::Header(L"\x573A\x666F \x00B7 " + state->scenes[(size_t)sceneIdx].name));
         items.push_back(DarkMenuItem::Action(6, L"\x914D\x7F6E\x6B64\x573A\x666F\x63D0\x793A\x8BCD..."));
         items.push_back(DarkMenuItem::Action(1, L"\x91CD\x547D\x540D\x6B64\x573A\x666F..."));
-        items.push_back(DarkMenuItem::Action(2, L"\x6E05\x7A7A\x6B64\x573A\x666F\x69FD\x4F4D\xFF08\x4FDD\x7559\x8BCD\x8231\xFF09", L"", false, true, mounted == 0));
+        if (mounted > 0) {
+            items.push_back(DarkMenuItem::Action(2, L"\x6E05\x7A7A\x6B64\x573A\x666F\x69FD\x4F4D\xFF08\x4FDD\x7559\x8BCD\x8231\xFF09", L"", false, true));
+        }
         items.push_back(DarkMenuItem::Separator());
         items.push_back(DarkMenuItem::Action(4, L"\x6253\x5F00\x8BCD\x8231\x7BA1\x7406..."));
         items.push_back(DarkMenuItem::Action(5, L"\x4F7F\x7528\x6392\x884C..."));
@@ -2252,7 +2463,11 @@ private:
             } else if (cmd == 1) {
                 vaultWnd->OpenRenameSceneModal(sceneIdx);
             } else if (cmd == 2) {
-                vaultWnd->ConfirmClearSceneSlots(sceneIdx);
+                std::wstring scName = (state && sceneIdx >= 0 && sceneIdx < kMaxScenes)
+                    ? state->scenes[(size_t)sceneIdx].name : L"";
+                if (vaultWnd->ConfirmClearSceneSlots(sceneIdx)) {
+                    ShowDockToast(L"已清空「" + scName + L"」槽位", false, 5000, true);
+                }
             } else if (cmd == 4) {
                 vaultWnd->Open(0, -1);
             } else if (cmd == 5) {
@@ -2313,7 +2528,7 @@ private:
         }
         ULONGLONG now = GetTickCount64();
         if (IsOnboardingActive() || isDragging || isSlotDragging || pressedSlot >= 0 || pressedEmptySlot >= 0 ||
-            pressedSceneBtn >= 0 || pressedRedockBtn || IsDockMenuOpen() || pendingAutoRetract) {
+            pressedSceneBtn >= 0 || pressedRedockBtn || pressedMenuBtn || pressedDockUndoBtn || IsDockMenuOpen() || pendingAutoRetract) {
             mouseOutsideSince = now;
             if (!leaveWatchRunning) EnsureLeaveWatchTimer();
             return;
@@ -2507,7 +2722,7 @@ private:
         if (!hwnd) return;
 
         // Recover from stuck background capture if LBUTTON was released outside our non-activating window
-        if ((isDragging || isSlotDragging || pressedSlot >= 0 || pressedEmptySlot >= 0 || pressedSceneBtn >= 0) &&
+        if ((isDragging || isSlotDragging || pressedSlot >= 0 || pressedEmptySlot >= 0 || pressedSceneBtn >= 0 || pressedRedockBtn || pressedMenuBtn || pressedDockUndoBtn) &&
             (GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
             DiagLogger::Instance().Log("WARN", "SELF_HEAL", L"Watchdog cleared stuck drag/capture state after LBUTTON release");
             CancelActiveInteractions();
@@ -2529,7 +2744,7 @@ private:
         // Expanded-state stall self-heal: if docked panel is expanded with no active blockers and cursor is outside past hold, retract!
         if (state->dockEdge != DockEdge::None && !IsCompactCollapsedMode() && expandSpring.target > 0.5f &&
             !IsOnboardingActive() && !IsDockMenuOpen() && !pendingAutoRetract &&
-            pressedSlot < 0 && pressedEmptySlot < 0 && pressedSceneBtn < 0 && !pressedRedockBtn) {
+            pressedSlot < 0 && pressedEmptySlot < 0 && pressedSceneBtn < 0 && !pressedRedockBtn && !pressedMenuBtn && !pressedDockUndoBtn) {
             ULONGLONG now = GetTickCount64();
             if (!IsCursorInsideInteractivePanel()) {
                 if (now >= holdOpenUntilTick) {
@@ -2751,6 +2966,23 @@ private:
             case WM_MOUSEACTIVATE:
                 return MA_NOACTIVATE; // Zero focus stealing iron law!
 
+            case WM_SETCURSOR: {
+                if (LOWORD(lp) == HTCLIENT) {
+                    if (self->isSlotDragging || (self->isDragging && self->dragMoved)) {
+                        SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+                    } else if (self->IsCompactCollapsedMode() ||
+                               self->hoverSlot >= 0 || self->hoverSceneBtn >= 0 ||
+                               self->hoverRedockBtn || self->hoverMenuBtn || self->hoverDockUndoBtn ||
+                               (self->storage && self->storage->readOnlyRecoveryMode)) {
+                        SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                    } else {
+                        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+                    }
+                    return TRUE;
+                }
+                break;
+            }
+
             case WM_APP_SYNC_DISPLAY: {
                 self->displaySyncQueued = false;
                 std::wstring reason = self->queuedSyncReason.empty() ? L"async-sync" : self->queuedSyncReason;
@@ -2913,7 +3145,7 @@ private:
                     if (self->state->dockEdge != DockEdge::None && !self->IsDockMenuOpen() &&
                         !self->isDragging && !self->isSlotDragging &&
                         self->pressedSlot < 0 && self->pressedEmptySlot < 0 &&
-                        self->pressedSceneBtn < 0) {
+                        self->pressedSceneBtn < 0 && !self->pressedRedockBtn && !self->pressedMenuBtn) {
                         self->hoverSlot = -1;
                         self->handleHovered = false;
                         self->StartSpringTo(0.0f);
@@ -2935,6 +3167,10 @@ private:
                 } else if (wp == kTimerQuickVerify) {
                     KillTimer(h, kTimerQuickVerify);
                     self->OnWatchdogTimer();
+                } else if (wp == kTimerDockToast) {
+                    self->ClearDockToast();
+                    self->RenderAndPresent("dock-toast-expire");
+                    self->EvaluateCollapseState("dock-toast-expire");
                 }
                 return 0;
             }
@@ -3063,10 +3299,25 @@ private:
                 self->HitTestExpandedDip(dx, dy, ns, nh);
                 int nsc = self->HitTestSceneBtnDip(dx, dy);
                 bool nRedock = self->HitTestRedockBtnDip(dx, dy);
-                if (ns != self->hoverSlot || nsc != self->hoverSceneBtn || nRedock != self->hoverRedockBtn) {
+                bool nMenu = self->HitTestMenuBtnDip(dx, dy);
+                bool nDockUndo = self->HitTestDockUndoBtnDip(dx, dy);
+
+                // If user actively moves to a DIFFERENT slot or scene button right after copying,
+                // cancel auto-retract so we never yank the panel away mid-decision!
+                if (self->pendingAutoRetract &&
+                    ((ns >= 0 && ns != self->copiedSlot) || nsc >= 0 || nMenu || nDockUndo)) {
+                    KillTimer(h, kTimerAutoRetract);
+                    self->pendingAutoRetract = false;
+                    ++self->retractGen;
+                }
+
+                if (ns != self->hoverSlot || nsc != self->hoverSceneBtn || nRedock != self->hoverRedockBtn ||
+                    nMenu != self->hoverMenuBtn || nDockUndo != self->hoverDockUndoBtn) {
                     self->hoverSlot = ns;
                     self->hoverSceneBtn = nsc;
                     self->hoverRedockBtn = nRedock;
+                    self->hoverMenuBtn = nMenu;
+                    self->hoverDockUndoBtn = nDockUndo;
                     self->SyncHoverBubble(false);
                     self->EnsureAnimTimer();
                     self->RenderAndPresent();
@@ -3081,10 +3332,12 @@ private:
                     KillTimer(h, kTimerHoverExpand);
                     if (self->IsCompactCollapsedMode()) self->RenderAndPresent();
                 }
-                if (self->hoverSlot != -1 || self->hoverSceneBtn != -1 || self->hoverRedockBtn) {
+                if (self->hoverSlot != -1 || self->hoverSceneBtn != -1 || self->hoverRedockBtn || self->hoverMenuBtn || self->hoverDockUndoBtn) {
                     self->hoverSlot = -1;
                     self->hoverSceneBtn = -1;
                     self->hoverRedockBtn = false;
+                    self->hoverMenuBtn = false;
+                    self->hoverDockUndoBtn = false;
                     self->SyncHoverBubble(false);
                     self->EnsureAnimTimer();
                     self->RenderAndPresent();
@@ -3096,11 +3349,14 @@ private:
             }
 
             case WM_LBUTTONDOWN: {
-                if (self->popupMenu && self->popupMenu->IsOpen()) self->popupMenu->Close();
+                bool menuWasOpen = (self->popupMenu && self->popupMenu->IsOpen());
+                POINT cur = MsgScreenPoint(h, lp);
+                if (menuWasOpen) self->popupMenu->Close(true, &cur);
                 self->pressedEmptySlot = -1;
                 self->pressedSceneBtn = -1;
                 self->pressedRedockBtn = false;
-                POINT cur = MsgScreenPoint(h, lp);
+                self->pressedMenuBtn = false;
+                self->pressedDockUndoBtn = false;
 
                 if (self->IsCompactCollapsedMode()) {
                     KillTimer(h, kTimerHoverExpand);
@@ -3124,15 +3380,36 @@ private:
 
                 float dx = (float)(short)LOWORD(lp) / self->dpiScale - self->CurrentSlideOffsetDip();
                 float dy = (float)(short)HIWORD(lp) / self->dpiScale;
+                if (self->HitTestDockUndoBtnDip(dx, dy)) {
+                    self->pressedDockUndoBtn = true;
+                    SetCapture(h);
+                    self->RenderAndPresent();
+                    return 0;
+                }
+                if (self->IsDockToastActive()) {
+                    D2D1_RECT_F tr = self->DockToastRectDip();
+                    if (dx >= tr.left && dx <= tr.right && dy >= tr.top && dy <= tr.bottom) return 0;
+                }
+                if (self->HitTestMenuBtnDip(dx, dy)) {
+                    if (menuWasOpen || (self->popupMenu && self->popupMenu->WasJustClosedByOutsideClickAt(MenuOwner::Dock, cur))) {
+                        return 0; // Toggle off cleanly instead of flashing open again
+                    }
+                    self->pressedMenuBtn = true;
+                    SetCapture(h);
+                    self->RenderAndPresent();
+                    return 0;
+                }
                 if (self->HitTestRedockBtnDip(dx, dy)) {
                     self->pressedRedockBtn = true;
                     SetCapture(h);
+                    self->RenderAndPresent();
                     return 0;
                 }
                 int hsc = self->HitTestSceneBtnDip(dx, dy);
                 if (hsc >= 0) {
                     self->pressedSceneBtn = hsc;
                     SetCapture(h);
+                    self->RenderAndPresent();
                     return 0;
                 }
                 int hs = -1;
@@ -3168,9 +3445,14 @@ private:
                         self->slotDragGrabOffsetDipY = dy - sr.top;
                         self->slotDragCurDipY = sr.top;
                         SetCapture(h);
+                        self->RenderAndPresent();
                     } else {
+                        if (menuWasOpen || (self->popupMenu && self->popupMenu->WasJustClosedByOutsideClickAt(MenuOwner::Dock, cur, 22))) {
+                            return 0;
+                        }
                         self->pressedEmptySlot = hs;
                         SetCapture(h);
+                        self->RenderAndPresent();
                     }
                 }
                 return 0;
@@ -3297,21 +3579,50 @@ private:
                     return 0;
                 }
 
-                // Press-release ownership for redock button, scene buttons & empty slots
+                // Press-release ownership for menu button, redock button, scene buttons & empty slots
+                bool downDockUndo = self->pressedDockUndoBtn;
+                bool downMenu = self->pressedMenuBtn;
                 bool downRedock = self->pressedRedockBtn;
                 int downScene = self->pressedSceneBtn;
                 int downEmpty = self->pressedEmptySlot;
+                self->pressedDockUndoBtn = false;
+                self->pressedMenuBtn = false;
                 self->pressedRedockBtn = false;
                 self->pressedSceneBtn = -1;
                 self->pressedEmptySlot = -1;
                 if (GetCapture() == h) ReleaseCapture();
 
-                if (!downRedock && downScene < 0 && downEmpty < 0) {
+                if (!downDockUndo && !downMenu && !downRedock && downScene < 0 && downEmpty < 0) {
                     return 0;
                 }
 
                 float dx = (float)(short)LOWORD(lp) / self->dpiScale - self->CurrentSlideOffsetDip();
                 float dy = (float)(short)HIWORD(lp) / self->dpiScale;
+                if (downDockUndo) {
+                    if (self->HitTestDockUndoBtnDip(dx, dy) && self->vaultWnd) {
+                        bool restored = self->vaultWnd->UndoLastDelete();
+                        self->ClearDockToast();
+                        const wchar_t* msg = restored
+                            ? L"已恢复该场景原有槽位"
+                            : ((self->storage && self->storage->readOnlyRecoveryMode) ? L"撤销失败：处于只读保护" : L"场景已改动，未覆盖现有槽位");
+                        self->ShowDockToast(msg, !restored && self->storage && self->storage->readOnlyRecoveryMode, 2200, false);
+                    } else {
+                        self->RenderAndPresent();
+                    }
+                    return 0;
+                }
+                if (downMenu) {
+                    self->RenderAndPresent();
+                    if (self->HitTestMenuBtnDip(dx, dy) && self->onRequestAppMenu) {
+                        D2D1_RECT_F mb = self->HeaderMenuBtnRectDip();
+                        POINT menuPt{
+                            self->curWinX + (int)std::round(mb.right * self->dpiScale),
+                            self->curWinY + (int)std::round((mb.bottom + 4.0f) * self->dpiScale)
+                        };
+                        self->onRequestAppMenu(menuPt);
+                    }
+                    return 0;
+                }
                 if (downRedock && self->HitTestRedockBtnDip(dx, dy)) {
                     RECT mon{};
                     RECT work = self->GetTargetMonitorWorkArea(&mon);
@@ -3331,6 +3642,8 @@ private:
                 if (downScene >= 0) {
                     if (self->HitTestSceneBtnDip(dx, dy) == downScene) {
                         self->SwitchActiveScene(downScene);
+                    } else {
+                        self->RenderAndPresent();
                     }
                     return 0;
                 }
@@ -3343,16 +3656,22 @@ private:
                     self->state->FindById(self->state->ActiveSlots()[(size_t)hs]) == nullptr) {
                     KillTimer(h, kTimerBubbleHover);
                     self->hoverBubble.HideImmediate();
+                    self->RenderAndPresent();
                     if (self->onboardingWnd.step == OnboardingStep::Step2Create && !self->onboardingWnd.step2Done) {
                         self->TriggerOnboardingCreatePrompt(hs);
                     } else {
                         self->ShowSlotMenu(hs, cur, true);
                     }
+                } else {
+                    self->RenderAndPresent();
                 }
                 return 0;
             }
 
             case WM_CAPTURECHANGED: {
+                bool hadPressed = self->pressedDockUndoBtn || self->pressedMenuBtn || self->pressedRedockBtn || self->pressedSceneBtn >= 0 || self->pressedEmptySlot >= 0;
+                self->pressedDockUndoBtn = false;
+                self->pressedMenuBtn = false;
                 self->pressedRedockBtn = false;
                 self->pressedSceneBtn = -1;
                 self->pressedEmptySlot = -1;
@@ -3366,7 +3685,10 @@ private:
                     self->EvaluateCollapseState("slot-drag-capture-lost");
                 } else if (self->pressedSlot >= 0) {
                     self->pressedSlot = -1;
+                    self->RenderAndPresent();
                     self->EvaluateCollapseState("slot-press-capture-lost");
+                } else if (hadPressed) {
+                    self->RenderAndPresent();
                 }
                 if (self->isDragging) {
                     // Transactional rollback: NEVER commit floating mode on interrupted capture!

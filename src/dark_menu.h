@@ -97,6 +97,32 @@ namespace AutoStart {
         return s;
     }
 
+    inline std::wstring ExpandEnvPath(const std::wstring& path) {
+        if (path.find(L'%') == std::wstring::npos) return path;
+        DWORD needed = ExpandEnvironmentStringsW(path.c_str(), nullptr, 0);
+        if (needed == 0 || needed > 32768) return path;
+        std::wstring out((size_t)needed, L'\0');
+        DWORD wrote = ExpandEnvironmentStringsW(path.c_str(), out.data(), needed);
+        if (wrote == 0 || wrote > needed) return path;
+        out.resize((size_t)(wrote - 1));
+        return out;
+    }
+
+    inline bool IsRegisteredTargetDefinitivelyMissing(const std::wstring& exePath) {
+        if (exePath.empty()) return false;
+        std::wstring expanded = ExpandEnvPath(exePath);
+        DWORD attr = GetFileAttributesW(expanded.c_str());
+        if (attr != INVALID_FILE_ATTRIBUTES) return false;
+        if (GetLastError() != ERROR_FILE_NOT_FOUND) return false;
+        // Parent directory must be online & accessible so offline drives / permission errors never trigger auto-rebind
+        size_t sep = expanded.find_last_of(L"\\/");
+        if (sep == std::wstring::npos || sep == 0) return false;
+        std::wstring parent = expanded.substr(0, sep);
+        if (parent.size() == 2 && parent[1] == L':') parent.push_back(L'\\');
+        DWORD pAttr = GetFileAttributesW(parent.c_str());
+        return (pAttr != INVALID_FILE_ATTRIBUTES) && ((pAttr & FILE_ATTRIBUTE_DIRECTORY) != 0);
+    }
+
     enum class Status : int {
         Disabled = 0,
         EnabledCurrent = 1,
@@ -118,6 +144,7 @@ namespace AutoStart {
             return Status::Disabled;
         }
         std::wstring regVal(buf);
+        if (type == REG_EXPAND_SZ) regVal = ExpandEnvPath(regVal);
         std::wstring regExe;
         if (!regVal.empty() && regVal[0] == L'"') {
             size_t endQ = regVal.find(L'"', 1);
@@ -126,6 +153,7 @@ namespace AutoStart {
             size_t sp = regVal.find(L' ');
             regExe = (sp != std::wstring::npos) ? regVal.substr(0, sp) : regVal;
         }
+        regExe = ExpandEnvPath(regExe);
         if (outRegExe) *outRegExe = regExe;
         if (regExe.empty()) return Status::Disabled;
         std::wstring curExe = CurrentExePath();
@@ -218,7 +246,12 @@ public:
     int hoverIndex = -1;
     int pressedIndex = -1;
     bool visible = false;
+    bool kbNavActive = false;
     MenuOwner owner = MenuOwner::None;
+    ULONGLONG lastCloseTick = 0;
+    MenuOwner lastCloseOwner = MenuOwner::None;
+    bool closedByOutsideClick = false;
+    POINT lastOutsideClickPt{ -99999, -99999 };
     HWND openForegroundHwnd = nullptr;
     ULONGLONG openTick = 0;
     bool openFgWasTrayOverflow = false;
@@ -277,11 +310,45 @@ public:
     bool IsOpenFor(MenuOwner targetOwner) const { return visible && owner == targetOwner; }
     MenuOwner CurrentOwner() const { return visible ? owner : MenuOwner::None; }
 
-    void Close() {
+    bool HandleForwardedKey(WPARAM vk) {
+        if (!visible) return false;
+        if (vk == VK_DOWN) { MoveSelection(1); return true; }
+        if (vk == VK_UP) { MoveSelection(-1); return true; }
+        if (vk == VK_RETURN) {
+            if (kbNavActive) ConfirmSelection();
+            return true;
+        }
+        if (vk == VK_ESCAPE) { Close(); return true; }
+        return false;
+    }
+
+    bool WasJustClosedByOutsideClick(MenuOwner targetOwner, ULONGLONG windowMs = 240) const {
+        if (!closedByOutsideClick || lastCloseOwner != targetOwner || lastCloseTick == 0) return false;
+        ULONGLONG now = GetTickCount64();
+        return now >= lastCloseTick && (now - lastCloseTick) <= windowMs;
+    }
+
+    bool WasJustClosedByOutsideClickAt(MenuOwner targetOwner, POINT screenPt, int maxDistPx = 42, ULONGLONG windowMs = 240) const {
+        if (!WasJustClosedByOutsideClick(targetOwner, windowMs)) return false;
+        if (lastOutsideClickPt.x <= -90000) return true; // No spatial info available (synthetic close)
+        return std::abs(screenPt.x - lastOutsideClickPt.x) <= maxDistPx &&
+               std::abs(screenPt.y - lastOutsideClickPt.y) <= maxDistPx;
+    }
+
+    void Close(bool byOutsideClick = false, const POINT* outsidePt = nullptr) {
         if (!visible) return;
         MenuOwner closedOwner = owner;
         visible = false;
+        kbNavActive = false;
         owner = MenuOwner::None;
+        lastCloseOwner = closedOwner;
+        lastCloseTick = GetTickCount64();
+        closedByOutsideClick = byOutsideClick;
+        if (byOutsideClick && outsidePt) {
+            lastOutsideClickPt = *outsidePt;
+        } else {
+            lastOutsideClickPt = POINT{ -99999, -99999 };
+        }
         openForegroundHwnd = nullptr;
         hoverIndex = -1;
         pressedIndex = -1;
@@ -330,6 +397,8 @@ public:
         winY = yPos;
         hoverIndex = -1;
         pressedIndex = -1;
+        kbNavActive = false;
+        closedByOutsideClick = false;
         prevLDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
         prevRDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
         prevUpDown = (GetAsyncKeyState(VK_UP) & 0x8000) != 0;
@@ -435,11 +504,15 @@ private:
             }
 
             bool hov = ((int)i == hoverIndex) && !it.disabled;
+            bool act = hov && ((int)i == pressedIndex);
             if (hov) {
-                D2D1_COLOR_F hc = it.danger ? Rgba(Theme::DangerRed, 0.18f) : Rgba(Theme::AccentBlue, 0.18f);
+                D2D1_COLOR_F hc = it.danger
+                    ? Rgba(Theme::DangerRed, act ? 0.28f : 0.18f)
+                    : Rgba(Theme::AccentBlue, act ? 0.28f : 0.18f);
                 rt->FillRoundedRectangle(D2D1::RoundedRect(r, 6.0f, 6.0f), canvas.Brush(hc));
                 DrawTopLitBorder(rt, r, 6.0f,
-                                 it.danger ? Rgba(Theme::DangerRed, 0.35f) : Rgba(Theme::AccentBlue, 0.35f),
+                                 it.danger ? Rgba(Theme::DangerRed, act ? 0.48f : 0.35f)
+                                           : Rgba(Theme::AccentBlue, act ? 0.48f : 0.35f),
                                  Rgba(0xFFFFFF, 0.05f), 1.0f);
             }
 
@@ -492,6 +565,7 @@ private:
                 cand = (start + dir * step % n + n) % n;
             }
             if (IsSelectableItem((size_t)cand)) {
+                kbNavActive = true;
                 if (cand != hoverIndex) {
                     hoverIndex = cand;
                     Render();
@@ -499,6 +573,24 @@ private:
                 return;
             }
         }
+    }
+
+    bool IsKeyboardPollAllowed(HWND curFg) const {
+        // VaultWindow synchronously forwards Up/Down/Enter/Esc directly to popupMenu so SearchEdit & menu NEVER double-fire!
+        if (owner == MenuOwner::Vault) return false;
+        if (!curFg) return false;
+        DWORD fgPid = 0;
+        GetWindowThreadProcessId(curFg, &fgPid);
+        if (fgPid == GetCurrentProcessId()) return true;
+        wchar_t cls[64]{};
+        if (GetClassNameW(curFg, cls, _countof(cls)) > 0) {
+            if (wcscmp(cls, L"Shell_TrayWnd") == 0 ||
+                wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0 ||
+                wcscmp(cls, L"NotifyIconOverflowWindow") == 0) {
+                return true;
+            }
+        }
+        return false;
     }
 
     void ConfirmSelection() {
@@ -512,12 +604,14 @@ private:
 
     void OnPollTimer() {
         if (!visible) return;
-        bool escDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
-        if (escDown && !prevEscDown) {
-            Close();
-            return;
+        if (owner != MenuOwner::Vault) {
+            bool escDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+            if (escDown && !prevEscDown) {
+                Close();
+                return;
+            }
+            prevEscDown = escDown;
         }
-        prevEscDown = escDown;
 
         // Detect foreground window switches (Alt+Tab, Win key, or elevated UIPI windows where GetAsyncKeyState returns 0)
         HWND curFg = foregroundProvider ? foregroundProvider() : GetForegroundWindow();
@@ -532,24 +626,26 @@ private:
             }
         }
 
-        // Keyboard navigation (Up / Down / Enter) without stealing focus
+        // Keyboard navigation (Up / Down / Enter) ONLY when foreground belongs to us/taskbar and Enter ONLY after explicit kbNav!
         bool upDown = (GetAsyncKeyState(VK_UP) & 0x8000) != 0;
         bool downDown = (GetAsyncKeyState(VK_DOWN) & 0x8000) != 0;
         bool enterDown = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
-        if (downDown && !prevDownDown) {
-            prevDownDown = true;
-            MoveSelection(1);
-            return;
-        }
-        if (upDown && !prevUpDown) {
-            prevUpDown = true;
-            MoveSelection(-1);
-            return;
-        }
-        if (enterDown && !prevEnterDown) {
-            prevEnterDown = true;
-            ConfirmSelection();
-            return;
+        if (IsKeyboardPollAllowed(curFg)) {
+            if (downDown && !prevDownDown) {
+                prevDownDown = true;
+                MoveSelection(1);
+                return;
+            }
+            if (upDown && !prevUpDown) {
+                prevUpDown = true;
+                MoveSelection(-1);
+                return;
+            }
+            if (enterDown && !prevEnterDown && kbNavActive) {
+                prevEnterDown = true;
+                ConfirmSelection();
+                return;
+            }
         }
         prevUpDown = upDown;
         prevDownDown = downDown;
@@ -569,6 +665,7 @@ private:
             lastPollCursor = pt;
             int newHover = insideBox ? HitTestDip(dx, dy) : -1;
             if (newHover != hoverIndex) {
+                kbNavActive = false;
                 hoverIndex = newHover;
                 Render();
             }
@@ -579,7 +676,7 @@ private:
 
         if ((lDown && !prevLDown) || (rDown && !prevRDown)) {
             if (!insideBox) {
-                Close();
+                Close(true, &pt);
                 return;
             }
         }
@@ -604,11 +701,18 @@ private:
             case WM_TIMER:
                 if (wp == kTimerPoll) self->OnPollTimer();
                 return 0;
+            case WM_SETCURSOR:
+                if (LOWORD(lp) == HTCLIENT) {
+                    SetCursor(LoadCursorW(nullptr, self->hoverIndex >= 0 ? IDC_HAND : IDC_ARROW));
+                    return TRUE;
+                }
+                break;
             case WM_MOUSEMOVE: {
                 float dx = (float)(short)LOWORD(lp) / self->dpiScale;
                 float dy = (float)(short)HIWORD(lp) / self->dpiScale;
                 int nh = self->HitTestDip(dx, dy);
                 if (nh != self->hoverIndex) {
+                    self->kbNavActive = false;
                     self->hoverIndex = nh;
                     self->Render();
                 }
@@ -627,6 +731,7 @@ private:
                 float dx = (float)(short)LOWORD(lp) / self->dpiScale;
                 float dy = (float)(short)HIWORD(lp) / self->dpiScale;
                 self->pressedIndex = self->HitTestDip(dx, dy);
+                if (self->pressedIndex >= 0) self->Render();
                 return 0;
             }
             case WM_LBUTTONUP: {
@@ -640,6 +745,8 @@ private:
                     auto cb = self->onSelect;
                     self->Close();
                     if (cb) cb(chosenId);
+                } else if (downIdx >= 0) {
+                    self->Render();
                 }
                 return 0;
             }

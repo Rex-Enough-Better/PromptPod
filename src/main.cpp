@@ -126,6 +126,17 @@ public:
             return false;
         }
 
+        if (!silentAutostart && customDataDir.empty()) {
+            // Silently auto-repair autostart path ONLY when parent dir is online and target exe is definitively missing
+            std::wstring oldAutoExe;
+            if (AutoStart::GetStatus(APP_RUN_REG_VALUE_W, &oldAutoExe) == AutoStart::Status::StaleOtherPath &&
+                AutoStart::IsRegisteredTargetDefinitivelyMissing(oldAutoExe)) {
+                if (AutoStart::SetEnabled(true)) {
+                    DiagLogger::Instance().Log("INFO", "AUTOSTART", L"Auto-repaired stale autostart entry after exe relocation");
+                }
+            }
+        }
+
         InstallTrayIcon();
 
         if (!silentAutostart) {
@@ -301,15 +312,29 @@ private:
 
     void ShowAppTrayMenu(POINT pt, MenuOwner menuOwner = MenuOwner::Tray) {
         bool bubbleOn = state.showHoverBubble;
-        bool dockExpanded = (state.dockEdge != DockEdge::None && dockWnd.IsExpandedOrExpanding());
+        bool isFloating = (state.dockEdge == DockEdge::None);
+        bool dockExpanded = (!isFloating && dockWnd.IsExpandedOrExpanding());
         auto upSnap = updater.GetSnapshot();
-        std::wstring updateLabel = (upSnap.phase == UpdatePhase::Available && !upSnap.latestVersion.empty())
-            ? (L"发现新版本 v" + upSnap.latestVersion + L"...")
-            : L"检查更新...";
+        std::wstring updateLabel = L"检查更新...";
+        std::wstring updateHint;
+        if (upSnap.phase == UpdatePhase::Available && !upSnap.latestVersion.empty()) {
+            updateLabel = L"发现新版本 v" + upSnap.latestVersion + L"...";
+            updateHint = L"新";
+        } else if (upSnap.phase == UpdatePhase::Checking) {
+            updateLabel = L"正在检查更新...";
+        } else if (upSnap.phase == UpdatePhase::Downloading) {
+            updateLabel = L"正在下载新版本...";
+        } else if (upSnap.phase == UpdatePhase::Installing) {
+            updateLabel = L"正在安装更新...";
+        }
 
         std::vector<DarkMenuItem> items;
         items.push_back(DarkMenuItem::Header(L"\x8BCD\x8231 PromptPod v" APP_VERSION_W));
-        items.push_back(DarkMenuItem::Action(1, dockExpanded ? L"\x6536\x8D77\x8D34\x8FB9\x9762\x677F" : L"\x5C55\x5F00\x8D34\x8FB9\x9762\x677F"));
+        if (!isFloating) {
+            items.push_back(DarkMenuItem::Action(1, dockExpanded ? L"\x6536\x8D77\x8D34\x8FB9\x9762\x677F" : L"\x5C55\x5F00\x8D34\x8FB9\x9762\x677F"));
+        } else if (menuOwner == MenuOwner::Tray) {
+            items.push_back(DarkMenuItem::Action(1, L"\x7F6E\x9876\x663E\x793A\x9762\x677F"));
+        }
         items.push_back(DarkMenuItem::Action(2, L"\x6253\x5F00\x8BCD\x8231\x7BA1\x7406..."));
         items.push_back(DarkMenuItem::Action(3, L"\x4F7F\x7528\x6392\x884C..."));
         items.push_back(DarkMenuItem::Action(6, L"\x6253\x5F00\x8BBE\x7F6E..."));
@@ -317,13 +342,15 @@ private:
         items.push_back(DarkMenuItem::Action(7, L"\x60AC\x505C\x9884\x89C8\x6B63\x6587", L"", bubbleOn));
         items.push_back(DarkMenuItem::Action(5, L"\x9762\x677F\x5F52\x4F4D"));
         items.push_back(DarkMenuItem::Separator());
-        items.push_back(DarkMenuItem::Action(10, updateLabel, upSnap.phase == UpdatePhase::Available ? L"新" : L""));
+        items.push_back(DarkMenuItem::Action(10, updateLabel, updateHint));
+        items.push_back(DarkMenuItem::Separator());
         items.push_back(DarkMenuItem::Action(9, L"\x9000\x51FA\x8BCD\x8231 PromptPod", L"", false, true));
 
-        popupMenu.ShowAt(pt, items, [this, dockExpanded](int cmd) {
+        popupMenu.ShowAt(pt, items, [this, isFloating, dockExpanded](int cmd) {
             switch (cmd) {
                 case 1:
-                    if (dockExpanded) dockWnd.CollapseNow();
+                    if (isFloating) dockWnd.ExpandAndReveal(0);
+                    else if (dockExpanded) dockWnd.CollapseNow();
                     else dockWnd.ExpandAndReveal(2600);
                     break;
                 case 2:
@@ -348,7 +375,7 @@ private:
                     vaultWnd.RefreshIfOpen();
                     break;
                 case 10: {
-                    vaultWnd.Open(2, -1);
+                    vaultWnd.OpenSettingsAtUpdate();
                     auto s = updater.GetSnapshot();
                     if (s.phase != UpdatePhase::Available && !updater.IsBusy()) {
                         updater.StartCheck(false);
@@ -1684,6 +1711,140 @@ inline int RunHeadlessSelfTest(const std::wstring& testRootDir) {
         CoUninitialize();
         DiagLogger::Instance().Init(sm.dataDir);
         if (v8Err != 0) return v8Err;
+    }
+
+    // 11. Verify v0.11.0 UX polish regressions (auto-title, feedback diag truncation, onboarding bubble guard & dynamic slots,
+    //     post-copy slot-move auto-retract cancel, menu outside-close toggle & external-fg guard, toast/undo isolation & clear-scene undo)
+    {
+        // 11a. DeriveAutoPromptTitle strips leading Markdown punctuation and extracts clean short first line
+        if (DeriveAutoPromptTitle(L"  ### 深度代码审查清单\n第二行正文") != L"深度代码审查清单") return 200;
+        if (DeriveAutoPromptTitle(L"   \n\t  ") != L"未命名 Prompt") return 201;
+
+        // 11b. BuildGitHubIssueUrl reports outBodyTruncated & outDiagTruncated accurately + IsRegisteredTargetDefinitivelyMissing check
+        bool bodyTr = false, diagTr = false;
+        BuildGitHubIssueUrl(true, L"Bug", L"Steps", L"Win11", L"short diag", &bodyTr, &diagTr);
+        if (bodyTr || diagTr) return 202;
+        std::wstring hugeDiag(2200, L'D');
+        BuildGitHubIssueUrl(true, L"Bug", L"Steps", L"Win11", hugeDiag, &bodyTr, &diagTr);
+        if (bodyTr || !diagTr) return 203;
+        if (!AutoStart::IsRegisteredTargetDefinitivelyMissing(testDir + L"\\definitely_missing_promptpod.exe")) return 215;
+        if (AutoStart::IsRegisteredTargetDefinitivelyMissing(testDir + L"\\no_such_parent_dir\\PromptPod.exe")) return 216;
+
+        // 11c. VaultWindow toast decouples visual undo button from Ctrl+Z lifetime, clear-scene undo protects against overwrite,
+        //      and Settings tab hides assign banner height
+        {
+            StorageManager uxSm;
+            uxSm.Init(testDir + L"\\ux_v11_case");
+            AppState uxSt{};
+            if (!uxSm.LoadOrSeed(uxSt)) return 204;
+            VaultWindow vw11;
+            vw11.state = &uxSt;
+            vw11.storage = &uxSm;
+            if (!vw11.DeletePromptWithUndo(L"seed_01") || !vw11.undoDelete.active || !vw11.toastShowsUndo) return 205;
+            vw11.ShowToast(L"其他提示", false);
+            if (vw11.toastShowsUndo || !vw11.undoDelete.active) return 206; // Visual undo hides on unrelated toast while Ctrl+Z stays alive!
+
+            // Clear-scene undo restores full slot layout cleanly when scene is still empty
+            uxSt.scenes[0].slots[0] = L"seed_02";
+            uxSt.scenes[0].slots[1] = L"seed_03";
+            uxSm.Save(uxSt);
+            vw11.undoDelete = VaultWindow::UndoDeleteEntry{};
+            vw11.undoDelete.active = true;
+            vw11.undoDelete.isClearScene = true;
+            vw11.undoDelete.clearedSceneIdx = 0;
+            vw11.undoDelete.clearedSceneSlots = uxSt.scenes[0].slots;
+            vw11.undoDelete.expireTick = GetTickCount64() + 5000;
+            uxSt.ClearSceneSlots(0);
+            if (!vw11.UndoLastDelete() || uxSt.scenes[0].slots[0] != L"seed_02" || uxSt.scenes[0].slots[1] != L"seed_03") return 207;
+
+            // Clear-scene undo refuses to clobber if user mounted a new prompt into that scene after clearing
+            vw11.undoDelete.active = true;
+            vw11.undoDelete.isClearScene = true;
+            vw11.undoDelete.clearedSceneIdx = 0;
+            vw11.undoDelete.expireTick = GetTickCount64() + 5000;
+            uxSt.ClearSceneSlots(0);
+            uxSt.AssignToSlot(4, L"seed_04");
+            if (vw11.UndoLastDelete() || uxSt.scenes[0].slots[4] != L"seed_04") return 217;
+
+            // Settings tab (2) must NOT reserve assignTargetSlot banner height
+            vw11.assignTargetSlot = 2;
+            vw11.activeTab = 0;
+            float topTab0 = vw11.ComputeContentTopDip();
+            vw11.activeTab = 2;
+            float topTab2 = vw11.ComputeContentTopDip();
+            if (std::fabs((topTab0 - topTab2) - 40.0f) > 0.5f) return 208;
+            DiagLogger::Instance().Init(sm.dataDir);
+        }
+
+        // 11d. DockWindow onboarding suppresses hover bubble, resolves dynamic slots on empty/full deck,
+        //      cancels pendingAutoRetract on moving to another slot, and DarkPopupMenu records outside-close toggle
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        int uxErr = 0;
+        {
+            DarkPopupMenu menu11;
+            DockWindow dock11;
+            AppState st11{};
+            StorageManager::SeedDefaults(st11, true); // Full 10 slots in Scene 0!
+            if (!menu11.Init(GetModuleHandleW(nullptr)) ||
+                !dock11.Init(GetModuleHandleW(nullptr), &st11, &sm, &menu11, nullptr, nullptr, false)) {
+                uxErr = 209;
+            } else {
+                // Full 10-slot replay: step1Slot=0, targetSlot=-1 (no fake empty slot highlight!), and hover bubble suppressed!
+                dock11.StartOnboarding(true);
+                if (dock11.onboardingWnd.step1Slot != 0 || dock11.onboardingWnd.targetSlot != -1) uxErr = 210;
+                if (uxErr == 0) {
+                    dock11.hoverSlot = 0;
+                    dock11.SyncHoverBubble(true);
+                    if (dock11.hoverBubble.IsShowingOrAppearing()) uxErr = 211;
+                }
+                dock11.FinishOnboarding(false);
+
+                // Moving cursor to a different slot during pendingAutoRetract cancels auto-retract
+                if (uxErr == 0) {
+                    dock11.clipboardWriter = [](const std::wstring&) { return true; };
+                    dock11.expandSpring.Snap(1.0f);
+                    dock11.RenderAndPresent("selftest-v11-retract");
+                    dock11.TriggerSlotCopy(0);
+                    if (!dock11.pendingAutoRetract) uxErr = 212;
+                    D2D1_RECT_F s1r = dock11.SlotRectDip(1);
+                    LPARAM lpS1 = MAKELPARAM((short)std::round(((s1r.left + s1r.right) * 0.5f) * dock11.dpiScale),
+                                             (short)std::round(((s1r.top + s1r.bottom) * 0.5f) * dock11.dpiScale));
+                    SendMessageW(dock11.hwnd, WM_MOUSEMOVE, 0, lpS1);
+                    if (dock11.pendingAutoRetract) uxErr = 213;
+                }
+
+                // External scene change via Refresh() clears transient copiedSlot / slotScrollDip cleanly
+                if (uxErr == 0) {
+                    dock11.copiedSlot = 0;
+                    dock11.slotScrollDip = 24.0f;
+                    dock11.lastRenderedSceneIdx = 0;
+                    st11.SetSceneEnabled(1, true);
+                    st11.activeSceneIndex = 1;
+                    dock11.Refresh();
+                    if (dock11.copiedSlot != -1 || dock11.slotScrollDip > 0.1f) uxErr = 218;
+                }
+
+                // DarkPopupMenu outside-click close matches exact trigger region spatially
+                if (uxErr == 0) {
+                    std::vector<DarkMenuItem> mi = { DarkMenuItem::Action(1, L"项") };
+                    POINT trigPt{ 400, 400 };
+                    POINT farPt{ 650, 650 };
+                    menu11.ShowAt(trigPt, mi, nullptr, 180.0f, MenuOwner::Vault);
+                    menu11.Close(true, &trigPt);
+                    if (!menu11.WasJustClosedByOutsideClickAt(MenuOwner::Vault, trigPt) ||
+                        menu11.WasJustClosedByOutsideClickAt(MenuOwner::Vault, farPt) ||
+                        menu11.WasJustClosedByOutsideClickAt(MenuOwner::Dock, trigPt)) {
+                        uxErr = 214;
+                    }
+                }
+
+                if (dock11.hoverBubble.hwnd) DestroyWindow(dock11.hoverBubble.hwnd);
+                if (dock11.hwnd) DestroyWindow(dock11.hwnd);
+                if (menu11.hwnd) DestroyWindow(menu11.hwnd);
+            }
+        }
+        CoUninitialize();
+        if (uxErr != 0) return uxErr;
     }
 
     return 0;
