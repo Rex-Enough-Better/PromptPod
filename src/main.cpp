@@ -509,6 +509,15 @@ inline int RunHeadlessSelfTest(const std::wstring& testRootDir) {
     wsprintfW(runSub, L"\\run_%lu_%llu", (unsigned long)GetCurrentProcessId(), (unsigned long long)GetTickCount64());
     std::wstring testDir = testRootDir + runSub;
 
+    static auto stubClipOk   = [](const std::wstring&) { return true; };
+    static auto stubClipFail = [](const std::wstring&) { return false; };
+    auto makeFixedMon = [](RECT mon, RECT work) {
+        return [mon, work](POINT, RECT* outMon) -> RECT {
+            if (outMon) *outMon = mon;
+            return work;
+        };
+    };
+
     // 1. Verify deterministic Chinese typography normalizer (including new brand name)
     if (UiText(L"\u8BCD\u8231PromptPod v0.6.0") != L"\u8BCD\u8231 PromptPod v0.6.0") return 10;
     if (UiText(L"\u5DF2\u590D\u523618\u6B21") != L"\u5DF2\u590D\u5236 18 \u6B21") return 11;
@@ -1104,10 +1113,7 @@ inline int RunHeadlessSelfTest(const std::wstring& testRootDir) {
             } else {
                 RECT simMon{ 0, 0, 1920, 1080 };
                 RECT simWork{ 0, 0, 1920, 1040 };
-                dock2.monitorProvider = [&](POINT, RECT* outMon) -> RECT {
-                    if (outMon) *outMon = simMon;
-                    return simWork;
-                };
+                dock2.monitorProvider = makeFixedMon(simMon, simWork);
                 POINT simCursor{ 200, 200 }; // Far outside right-docked panel
                 BOOL simCursorOk = TRUE;
                 dock2.cursorPosProvider = [&](POINT* outPt) -> BOOL {
@@ -1180,7 +1186,7 @@ inline int RunHeadlessSelfTest(const std::wstring& testRootDir) {
 
                 // (4) Stale kTimerAutoRetract generation invalidated by ExpandAndReveal(0)
                 if (smErr == 0) {
-                    dock2.clipboardWriter = [](const std::wstring&) { return true; };
+                    dock2.clipboardWriter = stubClipOk;
                     dock2.ExpandAndReveal(0);
                     dock2.expandSpring.Snap(1.0f);
                     dock2.RenderAndPresent("selftest-v062-gen");
@@ -1404,7 +1410,7 @@ inline int RunHeadlessSelfTest(const std::wstring& testRootDir) {
 
                 // 9f. Onboarding keeps panel open during Step 1 copy, advances step1Done, and finishes with capsule glow
                 if (v7Err == 0) {
-                    dock7.clipboardWriter = [](const std::wstring&) { return true; };
+                    dock7.clipboardWriter = stubClipOk;
                     POINT farOut{ 100, 100 };
                     dock7.cursorPosProvider = [&](POINT* outPt) -> BOOL { if (outPt) *outPt = farOut; return TRUE; };
                     dock7.StartOnboarding(false);
@@ -1428,10 +1434,7 @@ inline int RunHeadlessSelfTest(const std::wstring& testRootDir) {
                 if (v7Err == 0) {
                     RECT shortMon{ 0, 0, 910, 512 };
                     RECT shortWork{ 0, 0, 910, 440 };
-                    dock7.monitorProvider = [&](POINT, RECT* outMon) -> RECT {
-                        if (outMon) *outMon = shortMon;
-                        return shortWork;
-                    };
+                    dock7.monitorProvider = makeFixedMon(shortMon, shortWork);
                     dock7.expandSpring.Snap(1.0f);
                     dock7.RenderAndPresent("selftest-short-screen");
                     if (dock7.curPanelHeightDip >= Theme::PanelHeight() - 10.0f ||
@@ -1616,10 +1619,7 @@ inline int RunHeadlessSelfTest(const std::wstring& testRootDir) {
             } else {
                 RECT simMon{ 0, 0, 1920, 1080 };
                 RECT simWork{ 0, 0, 1920, 1040 };
-                dock8.monitorProvider = [&](POINT, RECT* outMon) -> RECT {
-                    if (outMon) *outMon = simMon;
-                    return simWork;
-                };
+                dock8.monitorProvider = makeFixedMon(simMon, simWork);
                 dock8.expandSpring.Snap(1.0f);
                 dock8.RenderAndPresent("selftest-v10-single");
                 if (std::fabs(dock8.curPanelHeightDip - 471.0f) > 0.5f) v8Err = 185;
@@ -1855,7 +1855,7 @@ inline int RunHeadlessSelfTest(const std::wstring& testRootDir) {
 
                 // Moving cursor to a different slot during pendingAutoRetract cancels auto-retract
                 if (uxErr == 0) {
-                    dock11.clipboardWriter = [](const std::wstring&) { return true; };
+                    dock11.clipboardWriter = stubClipOk;
                     dock11.expandSpring.Snap(1.0f);
                     dock11.RenderAndPresent("selftest-v11-retract");
                     dock11.TriggerSlotCopy(0);
@@ -1899,6 +1899,189 @@ inline int RunHeadlessSelfTest(const std::wstring& testRootDir) {
         }
         CoUninitialize();
         if (uxErr != 0) return uxErr;
+    }
+
+    // 12. Verify v0.12.0 unified motion grammar, interruptibility, OS Reduced Motion, and idle timer stop
+    {
+        // 12a. Reduced Motion override & Spring1D continuous mid-flight retargeting
+        Motion::SetReducedMotionOverride(1);
+        if (!Motion::IsReducedMotion()) { Motion::SetReducedMotionOverride(-1); return 225; }
+        {
+            Spring1D sp = Spring1D::Fluid(0.0f);
+            sp.target = 100.0f;
+            bool stillMoving = sp.Step(0.016f);
+            if (stillMoving || std::fabs(sp.value - 100.0f) > 0.01f) { Motion::SetReducedMotionOverride(-1); return 226; }
+            float v = 0.0f;
+            if (Motion::ExpApproach(v, 1.0f, 18.0f, 0.016f) || std::fabs(v - 1.0f) > 0.01f) { Motion::SetReducedMotionOverride(-1); return 227; }
+            if (std::fabs(Motion::RejectShakeOffset(1000ULL, 1045ULL, 260ULL, 5.0f)) > 0.001f) { Motion::SetReducedMotionOverride(-1); return 228; }
+        }
+
+        Motion::SetReducedMotionOverride(0);
+        if (Motion::IsReducedMotion()) { Motion::SetReducedMotionOverride(-1); return 229; }
+        {
+            Spring1D sp = Spring1D::Fluid(0.0f);
+            sp.target = 100.0f;
+            for (int k = 0; k < 4; ++k) sp.Step(0.016f);
+            float midVal = sp.value;
+            float midVel = sp.velocity;
+            if (midVal <= 5.0f || midVal >= 98.0f || midVel <= 0.0f) { Motion::SetReducedMotionOverride(-1); return 230; }
+            // Mid-flight interrupt/retarget to 0 must preserve continuous position without instant snap
+            sp.target = 0.0f;
+            sp.Step(0.016f);
+            if (std::fabs(sp.value - midVal) > 40.0f) { Motion::SetReducedMotionOverride(-1); return 231; }
+            for (int k = 0; k < 80; ++k) sp.Step(0.016f);
+            if (!sp.IsSettled() || std::fabs(sp.value) > 0.5f) { Motion::SetReducedMotionOverride(-1); return 232; }
+            if (std::fabs(Motion::RejectShakeOffset(1000ULL, 1045ULL, 260ULL, 5.0f)) < 0.5f) { Motion::SetReducedMotionOverride(-1); return 233; }
+        }
+
+        // 12b. HoverBubbleWindow height morphing, DarkPopupMenu emerge & clickability, DockWindow motion & idle stop
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        int mErr = 0;
+        {
+            DarkPopupMenu menu12;
+            DockWindow dock12;
+            AppState st12{};
+            StorageManager::SeedDefaults(st12, true);
+            st12.SetSceneEnabled(1, true);
+            st12.vault[0].content = L"短内容";
+            st12.vault[1].content = L"第一行\n第二行\n第三行\n第四行\n第五行\n第六行\n第七行\n第八行\n第九行\n第十行";
+            if (!menu12.Init(GetModuleHandleW(nullptr)) ||
+                !dock12.Init(GetModuleHandleW(nullptr), &st12, &sm, &menu12, nullptr, nullptr, false)) {
+                mErr = 234;
+            } else {
+                // Bubble snaps height on fresh open, morphs smoothly on switching to taller slot, snaps on Reduced Motion
+                dock12.expandSpring.Snap(1.0f);
+                dock12.RenderAndPresent("selftest-v12-init");
+                dock12.hoverSlot = 0;
+                dock12.SyncHoverBubble(true);
+                float h0 = dock12.hoverBubble.heightSpring.value;
+                if (std::fabs(h0 - dock12.hoverBubble.heightSpring.target) > 0.5f) mErr = 235;
+                if (mErr == 0) {
+                    dock12.hoverSlot = 1;
+                    dock12.SyncHoverBubble(true);
+                    if (std::fabs(dock12.hoverBubble.heightSpring.target - h0) < 20.0f ||
+                        std::fabs(dock12.hoverBubble.heightSpring.value - dock12.hoverBubble.heightSpring.target) < 5.0f) {
+                        mErr = 236;
+                    }
+                    Motion::SetReducedMotionOverride(1);
+                    dock12.hoverSlot = 0;
+                    dock12.SyncHoverBubble(true);
+                    if (std::fabs(dock12.hoverBubble.heightSpring.value - dock12.hoverBubble.heightSpring.target) > 0.5f) {
+                        mErr = 237;
+                    }
+                    Motion::SetReducedMotionOverride(0);
+                    dock12.hoverBubble.HideImmediate();
+                }
+
+                // DarkPopupMenu mid-emerge inverse-transform boundary hit test (top edge of item 1 visually shifted)
+                if (mErr == 0) {
+                    int clickedId = -1;
+                    std::vector<DarkMenuItem> mi = { DarkMenuItem::Action(42, L"第一项"), DarkMenuItem::Action(43, L"第二项") };
+                    menu12.ShowAt(POINT{ 400, 400 }, mi, [&](int id) { clickedId = id; }, 180.0f, MenuOwner::Vault);
+                    if (!menu12.visible || menu12.openSpring.value >= 0.99f || !menu12.animActive) mErr = 238;
+                    if (mErr == 0 && menu12.itemRects.size() >= 2) {
+                        // Compute exact screen-mapped visual top-inner edge of row 1 at current openSpring frame
+                        float a = Motion::EaseOutCubic(menu12.lastRenderOpenT);
+                        float sc = 0.955f + 0.045f * a;
+                        float ax = menu12.openFlipLeft ? (DarkPopupMenu::kPad + menu12.menuW) : DarkPopupMenu::kPad;
+                        float ay = menu12.openFlipUp ? (DarkPopupMenu::kPad + menu12.menuH) : DarkPopupMenu::kPad;
+                        float dySh = (menu12.openFlipUp ? 4.0f : -4.0f) * (1.0f - a);
+                        D2D1_RECT_F r1 = menu12.itemRects[1];
+                        float visX = ax + ((r1.left + r1.right) * 0.5f - ax) * sc;
+                        float visY = ay + ((r1.top + 1.0f) - ay) * sc + dySh;
+                        LPARAM lp1 = MAKELPARAM((short)std::round(visX * menu12.dpiScale),
+                                                (short)std::round(visY * menu12.dpiScale));
+                        SendMessageW(menu12.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lp1);
+                        SendMessageW(menu12.hwnd, WM_LBUTTONUP, 0, lp1);
+                        if (clickedId != 43 || menu12.visible || menu12.animActive) mErr = 239;
+                    }
+                }
+
+                // DockWindow: Reduced Motion copy stops 10ms anim timer; normal motion onboarding pulse stops after 2.4s; slot drag rollback
+                if (mErr == 0) {
+                    Motion::SetReducedMotionOverride(1);
+                    dock12.clipboardWriter = stubClipFail;
+                    dock12.TriggerSlotCopy(0);
+                    if (dock12.copyFailedSlot != 0 || dock12.animRunning) mErr = 240;
+                    Motion::SetReducedMotionOverride(0);
+                }
+                if (mErr == 0) {
+                    dock12.SwitchActiveScene(1);
+                    if (st12.activeSceneIndex != 1 || !dock12.animRunning) mErr = 241;
+                    // Verify onboarding pulse naturally stops animRunning under NORMAL motion once 2.4s expires
+                    dock12.StartOnboarding(true);
+                    dock12.onboardPulseStartTick = GetTickCount64() - DockWindow::kOnboardPulseDurationMs - 200;
+                    dock12.scenePillXSpring.Snap(dock12.scenePillXSpring.target);
+                    dock12.scenePillWSpring.Snap(dock12.scenePillWSpring.target);
+                    dock12.SyncSceneColorTarget(true);
+                    SendMessageW(dock12.hwnd, WM_TIMER, DockWindow::kTimerAnim, 0);
+                    if (dock12.animRunning) mErr = 242;
+                    dock12.FinishOnboarding(false);
+                }
+                if (mErr == 0) {
+                    // Verify slot drag blocks wheel scene switch AND capture loss rolls back temporary swap
+                    dock12.SwitchActiveScene(0);
+                    auto origSlots = st12.scenes[0].slots;
+                    dock12.pressedSlot = 0;
+                    dock12.slotDragSceneIdx = 0;
+                    dock12.slotDragOrigSlots = origSlots;
+                    dock12.isSlotDragging = true;
+                    std::swap(st12.scenes[0].slots[0], st12.scenes[0].slots[1]);
+                    SendMessageW(dock12.hwnd, WM_MOUSEWHEEL, MAKEWPARAM(0, -WHEEL_DELTA), 0);
+                    if (st12.activeSceneIndex != 0) mErr = 246;
+                    SendMessageW(dock12.hwnd, WM_CAPTURECHANGED, 0, 0);
+                    if (dock12.isSlotDragging || st12.scenes[0].slots != origSlots) mErr = 247;
+                }
+
+                if (dock12.hoverBubble.hwnd) DestroyWindow(dock12.hoverBubble.hwnd);
+                if (dock12.hwnd) DestroyWindow(dock12.hwnd);
+                if (menu12.hwnd) DestroyWindow(menu12.hwnd);
+            }
+        }
+        CoUninitialize();
+        if (mErr != 0) { Motion::SetReducedMotionOverride(-1); return mErr; }
+
+        // 12c. VaultWindow tab pill, RowShift physics, transactional drag rollback & Reduced Motion snap
+        {
+            AppState vSt{};
+            StorageManager::SeedDefaults(vSt, false);
+            VaultWindow vw12;
+            vw12.state = &vSt;
+            vw12.storage = &sm;
+            vw12.activeTab = 0;
+            vw12.SyncTabPillTarget(true);
+            Motion::SetReducedMotionOverride(0);
+            // Without an active HWND, StartWindowAnimTimer fails -> P0 #5 fallback must snap springs to final state
+            vw12.SwitchTab(1);
+            if (std::fabs(vw12.tabPillXSpring.value - 140.0f) > 0.5f ||
+                std::fabs(vw12.rankEnterSpring.value - 1.0f) > 0.01f) {
+                Motion::SetReducedMotionOverride(-1);
+                return 243;
+            }
+            vw12.AddRowShift(L"seed_01", 76.0f);
+            if (std::fabs(vw12.GetRowShift(L"seed_01") - 76.0f) > 0.5f) {
+                Motion::SetReducedMotionOverride(-1);
+                return 244;
+            }
+            // Transactional vault card drag rollback restores original vault order
+            std::wstring firstId = vSt.vault[0].id;
+            vw12.vaultDragOrigIdx = 0;
+            vw12.vaultDragIdx = 2;
+            vw12.isVaultDragging = true;
+            VaultWindow::ReorderVaultItemOnly(vSt, 0, 2);
+            vw12.CancelVaultDrag(true);
+            if (vw12.isVaultDragging || vSt.vault[0].id != firstId) {
+                Motion::SetReducedMotionOverride(-1);
+                return 245;
+            }
+            Motion::SetReducedMotionOverride(1);
+            vw12.SwitchTab(2);
+            if (std::fabs(vw12.tabPillXSpring.value - 234.0f) > 0.5f) {
+                Motion::SetReducedMotionOverride(-1);
+                return 248;
+            }
+        }
+        Motion::SetReducedMotionOverride(-1);
     }
 
     return 0;

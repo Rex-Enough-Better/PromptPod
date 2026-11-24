@@ -27,6 +27,7 @@ public:
     ComPtr<IDWriteFactory> dwFactory;
 
     bool Init() {
+        Motion::RefreshSystemReducedMotion();
         HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2dFactory.GetAddressOf());
         if (FAILED(hr)) return false;
         hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
@@ -34,7 +35,7 @@ public:
         return SUCCEEDED(hr);
     }
 
-    ComPtr<IDWriteTextFormat> CreateFormat(float sizeDip, DWRITE_FONT_WEIGHT weight,
+    [[gnu::noinline]] ComPtr<IDWriteTextFormat> CreateFormat(float sizeDip, DWRITE_FONT_WEIGHT weight,
                                            bool noWrap = true,
                                            DWRITE_TEXT_ALIGNMENT hAlign = DWRITE_TEXT_ALIGNMENT_LEADING,
                                            DWRITE_PARAGRAPH_ALIGNMENT vAlign = DWRITE_PARAGRAPH_ALIGNMENT_CENTER) {
@@ -90,11 +91,11 @@ public:
     ComPtr<ID2D1DCRenderTarget> rt;
     ComPtr<ID2D1SolidColorBrush> solidBrush;
 
-    ~LayeredCanvas() {
+    [[gnu::noinline]] ~LayeredCanvas() {
         ReleaseGdi();
     }
 
-    void ReleaseGdi() {
+    [[gnu::noinline]] void ReleaseGdi() {
         if (memDC) {
             if (oldBmp) SelectObject(memDC, oldBmp);
             oldBmp = nullptr;
@@ -114,7 +115,7 @@ public:
         capHeightPx = 0;
     }
 
-    bool EnsureTarget() {
+    [[gnu::noinline]] bool EnsureTarget() {
         if (rt && solidBrush) return true;
         solidBrush.Reset();
         rt.Reset();
@@ -145,7 +146,7 @@ public:
         return true;
     }
 
-    bool EnsureSize(int wPx, int hPx) {
+    [[gnu::noinline]] bool EnsureSize(int wPx, int hPx) {
         if (wPx <= 0 || hPx <= 0) {
             lastFailStep = "InvalidSize";
             return false;
@@ -222,7 +223,7 @@ public:
         return solidBrush.Get();
     }
 
-    bool Begin(int wPx, int hPx, float dpiScale) {
+    [[gnu::noinline]] bool Begin(int wPx, int hPx, float dpiScale) {
         lastFailStep = "";
         lastHr = S_OK;
         lastWin32Err = 0;
@@ -247,7 +248,7 @@ public:
         return true;
     }
 
-    bool EndAndPresent(HWND hwnd, int screenX, int screenY, BYTE masterAlpha = 255) {
+    [[gnu::noinline]] bool EndAndPresent(HWND hwnd, int screenX, int screenY, BYTE masterAlpha = 255) {
         HRESULT hr = rt->EndDraw();
         if (FAILED(hr)) {
             lastFailStep = "EndDraw";
@@ -275,7 +276,7 @@ public:
 };
 
 // Helper: draw soft layered ambient shadow around a rounded rectangle in DIPs
-inline void DrawAmbientShadow(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br,
+[[gnu::noinline]] inline void DrawAmbientShadow(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br,
                               const D2D1_RECT_F& box, float radius, float opacityScale = 1.0f) {
     if (opacityScale <= 0.01f) return;
     constexpr int kLayers = 6;
@@ -295,7 +296,7 @@ inline void DrawAmbientShadow(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br,
 }
 
 // Helper: draw 1px top-lit Linear-style specular gradient border
-inline void DrawTopLitBorder(ID2D1RenderTarget* rt, const D2D1_RECT_F& box, float radius,
+[[gnu::noinline]] inline void DrawTopLitBorder(ID2D1RenderTarget* rt, const D2D1_RECT_F& box, float radius,
                              const D2D1_COLOR_F& topColor, const D2D1_COLOR_F& bottomColor, float strokeWidth = 1.0f) {
     D2D1_GRADIENT_STOP stops[2] = {
         { 0.0f, topColor },
@@ -317,7 +318,180 @@ inline void DrawTopLitBorder(ID2D1RenderTarget* rt, const D2D1_RECT_F& box, floa
     rt->DrawRoundedRectangle(rr, grad.Get(), strokeWidth);
 }
 
-inline float GetDpiScaleForWindow(HWND hwnd) {
+// Helper: shared rounded-rect 2-stop linear gradient fill (eliminates duplicated COM boilerplate across windows)
+[[gnu::noinline]] inline void FillRoundedGradient(ID2D1RenderTarget* rt, const D2D1_RECT_F& box, float radius,
+                                                  const D2D1_COLOR_F& startColor, const D2D1_COLOR_F& endColor,
+                                                  bool horizontal = false) {
+    D2D1_GRADIENT_STOP stops[2] = {
+        { 0.0f, startColor },
+        { 1.0f, endColor }
+    };
+    ComPtr<ID2D1GradientStopCollection> coll;
+    if (FAILED(rt->CreateGradientStopCollection(stops, 2, coll.GetAddressOf()))) return;
+    ComPtr<ID2D1LinearGradientBrush> grad;
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES props = horizontal
+        ? D2D1::LinearGradientBrushProperties(D2D1::Point2F(box.left, box.top), D2D1::Point2F(box.right, box.top))
+        : D2D1::LinearGradientBrushProperties(D2D1::Point2F(box.left, box.top), D2D1::Point2F(box.left, box.bottom));
+    if (SUCCEEDED(rt->CreateLinearGradientBrush(props, coll.Get(), grad.GetAddressOf())) && grad) {
+        rt->FillRoundedRectangle(D2D1::RoundedRect(box, radius, radius), grad.Get());
+    }
+}
+
+// Helper: progressive 2-segment vector checkmark stroke (progress 0..1)
+[[gnu::noinline]] inline void DrawAnimatedCheckmark(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br,
+                                                    float cx, float cy, float size, float progress,
+                                                    const D2D1_COLOR_F& col, float strokeW = 1.75f) {
+    progress = std::clamp(progress, 0.0f, 1.0f);
+    if (progress <= 0.02f || !rt || !br) return;
+    br->SetColor(col);
+    D2D1_POINT_2F p1 = D2D1::Point2F(cx - size * 0.44f, cy + size * 0.04f);
+    D2D1_POINT_2F p2 = D2D1::Point2F(cx - size * 0.12f, cy + size * 0.36f);
+    D2D1_POINT_2F p3 = D2D1::Point2F(cx + size * 0.46f, cy - size * 0.34f);
+    float s1 = std::clamp(progress / 0.42f, 0.0f, 1.0f);
+    D2D1_POINT_2F e1 = D2D1::Point2F(p1.x + (p2.x - p1.x) * s1, p1.y + (p2.y - p1.y) * s1);
+    rt->DrawLine(p1, e1, br, strokeW);
+    if (progress > 0.42f) {
+        float s2 = std::clamp((progress - 0.42f) / 0.58f, 0.0f, 1.0f);
+        D2D1_POINT_2F e2 = D2D1::Point2F(p2.x + (p3.x - p2.x) * s2, p2.y + (p3.y - p2.y) * s2);
+        rt->DrawLine(p2, e2, br, strokeW);
+    }
+}
+
+// Helper: unified spring-animated pill toggle switch (with subtle mid-flight knob stretch)
+[[gnu::noinline]] inline void DrawAnimatedToggleSwitch(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br,
+                                                       const D2D1_RECT_F& r, float animT, bool hov,
+                                                       float alphaScale = 1.0f) {
+    if (!rt || !br || alphaScale <= 0.01f) return;
+    float t = std::clamp(animT, 0.0f, 1.0f);
+    float radius = (r.bottom - r.top) * 0.5f;
+
+    // Base off track
+    br->SetColor(Rgba(hov ? 0x222838 : 0x131722, alphaScale));
+    rt->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), br);
+
+    // Cross-faded active gradient track
+    if (t > 0.01f) {
+        FillRoundedGradient(rt, r, radius,
+                            Rgba(hov ? 0x4F8EF7 : 0x3B7BF6, t * alphaScale),
+                            Rgba(Theme::AccentCyan, (hov ? 0.98f : 0.90f) * t * alphaScale),
+                            true);
+    }
+    DrawTopLitBorder(rt, r, radius,
+                     Rgba(0xFFFFFF, (0.14f + 0.14f * t) * alphaScale),
+                     Rgba(0xFFFFFF, (0.05f + 0.03f * t) * alphaScale));
+
+    // Smoothly gliding knob with subtle Apple-style mid-flight horizontal stretch
+    float knobR = std::max(2.0f, radius - 2.8f);
+    float leftX = r.left + radius;
+    float rightX = r.right - radius;
+    float knobX = leftX + (rightX - leftX) * t;
+    float knobY = (r.top + r.bottom) * 0.5f;
+    float stretch = std::sin(t * 3.14159265f) * 1.45f;
+    D2D1_RECT_F knobRect = D2D1::RectF(knobX - knobR - stretch, knobY - knobR,
+                                       knobX + knobR + stretch, knobY + knobR);
+    br->SetColor(LerpColor(Rgba(0x94A3B8, alphaScale), Rgba(0xFFFFFF, alphaScale), t));
+    rt->FillRoundedRectangle(D2D1::RoundedRect(knobRect, knobR, knobR), br);
+}
+
+// Helper: shared rounded-rect Toast backdrop with optional bottom countdown hairline
+[[gnu::noinline]] inline void DrawAnimatedToastSurface(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br,
+                                                       const D2D1_RECT_F& tr, float radius,
+                                                       uint32_t bgHex, uint32_t rimHex,
+                                                       float alpha, float countdownRatio = -1.0f) {
+    if (!rt || !br || alpha <= 0.01f) return;
+    br->SetColor(Rgba(bgHex, 0.98f * alpha));
+    rt->FillRoundedRectangle(D2D1::RoundedRect(tr, radius, radius), br);
+    DrawTopLitBorder(rt, tr, radius, Rgba(rimHex, 0.52f * alpha), Rgba(0xFFFFFF, 0.06f * alpha), 1.0f);
+    if (countdownRatio > 0.01f) {
+        float barW = std::max(0.0f, (tr.right - tr.left - 12.0f) * std::clamp(countdownRatio, 0.0f, 1.0f));
+        D2D1_RECT_F bar = D2D1::RectF(tr.left + 6.0f, tr.bottom - 2.6f, tr.left + 6.0f + barW, tr.bottom - 0.8f);
+        br->SetColor(Rgba(rimHex, 0.72f * alpha));
+        rt->FillRoundedRectangle(D2D1::RoundedRect(bar, 0.9f, 0.9f), br);
+    }
+}
+
+// Compact shared rounded-rect primitives (keep OnPaint functions small & cache-friendly)
+[[gnu::noinline]] inline void FillRR(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br,
+                                     const D2D1_RECT_F& r, float radius, const D2D1_COLOR_F& col) {
+    if (!rt || !br) return;
+    br->SetColor(col);
+    rt->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), br);
+}
+
+[[gnu::noinline]] inline void FillRMRim(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br,
+                                        const D2D1_RECT_F& r, float radius,
+                                        const D2D1_COLOR_F& fillCol, const D2D1_COLOR_F& topRim,
+                                        const D2D1_COLOR_F& botRim, float strokeWidth = 1.0f) {
+    if (!rt || !br) return;
+    br->SetColor(fillCol);
+    rt->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), br);
+    DrawTopLitBorder(rt, r, radius, topRim, botRim, strokeWidth);
+}
+
+[[gnu::noinline]] inline void FillRRHex(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br,
+                                        const D2D1_RECT_F& r, float radius, uint32_t hex, float alpha = 1.0f) {
+    FillRR(rt, br, r, radius, Rgba(hex, alpha));
+}
+
+[[gnu::noinline]] inline void FillRMRimHex(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br,
+                                           const D2D1_RECT_F& r, float radius,
+                                           uint32_t fillHex, float fillA,
+                                           uint32_t topHex, float topA,
+                                           uint32_t botHex = 0xFFFFFF, float botA = 0.04f,
+                                           float strokeWidth = 1.0f) {
+    FillRMRim(rt, br, r, radius, Rgba(fillHex, fillA), Rgba(topHex, topA), Rgba(botHex, botA), strokeWidth);
+}
+
+[[gnu::noinline]] inline void DrawFocusGlow(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br,
+                                            const D2D1_RECT_F& r, float radius, float anim,
+                                            uint32_t hex = Theme::AccentCyan, float alphaScale = 0.16f) {
+    if (!rt || !br || anim <= 0.02f) return;
+    D2D1_RECT_F glow = D2D1::RectF(r.left - 1.5f, r.top - 1.5f, r.right + 1.5f, r.bottom + 1.5f);
+    br->SetColor(Rgba(hex, alphaScale * anim));
+    rt->DrawRoundedRectangle(D2D1::RoundedRect(glow, radius + 1.5f, radius + 1.5f), br, 2.5f);
+}
+
+[[gnu::noinline]] inline void DrawTextHex(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, IDWriteTextFormat* fmt,
+                                          const D2D1_RECT_F& r, const wchar_t* s, UINT32 len,
+                                          uint32_t hex, float alpha = 1.0f) {
+    if (!rt || !br || !fmt || !s || len == 0) return;
+    br->SetColor(Rgba(hex, alpha));
+    rt->DrawTextW(s, len, fmt, r, br);
+}
+
+[[gnu::noinline]] inline void DrawInputBox(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br,
+                                           const D2D1_RECT_F& box, float radius, float focusAnim,
+                                           bool isError = false, uint32_t fillHex = Theme::CardBg) {
+    DrawFocusGlow(rt, br, box, radius, focusAnim, isError ? Theme::DangerRed : Theme::AccentCyan, 0.16f);
+    D2D1_COLOR_F rimTop = isError
+        ? Rgba(Theme::DangerRed, 0.72f)
+        : LerpColor(Rgba(0xFFFFFF, 0.12f), Rgba(Theme::AccentCyan, 0.56f), focusAnim);
+    FillRMRim(rt, br, box, radius, Rgba(fillHex, 1.0f), rimTop, Rgba(0xFFFFFF, 0.05f));
+}
+
+[[gnu::noinline]] inline bool StartWindowAnimTimer(HWND hwnd, UINT_PTR timerId, bool& active,
+                                                   LARGE_INTEGER& qpcFreq, LARGE_INTEGER& lastQpc) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    if (active) return true;
+    if (qpcFreq.QuadPart == 0) QueryPerformanceFrequency(&qpcFreq);
+    QueryPerformanceCounter(&lastQpc);
+    if (SetTimer(hwnd, timerId, 10, nullptr) != 0) {
+        active = true;
+        return true;
+    }
+    return false;
+}
+
+[[gnu::noinline]] inline float StepDeltaQpc(LARGE_INTEGER& qpcFreq, LARGE_INTEGER& lastQpc) {
+    if (qpcFreq.QuadPart == 0) QueryPerformanceFrequency(&qpcFreq);
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    float dt = (qpcFreq.QuadPart > 0) ? (float)(now.QuadPart - lastQpc.QuadPart) / (float)qpcFreq.QuadPart : 0.016f;
+    lastQpc = now;
+    return dt;
+}
+
+[[gnu::noinline]] inline float GetDpiScaleForWindow(HWND hwnd) {
     UINT dpi = 96;
     HMODULE user32 = GetModuleHandleW(L"user32.dll");
     if (user32) {
@@ -328,7 +502,7 @@ inline float GetDpiScaleForWindow(HWND hwnd) {
     return dpi > 0 ? (float)dpi / 96.0f : 1.0f;
 }
 
-inline float GetDpiScaleForMonitor(HMONITOR mon, HWND fallbackHwnd = nullptr) {
+[[gnu::noinline]] inline float GetDpiScaleForMonitor(HMONITOR mon, HWND fallbackHwnd = nullptr) {
     if (mon) {
         static HMODULE shcore = LoadLibraryW(L"shcore.dll");
         if (shcore) {
@@ -355,7 +529,7 @@ inline float GetDpiScaleForPoint(POINT pt, HWND fallbackHwnd = nullptr) {
     return GetDpiScaleForMonitor(mon, fallbackHwnd);
 }
 
-inline RECT GetMonitorWorkAreaForPoint(POINT pt, RECT* outFullMonitor = nullptr) {
+[[gnu::noinline]] inline RECT GetMonitorWorkAreaForPoint(POINT pt, RECT* outFullMonitor = nullptr) {
     HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);

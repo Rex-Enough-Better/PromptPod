@@ -200,7 +200,9 @@ struct DarkMenuItem {
     bool danger = false;
     bool disabled = false;
 
-    static DarkMenuItem Action(int id, const std::wstring& label, const std::wstring& hint = L"",
+    [[gnu::noinline]] ~DarkMenuItem() = default;
+
+    [[gnu::noinline]] static DarkMenuItem Action(int id, const std::wstring& label, const std::wstring& hint = L"",
                                bool checked = false, bool danger = false, bool disabled = false) {
         DarkMenuItem it{};
         it.id = id;
@@ -212,13 +214,13 @@ struct DarkMenuItem {
         return it;
     }
 
-    static DarkMenuItem Separator() {
+    [[gnu::noinline]] static DarkMenuItem Separator() {
         DarkMenuItem it{};
         it.isSeparator = true;
         return it;
     }
 
-    static DarkMenuItem Header(const std::wstring& title) {
+    [[gnu::noinline]] static DarkMenuItem Header(const std::wstring& title) {
         DarkMenuItem it{};
         it.isSectionHeader = true;
         it.label = UiText(title);
@@ -237,6 +239,9 @@ enum class MenuOwner : int {
 // Non-focus-stealing Raycast-style dark layered popup menu
 class DarkPopupMenu {
 public:
+    [[gnu::noinline]] DarkPopupMenu() = default;
+    [[gnu::noinline]] ~DarkPopupMenu() = default;
+
     HWND hwnd = nullptr;
     LayeredCanvas canvas;
     std::vector<DarkMenuItem> items;
@@ -267,6 +272,22 @@ public:
     float menuW = 228.0f;
     float menuH = 100.0f;
     float dpiScale = 1.0f;
+
+    // Unified Apple-grade popup motion state (anchor-corner emerge + sliding highlight pill)
+    Spring1D openSpring = Spring1D::Snappy(1.0f);
+    Spring1D hoverYSpring = Spring1D::Snappy(0.0f);
+    Spring1D hoverHSpring = Spring1D::Snappy(30.0f);
+    float hoverAlpha = 0.0f;
+    float hoverDangerT = 0.0f;
+    float pressAnim = 0.0f;
+    bool hoverPillInit = false;
+    bool openFlipLeft = false;
+    bool openFlipUp = false;
+    float lastRenderOpenT = 1.0f;
+    LARGE_INTEGER qpcFreq{};
+    LARGE_INTEGER lastAnimQpc{};
+    bool animActive = false;
+
     std::function<void(MenuOwner)> onClosed;
     std::function<HWND()> foregroundProvider;
     std::function<BOOL(POINT*)> cursorPosProvider;
@@ -276,11 +297,13 @@ public:
     ComPtr<IDWriteTextFormat> fmtHeader;
 
     static constexpr UINT_PTR kTimerPoll = 9001;
+    static constexpr UINT_PTR kTimerAnim = 9002;
     static constexpr float kPad = 12.0f;
 
     friend int RunHeadlessSelfTest(const std::wstring& testDir);
 
     bool Init(HINSTANCE hInst) {
+        QueryPerformanceFrequency(&qpcFreq);
         WNDCLASSEXW wc{};
         wc.cbSize = sizeof(wc);
         wc.lpfnWndProc = WndProcStatic;
@@ -352,6 +375,13 @@ public:
         openForegroundHwnd = nullptr;
         hoverIndex = -1;
         pressedIndex = -1;
+        hoverPillInit = false;
+        hoverAlpha = 0.0f;
+        hoverDangerT = 0.0f;
+        pressAnim = 0.0f;
+        openSpring.Snap(1.0f);
+        lastRenderOpenT = 1.0f;
+        StopAnimTimer();
         KillTimer(hwnd, kTimerPoll);
         ShowWindow(hwnd, SW_HIDE);
         if (onClosed) onClosed(closedOwner);
@@ -388,8 +418,16 @@ public:
         RECT work = GetMonitorWorkAreaForPoint(screenPt);
         int x = screenPt.x - (int)(kPad * dpiScale);
         int yPos = screenPt.y - (int)(kPad * dpiScale);
-        if (x + wPx > work.right) x = screenPt.x - wPx + (int)(kPad * dpiScale);
-        if (yPos + hPx > work.bottom) yPos = work.bottom - hPx - 4;
+        openFlipLeft = false;
+        openFlipUp = false;
+        if (x + wPx > work.right) {
+            x = screenPt.x - wPx + (int)(kPad * dpiScale);
+            openFlipLeft = true;
+        }
+        if (yPos + hPx > work.bottom) {
+            yPos = work.bottom - hPx - 4;
+            openFlipUp = true;
+        }
         if (x < work.left) x = work.left + 4;
         if (yPos < work.top) yPos = work.top + 4;
 
@@ -397,6 +435,16 @@ public:
         winY = yPos;
         hoverIndex = -1;
         pressedIndex = -1;
+        hoverPillInit = false;
+        hoverAlpha = 0.0f;
+        hoverDangerT = 0.0f;
+        pressAnim = 0.0f;
+        if (Motion::IsReducedMotion()) {
+            openSpring.Snap(1.0f);
+        } else {
+            openSpring.Snap(0.16f);
+            openSpring.target = 1.0f;
+        }
         kbNavActive = false;
         closedByOutsideClick = false;
         prevLDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
@@ -442,10 +490,99 @@ public:
         visible = true;
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         SetWindowPos(hwnd, HWND_TOPMOST, winX, winY, wPx, hPx, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (!openSpring.IsSettled()) EnsureAnimTimer();
     }
 
 private:
+    [[gnu::noinline]] void SnapAllAnims() {
+        openSpring.Snap(openSpring.target);
+        hoverYSpring.Snap(hoverYSpring.target);
+        hoverHSpring.Snap(hoverHSpring.target);
+        hoverAlpha = (hoverIndex >= 0) ? 1.0f : 0.0f;
+        hoverDangerT = (hoverIndex >= 0 && hoverIndex < (int)items.size() && items[(size_t)hoverIndex].danger) ? 1.0f : 0.0f;
+        pressAnim = (pressedIndex >= 0 && pressedIndex == hoverIndex) ? 1.0f : 0.0f;
+        StopAnimTimer();
+        Render();
+    }
+
+    void EnsureAnimTimer() {
+        if (!hwnd || animActive) return;
+        QueryPerformanceCounter(&lastAnimQpc);
+        if (SetTimer(hwnd, kTimerAnim, 10, nullptr) != 0) {
+            animActive = true;
+        } else {
+            SnapAllAnims();
+        }
+    }
+
+    void StopAnimTimer() {
+        if (animActive && hwnd) {
+            KillTimer(hwnd, kTimerAnim);
+            animActive = false;
+        }
+    }
+
+    void SetHoverIndex(int newHover) {
+        if (newHover == hoverIndex) return;
+        hoverIndex = newHover;
+        if (hoverIndex >= 0 && hoverIndex < (int)itemRects.size()) {
+            const auto& r = itemRects[(size_t)hoverIndex];
+            if (!hoverPillInit || hoverAlpha < 0.08f || Motion::IsReducedMotion()) {
+                hoverYSpring.Snap(r.top);
+                hoverHSpring.Snap(r.bottom - r.top);
+                hoverDangerT = items[(size_t)hoverIndex].danger ? 1.0f : 0.0f;
+                hoverPillInit = true;
+            } else {
+                hoverYSpring.target = r.top;
+                hoverHSpring.target = r.bottom - r.top;
+            }
+        }
+        if (Motion::IsReducedMotion()) {
+            hoverAlpha = (hoverIndex >= 0) ? 1.0f : 0.0f;
+            hoverDangerT = (hoverIndex >= 0 && hoverIndex < (int)items.size() && items[(size_t)hoverIndex].danger) ? 1.0f : 0.0f;
+            Render();
+        } else {
+            EnsureAnimTimer();
+            Render();
+        }
+    }
+
+    void OnAnimTick() {
+        if (!visible) {
+            StopAnimTimer();
+            return;
+        }
+        float dt = StepDeltaQpc(qpcFreq, lastAnimQpc);
+
+        bool mOpen = openSpring.Step(dt);
+        bool mHY   = hoverYSpring.Step(dt, 0.15f, 1.0f);
+        bool mHH   = hoverHSpring.Step(dt, 0.15f, 1.0f);
+        bool mHA   = Motion::ExpApproach(hoverAlpha, (hoverIndex >= 0) ? 1.0f : 0.0f, 24.0f, dt);
+        float wantDanger = (hoverIndex >= 0 && hoverIndex < (int)items.size() && items[(size_t)hoverIndex].danger) ? 1.0f : 0.0f;
+        bool mHD   = (hoverIndex >= 0) ? Motion::ExpApproach(hoverDangerT, wantDanger, 20.0f, dt) : false;
+        float wantPress = (pressedIndex >= 0 && pressedIndex == hoverIndex) ? 1.0f : 0.0f;
+        bool mPr   = Motion::ExpApproach(pressAnim, wantPress, 28.0f, dt);
+
+        Render();
+        if (!mOpen && !mHY && !mHH && !mHA && !mHD && !mPr) {
+            StopAnimTimer();
+        }
+    }
+
+    void UnmapDip(float& dx, float& dy) const {
+        if (!Motion::IsReducedMotion() && lastRenderOpenT < 0.998f) {
+            float a = Motion::EaseOutCubic(lastRenderOpenT);
+            float sc = 0.955f + 0.045f * a;
+            float ax = openFlipLeft ? (kPad + menuW) : kPad;
+            float ay = openFlipUp ? (kPad + menuH) : kPad;
+            float dyShift = (openFlipUp ? 4.0f : -4.0f) * (1.0f - a);
+            dx = (dx - ax) / sc + ax;
+            dy = ((dy - dyShift) - ay) / sc + ay;
+        }
+    }
+
     int HitTestDip(float dx, float dy) const {
+        UnmapDip(dx, dy);
         for (size_t i = 0; i < items.size(); ++i) {
             const auto& it = items[i];
             if (it.isSeparator || it.isSectionHeader || it.disabled) continue;
@@ -466,24 +603,44 @@ private:
         if (!canvas.Begin(wPx, hPx, dpiScale)) return false;
         auto* rt = canvas.rt.Get();
 
+        float openT = std::clamp(openSpring.value, 0.0f, 1.0f);
+        lastRenderOpenT = openT;
+        float a = Motion::EaseOutCubic(openT);
         D2D1_RECT_F box = D2D1::RectF(kPad, kPad, kPad + menuW, kPad + menuH);
-        DrawAmbientShadow(rt, canvas.Brush(D2D1::ColorF(0, 0, 0, 1)), box, 10.0f, 1.0f);
 
-        // Rich obsidian surface
-        D2D1_GRADIENT_STOP bgStops[2] = {
-            { 0.0f, Rgba(0x181C26, 0.98f) },
-            { 1.0f, Rgba(0x10131A, 0.98f) }
-        };
-        ComPtr<ID2D1GradientStopCollection> coll;
-        if (SUCCEEDED(rt->CreateGradientStopCollection(bgStops, 2, coll.GetAddressOf()))) {
-            ComPtr<ID2D1LinearGradientBrush> bgGrad;
-            rt->CreateLinearGradientBrush(
-                D2D1::LinearGradientBrushProperties(D2D1::Point2F(box.left, box.top), D2D1::Point2F(box.left, box.bottom)),
-                coll.Get(), bgGrad.GetAddressOf());
-            if (bgGrad) rt->FillRoundedRectangle(D2D1::RoundedRect(box, 10.0f, 10.0f), bgGrad.Get());
+        // Anchor-corner spring emerge (HitTestDip / UnmapDip inverse-maps exact transform!)
+        if (!Motion::IsReducedMotion() && openT < 0.998f) {
+            float sc = 0.955f + 0.045f * a;
+            float ax = openFlipLeft ? box.right : box.left;
+            float ay = openFlipUp ? box.bottom : box.top;
+            float dyShift = (openFlipUp ? 4.0f : -4.0f) * (1.0f - a);
+            rt->SetTransform(D2D1::Matrix3x2F::Scale(sc, sc, D2D1::Point2F(ax, ay)) *
+                             D2D1::Matrix3x2F::Translation(0.0f, dyShift) *
+                             D2D1::Matrix3x2F::Scale(dpiScale, dpiScale));
         }
 
-        DrawTopLitBorder(rt, box, 10.0f, Rgba(0xFFFFFF, 0.17f), Rgba(0xFFFFFF, 0.06f), 1.0f);
+        DrawAmbientShadow(rt, canvas.Brush(D2D1::ColorF(0, 0, 0, 1)), box, 10.0f, a);
+
+        // Rich obsidian surface (shared gradient helper)
+        FillRoundedGradient(rt, box, 10.0f, Rgba(0x181C26, 0.98f * a), Rgba(0x10131A, 0.98f * a));
+        DrawTopLitBorder(rt, box, 10.0f, Rgba(0xFFFFFF, 0.17f * a), Rgba(0xFFFFFF, 0.06f * a), 1.0f);
+
+        // Continuous sliding highlight pill (glides smoothly between hovered/keyboard-selected rows!)
+        if (hoverPillInit && hoverAlpha > 0.01f) {
+            float inset = 0.65f * pressAnim;
+            D2D1_RECT_F hr = D2D1::RectF(
+                kPad + 5.0f + inset,
+                hoverYSpring.value + inset,
+                kPad + menuW - 5.0f - inset,
+                hoverYSpring.value + hoverHSpring.value - inset
+            );
+            D2D1_COLOR_F accentCol = LerpColor(Rgba(Theme::AccentBlue, 1.0f), Rgba(Theme::DangerRed, 1.0f), hoverDangerT);
+            D2D1_COLOR_F fillCol = accentCol;
+            fillCol.a = (0.18f + 0.10f * pressAnim) * hoverAlpha * a;
+            D2D1_COLOR_F rimCol = accentCol;
+            rimCol.a = (0.35f + 0.14f * pressAnim) * hoverAlpha * a;
+            FillRMRim(rt, canvas.solidBrush.Get(), hr, 6.0f, fillCol, rimCol, Rgba(0xFFFFFF, 0.05f * hoverAlpha * a), 1.0f);
+        }
 
         for (size_t i = 0; i < items.size(); ++i) {
             const auto& it = items[i];
@@ -491,56 +648,33 @@ private:
             if (it.isSeparator) {
                 float my = (r.top + r.bottom) * 0.5f;
                 rt->DrawLine(D2D1::Point2F(r.left + 6.0f, my), D2D1::Point2F(r.right - 6.0f, my),
-                             canvas.Brush(Rgba(0xFFFFFF, 0.07f)), 1.0f);
+                             canvas.Brush(Rgba(0xFFFFFF, 0.07f * a)), 1.0f);
                 continue;
             }
+            auto* br = canvas.solidBrush.Get();
             if (it.isSectionHeader) {
-                if (fmtHeader) {
-                    D2D1_RECT_F tr = D2D1::RectF(r.left + 8.0f, r.top + 2.0f, r.right - 8.0f, r.bottom);
-                    rt->DrawTextW(it.label.c_str(), (UINT32)it.label.size(), fmtHeader.Get(), tr,
-                                  canvas.Brush(Rgba(Theme::AccentCyan, 0.78f)));
-                }
+                DrawTextHex(rt, br, fmtHeader.Get(), D2D1::RectF(r.left + 8.0f, r.top + 2.0f, r.right - 8.0f, r.bottom),
+                            it.label.c_str(), (UINT32)it.label.size(), Theme::AccentCyan, 0.78f * a);
                 continue;
             }
 
             bool hov = ((int)i == hoverIndex) && !it.disabled;
-            bool act = hov && ((int)i == pressedIndex);
-            if (hov) {
-                D2D1_COLOR_F hc = it.danger
-                    ? Rgba(Theme::DangerRed, act ? 0.28f : 0.18f)
-                    : Rgba(Theme::AccentBlue, act ? 0.28f : 0.18f);
-                rt->FillRoundedRectangle(D2D1::RoundedRect(r, 6.0f, 6.0f), canvas.Brush(hc));
-                DrawTopLitBorder(rt, r, 6.0f,
-                                 it.danger ? Rgba(Theme::DangerRed, act ? 0.48f : 0.35f)
-                                           : Rgba(Theme::AccentBlue, act ? 0.48f : 0.35f),
-                                 Rgba(0xFFFFFF, 0.05f), 1.0f);
-            }
 
             float leftTextX = r.left + 24.0f;
             if (it.checked) {
-                // Crisp checkmark glyph
-                D2D1_POINT_2F p1 = D2D1::Point2F(r.left + 8.5f, (r.top + r.bottom) * 0.5f + 0.5f);
-                D2D1_POINT_2F p2 = D2D1::Point2F(r.left + 11.5f, (r.top + r.bottom) * 0.5f + 3.5f);
-                D2D1_POINT_2F p3 = D2D1::Point2F(r.left + 16.5f, (r.top + r.bottom) * 0.5f - 3.0f);
-                auto* ckBr = canvas.Brush(Rgba(Theme::CopyGreen, 0.95f));
-                rt->DrawLine(p1, p2, ckBr, 1.7f);
-                rt->DrawLine(p2, p3, ckBr, 1.7f);
+                DrawAnimatedCheckmark(rt, br, r.left + 12.6f, (r.top + r.bottom) * 0.5f,
+                                      9.2f, 1.0f, Rgba(Theme::CopyGreen, 0.95f * a), 1.7f);
             }
 
-            D2D1_COLOR_F txtColor = Rgba(Theme::TextPrimary, 0.94f);
-            if (it.disabled) txtColor = Rgba(Theme::TextMuted, 0.65f);
-            else if (it.danger) txtColor = Rgba(Theme::DangerRed, hov ? 1.0f : 0.90f);
-            else if (hov) txtColor = Rgba(0xFFFFFF, 1.0f);
+            uint32_t txtHex = it.disabled ? Theme::TextMuted : (it.danger ? Theme::DangerRed : (hov ? 0xFFFFFF : Theme::TextPrimary));
+            float txtA = (it.disabled ? 0.65f : (it.danger ? (hov ? 1.0f : 0.90f) : (hov ? 1.0f : 0.94f))) * a;
 
             float rightReserve = it.rightHint.empty() ? 8.0f : 62.0f;
-            if (fmtItem) {
-                D2D1_RECT_F tr = D2D1::RectF(leftTextX, r.top, r.right - rightReserve, r.bottom);
-                rt->DrawTextW(it.label.c_str(), (UINT32)it.label.size(), fmtItem.Get(), tr, canvas.Brush(txtColor));
-            }
-            if (!it.rightHint.empty() && fmtHint) {
-                D2D1_RECT_F hr = D2D1::RectF(r.right - 64.0f, r.top, r.right - 8.0f, r.bottom);
-                rt->DrawTextW(it.rightHint.c_str(), (UINT32)it.rightHint.size(), fmtHint.Get(), hr,
-                              canvas.Brush(Rgba(Theme::TextSecondary, hov ? 0.90f : 0.62f)));
+            DrawTextHex(rt, br, fmtItem.Get(), D2D1::RectF(leftTextX, r.top, r.right - rightReserve, r.bottom),
+                        it.label.c_str(), (UINT32)it.label.size(), txtHex, txtA);
+            if (!it.rightHint.empty()) {
+                DrawTextHex(rt, br, fmtHint.Get(), D2D1::RectF(r.right - 64.0f, r.top, r.right - 8.0f, r.bottom),
+                            it.rightHint.c_str(), (UINT32)it.rightHint.size(), Theme::TextSecondary, (hov ? 0.90f : 0.62f) * a);
             }
         }
 
@@ -566,10 +700,7 @@ private:
             }
             if (IsSelectableItem((size_t)cand)) {
                 kbNavActive = true;
-                if (cand != hoverIndex) {
-                    hoverIndex = cand;
-                    Render();
-                }
+                SetHoverIndex(cand);
                 return;
             }
         }
@@ -659,15 +790,16 @@ private:
         }
         float dx = (float)(pt.x - winX) / dpiScale;
         float dy = (float)(pt.y - winY) / dpiScale;
-        bool insideBox = (dx >= kPad && dx <= kPad + menuW && dy >= kPad && dy <= kPad + menuH);
+        float lx = dx, ly = dy;
+        UnmapDip(lx, ly);
+        bool insideBox = (lx >= kPad && lx <= kPad + menuW && ly >= kPad && ly <= kPad + menuH);
 
         if (pt.x != lastPollCursor.x || pt.y != lastPollCursor.y) {
             lastPollCursor = pt;
             int newHover = insideBox ? HitTestDip(dx, dy) : -1;
             if (newHover != hoverIndex) {
                 kbNavActive = false;
-                hoverIndex = newHover;
-                Render();
+                SetHoverIndex(newHover);
             }
         }
 
@@ -698,8 +830,13 @@ private:
         switch (msg) {
             case WM_MOUSEACTIVATE:
                 return MA_NOACTIVATE;
+            case WM_SETTINGCHANGE:
+                Motion::RefreshSystemReducedMotion();
+                if (Motion::IsReducedMotion() && self->visible) self->SnapAllAnims();
+                return 0;
             case WM_TIMER:
                 if (wp == kTimerPoll) self->OnPollTimer();
+                else if (wp == kTimerAnim) self->OnAnimTick();
                 return 0;
             case WM_SETCURSOR:
                 if (LOWORD(lp) == HTCLIENT) {
@@ -713,8 +850,7 @@ private:
                 int nh = self->HitTestDip(dx, dy);
                 if (nh != self->hoverIndex) {
                     self->kbNavActive = false;
-                    self->hoverIndex = nh;
-                    self->Render();
+                    self->SetHoverIndex(nh);
                 }
                 return 0;
             }
@@ -731,7 +867,10 @@ private:
                 float dx = (float)(short)LOWORD(lp) / self->dpiScale;
                 float dy = (float)(short)HIWORD(lp) / self->dpiScale;
                 self->pressedIndex = self->HitTestDip(dx, dy);
-                if (self->pressedIndex >= 0) self->Render();
+                if (self->pressedIndex >= 0) {
+                    if (Motion::IsReducedMotion()) { self->pressAnim = 1.0f; self->Render(); }
+                    else { self->EnsureAnimTimer(); self->Render(); }
+                }
                 return 0;
             }
             case WM_LBUTTONUP: {
@@ -746,7 +885,8 @@ private:
                     self->Close();
                     if (cb) cb(chosenId);
                 } else if (downIdx >= 0) {
-                    self->Render();
+                    if (Motion::IsReducedMotion()) { self->pressAnim = 0.0f; self->Render(); }
+                    else { self->EnsureAnimTimer(); self->Render(); }
                 }
                 return 0;
             }

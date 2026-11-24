@@ -220,7 +220,7 @@ struct SceneDeck {
     std::array<std::wstring, 10> slots{};
 };
 
-inline std::array<SceneDeck, kMaxScenes> MakeDefaultScenes() {
+[[gnu::noinline]] inline std::array<SceneDeck, kMaxScenes> MakeDefaultScenes() {
     std::array<SceneDeck, kMaxScenes> arr{};
     for (int i = 0; i < kMaxScenes; ++i) {
         arr[(size_t)i].name = DefaultSceneName(i);
@@ -230,6 +230,13 @@ inline std::array<SceneDeck, kMaxScenes> MakeDefaultScenes() {
 }
 
 struct AppState {
+    [[gnu::noinline]] AppState() = default;
+    [[gnu::noinline]] AppState(const AppState&) = default;
+    [[gnu::noinline]] AppState(AppState&&) noexcept = default;
+    [[gnu::noinline]] AppState& operator=(const AppState&) = default;
+    [[gnu::noinline]] AppState& operator=(AppState&&) noexcept = default;
+    [[gnu::noinline]] ~AppState() = default;
+
     int schemaVersion = 4;
     int seedPackRev = kCurrentSeedPackRev;
     DockEdge dockEdge = DockEdge::Right;
@@ -248,7 +255,7 @@ struct AppState {
     std::array<SceneDeck, kMaxScenes> scenes = MakeDefaultScenes();
     std::vector<PromptItem> vault;
 
-    int GetEnabledScenes(int outIdx[kMaxScenes]) const {
+    [[gnu::noinline]] int GetEnabledScenes(int outIdx[kMaxScenes]) const {
         int n = 0;
         for (int i = 0; i < kMaxScenes; ++i) {
             if (scenes[(size_t)i].enabled) {
@@ -271,7 +278,7 @@ struct AppState {
         return EnabledSceneCount() > 1;
     }
 
-    int EffectiveActiveSceneIndex() const {
+    [[gnu::noinline]] int EffectiveActiveSceneIndex() const {
         if (activeSceneIndex >= 0 && activeSceneIndex < kMaxScenes && scenes[(size_t)activeSceneIndex].enabled) {
             return activeSceneIndex;
         }
@@ -297,7 +304,7 @@ struct AppState {
         return scenes[(size_t)EffectiveActiveSceneIndex()].slots;
     }
 
-    bool SetSceneEnabled(int sceneIdx, bool enable) {
+    [[gnu::noinline]] bool SetSceneEnabled(int sceneIdx, bool enable) {
         if (sceneIdx < 0 || sceneIdx >= kMaxScenes) return false;
         if (scenes[(size_t)sceneIdx].enabled == enable) return true;
         if (!enable) {
@@ -321,12 +328,12 @@ struct AppState {
         return SetSceneEnabled(sceneIdx, !scenes[(size_t)sceneIdx].enabled);
     }
 
-    void ClearSceneSlots(int sceneIdx) {
+    [[gnu::noinline]] void ClearSceneSlots(int sceneIdx) {
         if (sceneIdx < 0 || sceneIdx >= kMaxScenes) return;
         for (auto& s : scenes[(size_t)sceneIdx].slots) s.clear();
     }
 
-    int CountMountedInScene(int sceneIdx) const {
+    [[gnu::noinline]] int CountMountedInScene(int sceneIdx) const {
         if (sceneIdx < 0 || sceneIdx >= kMaxScenes) return 0;
         int n = 0;
         for (const auto& s : scenes[(size_t)sceneIdx].slots) {
@@ -387,7 +394,7 @@ struct AppState {
         return true;
     }
 
-    bool IsMountedInAnyEnabledScene(const std::wstring& id) const {
+    [[gnu::noinline]] bool IsMountedInAnyEnabledScene(const std::wstring& id) const {
         if (id.empty()) return false;
         for (int s = 0; s < kMaxScenes; ++s) {
             if (scenes[(size_t)s].enabled && FindSlotOfIdInScene(s, id) >= 0) return true;
@@ -396,7 +403,7 @@ struct AppState {
     }
 
     // Counts how many OTHER enabled scenes (excluding `excludeSceneIdx`, or activeScene if < 0) contain `id`.
-    int CountOtherEnabledScenesWithId(const std::wstring& id, int* outFirstScene = nullptr, int* outFirstSlot = nullptr, int excludeSceneIdx = -1) const {
+    [[gnu::noinline]] int CountOtherEnabledScenesWithId(const std::wstring& id, int* outFirstScene = nullptr, int* outFirstSlot = nullptr, int excludeSceneIdx = -1) const {
         if (outFirstScene) *outFirstScene = -1;
         if (outFirstSlot) *outFirstSlot = -1;
         if (id.empty() || !IsMultiSceneActive()) return 0;
@@ -1332,6 +1339,9 @@ public:
 
 class StorageManager {
 public:
+    [[gnu::noinline]] StorageManager() = default;
+    [[gnu::noinline]] ~StorageManager() = default;
+
     static constexpr size_t kMaxDataFileBytes = 32 * 1024 * 1024;
 
     std::wstring dataDir;

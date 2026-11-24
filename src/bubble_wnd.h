@@ -13,6 +13,9 @@ namespace pp {
 // Pure mouse-passthrough (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE) full-text hover preview bubble
 class HoverBubbleWindow {
 public:
+    [[gnu::noinline]] HoverBubbleWindow() = default;
+    [[gnu::noinline]] ~HoverBubbleWindow() = default;
+
     HWND hwnd = nullptr;
     LayeredCanvas canvas;
 
@@ -24,8 +27,10 @@ public:
     ComPtr<IDWriteTextLayout> bodyLayout;
 
     float dpiScale = 1.0f;
-    Spring1D alphaSpring{};
-    Spring1D ySpring{};
+    Spring1D alphaSpring = Spring1D::Snappy(0.0f);
+    Spring1D ySpring = Spring1D::Fluid(0.0f);
+    Spring1D heightSpring = Spring1D::Fluid(120.0f);
+    float contentAlpha = 1.0f;
 
     int currentSlot = -1;
     std::wstring currentId;
@@ -86,10 +91,10 @@ public:
         );
         if (!hwnd) return false;
 
-        alphaSpring.stiffness = 620.0f;
-        alphaSpring.damping = 49.8f;
-        ySpring.stiffness = 580.0f;
-        ySpring.damping = 48.2f;
+        alphaSpring = Spring1D::Snappy(0.0f);
+        ySpring = Spring1D::Fluid(0.0f);
+        heightSpring = Spring1D::Fluid(120.0f);
+        contentAlpha = 1.0f;
         return true;
     }
 
@@ -109,6 +114,7 @@ public:
         }
         consecutiveRenderFails = 0;
         alphaSpring.Snap(0.0f);
+        contentAlpha = 1.0f;
         StopTimer();
         if (shown) {
             ShowWindow(hwnd, SW_HIDE);
@@ -119,6 +125,10 @@ public:
 
     void HideSmooth() {
         if (!hwnd || !shown || alphaSpring.target == 0.0f) return;
+        if (Motion::IsReducedMotion()) {
+            HideImmediate();
+            return;
+        }
         currentSlot = -1;
         alphaSpring.target = 0.0f;
         StartTimer();
@@ -178,17 +188,26 @@ public:
         int clampedCardTopY = std::clamp(idealCardTopY, (int)work.top + 8, std::max((int)work.top + 8, (int)work.bottom - cardHPx - 8));
         int targetWinY = clampedCardTopY - padPx;
 
-        if (!shown || alphaSpring.value <= 0.02f) {
+        bool reduced = Motion::IsReducedMotion();
+        bool freshOpen = (!shown || alphaSpring.value <= 0.02f);
+        if (freshOpen || reduced) {
             ySpring.Snap((float)targetWinY);
-            // Seed above RenderFrame's 0.004 threshold so the initial frame actually renders and resizes the HWND!
-            if (alphaSpring.value <= 0.01f) {
-                alphaSpring.value = 0.02f;
+            heightSpring.Snap(cardHeightDip);
+            contentAlpha = 1.0f;
+            if (reduced) {
+                alphaSpring.Snap(1.0f);
+            } else {
+                // Seed above RenderFrame's 0.004 threshold so the initial frame actually renders and resizes the HWND!
+                if (alphaSpring.value <= 0.01f) alphaSpring.value = 0.05f;
+                alphaSpring.target = 1.0f;
             }
         } else {
             ySpring.target = (float)targetWinY;
+            heightSpring.target = cardHeightDip;
+            if (contentChanged) contentAlpha = 0.14f;
+            alphaSpring.target = 1.0f;
         }
 
-        alphaSpring.target = 1.0f;
         consecutiveRenderFails = 0;
         if (!shown) {
             if (!RenderFrame()) {
@@ -207,7 +226,11 @@ public:
                 }
             }
         }
-        StartTimer();
+        if (!alphaSpring.IsSettled() || !ySpring.IsSettled() || !heightSpring.IsSettled() || contentAlpha < 0.995f) {
+            StartTimer();
+        } else {
+            StopTimer();
+        }
     }
 
 private:
@@ -262,11 +285,26 @@ private:
         cardHeightDip = headerH + 10.0f + bodyDrawHeightDip + bottomPad;
     }
 
+    [[gnu::noinline]] void SnapOrHide() {
+        StopTimer();
+        if (alphaSpring.target == 0.0f) {
+            HideImmediate();
+        } else {
+            alphaSpring.Snap(alphaSpring.target);
+            ySpring.Snap(ySpring.target);
+            heightSpring.Snap(heightSpring.target);
+            contentAlpha = 1.0f;
+            RenderFrame();
+        }
+    }
+
     void StartTimer() {
         if (!animActive) {
             QueryPerformanceCounter(&lastQpc);
             if (SetTimer(hwnd, kTimerAnim, 10, nullptr) != 0) {
                 animActive = true;
+            } else {
+                SnapOrHide();
             }
         }
     }
@@ -285,7 +323,9 @@ private:
         lastQpc = now;
 
         bool movingA = alphaSpring.Step(dt);
-        bool movingY = ySpring.Step(dt);
+        bool movingY = ySpring.Step(dt, 0.25f, 1.5f);
+        bool movingH = heightSpring.Step(dt, 0.25f, 1.5f);
+        bool movingC = Motion::ExpApproach(contentAlpha, 1.0f, 22.0f, dt);
 
         if (alphaSpring.target == 0.0f && alphaSpring.value <= 0.008f) {
             HideImmediate();
@@ -294,7 +334,7 @@ private:
 
         if (RenderFrame()) {
             consecutiveRenderFails = 0;
-            if (!movingA && !movingY) {
+            if (!movingA && !movingY && !movingH && !movingC) {
                 StopTimer();
             }
         } else {
@@ -306,112 +346,94 @@ private:
     }
 
     bool RenderFrame() {
-        float a = std::clamp(alphaSpring.value, 0.0f, 1.0f);
-        if (a <= 0.004f) return false;
+        float aRaw = std::clamp(alphaSpring.value, 0.0f, 1.0f);
+        if (aRaw <= 0.004f) return false;
+        float a = Motion::EaseOutCubic(aRaw);
+        float ca = a * std::clamp(contentAlpha, 0.0f, 1.0f);
 
+        float drawCardH = std::max(60.0f, heightSpring.value);
         float totalWDip = cardWidthDip + kPad * 2.0f;
-        float totalHDip = cardHeightDip + kPad * 2.0f;
+        float totalHDip = drawCardH + kPad * 2.0f;
         int wPx = (int)std::ceil(totalWDip * dpiScale);
         int hPx = (int)std::ceil(totalHDip * dpiScale);
 
         if (!canvas.Begin(wPx, hPx, dpiScale)) return false;
         auto* rt = canvas.rt.Get();
 
-        D2D1_RECT_F box = D2D1::RectF(kPad, kPad, kPad + cardWidthDip, kPad + cardHeightDip);
-
-        // Ambient floating shadow
-        DrawAmbientShadow(rt, canvas.Brush(D2D1::ColorF(0, 0, 0, 1)), box, 11.0f, a);
-
-        // Deep obsidian frosted body
-        {
-            D2D1_GRADIENT_STOP stops[2] = {
-                { 0.0f, Rgba(0x171B26, 0.97f * a) },
-                { 1.0f, Rgba(0x0E1118, 0.98f * a) }
-            };
-            ComPtr<ID2D1GradientStopCollection> coll;
-            if (SUCCEEDED(rt->CreateGradientStopCollection(stops, 2, coll.GetAddressOf()))) {
-                ComPtr<ID2D1LinearGradientBrush> bgGrad;
-                rt->CreateLinearGradientBrush(
-                    D2D1::LinearGradientBrushProperties(D2D1::Point2F(box.left, box.top), D2D1::Point2F(box.left, box.bottom)),
-                    coll.Get(), bgGrad.GetAddressOf());
-                if (bgGrad) rt->FillRoundedRectangle(D2D1::RoundedRect(box, 11.0f, 11.0f), bgGrad.Get());
-            }
-        }
-
-        DrawTopLitBorder(rt, box, 11.0f, Rgba(0x93C5FD, 0.25f * a), Rgba(0xFFFFFF, 0.07f * a), 1.0f);
+        D2D1_RECT_F box = D2D1::RectF(kPad, kPad, kPad + cardWidthDip, kPad + drawCardH);
 
         // Directional glowing tether notch aligned with hovered slot Y
         int curWinY = (int)std::round(ySpring.value);
         float localSlotY = (float)(slotCenterScreenY - curWinY) / dpiScale;
-        float notchCenterY = std::clamp(localSlotY, box.top + 22.0f, box.bottom - 22.0f);
+        float notchCenterY = std::clamp(localSlotY, box.top + 22.0f, std::max(box.top + 22.0f, box.bottom - 22.0f));
         float notchX = placeOnLeft ? (box.right - 1.5f) : (box.left - 1.0f);
-        D2D1_RECT_F notch = D2D1::RectF(notchX, notchCenterY - 8.5f, notchX + 2.5f, notchCenterY + 8.5f);
-        rt->FillRoundedRectangle(D2D1::RoundedRect(notch, 1.2f, 1.2f), canvas.Brush(Rgba(Theme::AccentCyan, 0.92f * a)));
+
+        // Subtle scale anchored toward the dock tether notch for organic emerge/retreat
+        if (!Motion::IsReducedMotion() && aRaw < 0.998f) {
+            float sc = 0.968f + 0.032f * a;
+            float anchorX = placeOnLeft ? box.right : box.left;
+            rt->SetTransform(D2D1::Matrix3x2F::Scale(sc, sc, D2D1::Point2F(anchorX, notchCenterY)) *
+                             D2D1::Matrix3x2F::Scale(dpiScale, dpiScale));
+        }
+
+        auto* br = canvas.solidBrush.Get();
+        // Ambient floating shadow
+        DrawAmbientShadow(rt, br, box, 11.0f, a);
+
+        // Deep obsidian frosted body (shared gradient helper)
+        FillRoundedGradient(rt, box, 11.0f, Rgba(0x171B26, 0.97f * a), Rgba(0x0E1118, 0.98f * a));
+        DrawTopLitBorder(rt, box, 11.0f, Rgba(0x93C5FD, 0.25f * a), Rgba(0xFFFFFF, 0.07f * a), 1.0f);
+
+        FillRRHex(rt, br, D2D1::RectF(notchX, notchCenterY - 8.5f, notchX + 2.5f, notchCenterY + 8.5f), 1.2f, Theme::AccentCyan, 0.92f * a);
 
         // Header bar: Slot index pill + Full Title + Char count
         D2D1_RECT_F slotPill = D2D1::RectF(box.left + 12.0f, box.top + 9.0f, box.left + 38.0f, box.top + 27.0f);
-        rt->FillRoundedRectangle(D2D1::RoundedRect(slotPill, 4.5f, 4.5f), canvas.Brush(Rgba(Theme::AccentCyan, 0.15f * a)));
-        if (fmtSlotTag && currentSlot >= 0) {
+        FillRRHex(rt, br, slotPill, 4.5f, Theme::AccentCyan, 0.15f * ca);
+        if (currentSlot >= 0) {
             wchar_t sb[8]{};
             wsprintfW(sb, L"%02d", currentSlot + 1);
-            rt->DrawTextW(sb, 2, fmtSlotTag.Get(), slotPill, canvas.Brush(Rgba(Theme::AccentCyan, 0.96f * a)));
+            DrawTextHex(rt, br, fmtSlotTag.Get(), slotPill, sb, 2, Theme::AccentCyan, 0.96f * ca);
         }
 
         wchar_t metaBuf[32]{};
         wsprintfW(metaBuf, L"%u \u5B57", (unsigned)charCount);
         std::wstring metaStr = UiText(metaBuf);
-        if (fmtMeta) {
-            rt->DrawTextW(metaStr.c_str(), (UINT32)metaStr.size(), fmtMeta.Get(),
-                          D2D1::RectF(box.right - 74.0f, box.top + 7.0f, box.right - 13.0f, box.top + 29.0f),
-                          canvas.Brush(Rgba(Theme::TextMuted, 0.90f * a)));
-        }
-
-        if (fmtTitle) {
-            rt->DrawTextW(titleText.c_str(), (UINT32)titleText.size(), fmtTitle.Get(),
-                          D2D1::RectF(slotPill.right + 8.0f, box.top + 7.0f, box.right - 78.0f, box.top + 29.0f),
-                          canvas.Brush(Rgba(Theme::TextPrimary, 0.98f * a)));
-        }
+        DrawTextHex(rt, br, fmtMeta.Get(), D2D1::RectF(box.right - 74.0f, box.top + 7.0f, box.right - 13.0f, box.top + 29.0f),
+                    metaStr.c_str(), (UINT32)metaStr.size(), Theme::TextMuted, 0.90f * ca);
+        DrawTextHex(rt, br, fmtTitle.Get(), D2D1::RectF(slotPill.right + 8.0f, box.top + 7.0f, box.right - 78.0f, box.top + 29.0f),
+                    titleText.c_str(), (UINT32)titleText.size(), Theme::TextPrimary, 0.98f * ca);
 
         // Subtle divider
         float divY = box.top + 35.0f;
         rt->DrawLine(D2D1::Point2F(box.left + 12.0f, divY), D2D1::Point2F(box.right - 12.0f, divY),
                      canvas.Brush(Rgba(0xFFFFFF, 0.06f * a)), 1.0f);
 
-        // Full-text body layout (clipped cleanly if overflowing)
+        // Full-text body layout (clipped cleanly to the live morphing box height)
         float bodyTop = divY + 9.0f;
-        D2D1_RECT_F bodyClip = D2D1::RectF(box.left + 14.0f, bodyTop, box.right - 14.0f, bodyTop + bodyDrawHeightDip);
+        float maxClipBot = box.bottom - (isOverflow ? 30.0f : 12.0f);
+        float clipBot = std::max(bodyTop + 4.0f, std::min(bodyTop + bodyDrawHeightDip, maxClipBot));
+        D2D1_RECT_F bodyClip = D2D1::RectF(box.left + 14.0f, bodyTop, box.right - 14.0f, clipBot);
         rt->PushAxisAlignedClip(bodyClip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         if (bodyLayout) {
             rt->DrawTextLayout(D2D1::Point2F(bodyClip.left, bodyClip.top), bodyLayout.Get(),
-                               canvas.Brush(Rgba(0xE2E8F0, 0.94f * a)));
+                               canvas.Brush(Rgba(0xE2E8F0, 0.94f * ca)));
         }
-        if (isOverflow) {
-            // Smooth bottom fade-out gradient veil
+        if (isOverflow && (clipBot - bodyTop) > 20.0f) {
             D2D1_RECT_F fadeRect = D2D1::RectF(box.left + 2.0f, bodyClip.bottom - 42.0f, box.right - 2.0f, bodyClip.bottom + 1.0f);
-            D2D1_GRADIENT_STOP fStops[2] = {
-                { 0.0f, Rgba(0x10131B, 0.0f) },
-                { 1.0f, Rgba(0x0E1118, 0.98f * a) }
-            };
-            ComPtr<ID2D1GradientStopCollection> fColl;
-            if (SUCCEEDED(rt->CreateGradientStopCollection(fStops, 2, fColl.GetAddressOf()))) {
-                ComPtr<ID2D1LinearGradientBrush> fGrad;
-                rt->CreateLinearGradientBrush(
-                    D2D1::LinearGradientBrushProperties(D2D1::Point2F(0, fadeRect.top), D2D1::Point2F(0, fadeRect.bottom)),
-                    fColl.Get(), fGrad.GetAddressOf());
-                if (fGrad) rt->FillRectangle(fadeRect, fGrad.Get());
-            }
+            FillRoundedGradient(rt, fadeRect, 0.0f, Rgba(0x10131B, 0.0f), Rgba(0x0E1118, 0.98f * a));
         }
         rt->PopAxisAlignedClip();
 
-        if (isOverflow && fmtFootHint) {
-            std::wstring fhStr = UiText(L"\u4EC5\u663E\u793A\u524D\u6BB5 \u00B7 \u5DE6\u952E\u590D\u5236\u5168\u6587\uFF0C\u53F3\u952E\u7F16\u8F91");
-            rt->DrawTextW(fhStr.c_str(), (UINT32)fhStr.size(), fmtFootHint.Get(),
-                          D2D1::RectF(box.left + 12.0f, box.bottom - 26.0f, box.right - 12.0f, box.bottom - 6.0f),
-                          canvas.Brush(Rgba(Theme::AccentCyan, 0.88f * a)));
+        if (isOverflow && box.bottom - box.top > 72.0f) {
+            std::wstring fhStr = UiText(L"\u4EC5\u663E\u793A\u524D\u6BB5 \u00B7 \u5DE6\u952E\u590D\u5236\u5168\u6587\xFF0C\x53F3\x952E\x7F16\x8F91");
+            DrawTextHex(rt, br, fmtFootHint.Get(), D2D1::RectF(box.left + 12.0f, box.bottom - 26.0f, box.right - 12.0f, box.bottom - 6.0f),
+                        fhStr.c_str(), (UINT32)fhStr.size(), Theme::AccentCyan, 0.88f * ca);
         }
 
-        // Subtle horizontal micro-glide toward the dock as it fades in
-        int glideOffsetPx = (int)std::round((placeOnLeft ? 6.0f : -6.0f) * (1.0f - a) * dpiScale);
+        // Subtle horizontal micro-glide toward the dock as it fades in/out (zero shift in Reduced Motion)
+        int glideOffsetPx = Motion::IsReducedMotion()
+            ? 0
+            : (int)std::round((placeOnLeft ? 6.0f : -6.0f) * (1.0f - a) * dpiScale);
         int winX = anchorScreenX + glideOffsetPx;
         if (!canvas.EndAndPresent(hwnd, winX, curWinY)) {
             DiagLogger::Instance().LogFmt("ERROR", "BUBBLE",
@@ -441,6 +463,10 @@ private:
                 return HTTRANSPARENT;
             case WM_MOUSEACTIVATE:
                 return MA_NOACTIVATE;
+            case WM_SETTINGCHANGE:
+                Motion::RefreshSystemReducedMotion();
+                if (Motion::IsReducedMotion() && self->shown) self->SnapOrHide();
+                return 0;
             case WM_TIMER:
                 if (wp == kTimerAnim) self->OnTick();
                 return 0;
