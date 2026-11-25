@@ -7566,12 +7566,12 @@ private:
                 DrawRowDivider(g, ry, settingsViewport);
 
                 // Row 4.3: 内置提示词致谢（数字生命卡兹克 X & GitHub 点击跳转）
-                DrawRowText(g, ry, 74.0f, 224.0f, settingsViewport, L"内置提示词致谢",
+                DrawRowText(g, ry, 74.0f, 294.0f, settingsViewport, L"内置提示词致谢",
                             L"内置 12 条精选默认 Prompt 均整理自「数字生命卡兹克」的公开分享，特此致谢");
                 if (ry + 74.0f >= settingsViewport.top && ry <= settingsViewport.bottom) {
                     float bt = ry + 23.0f, bb = ry + 51.0f;
-                    DrawClippedPresetBtn(g.right - 214.0f, bt, g.right - 130.0f, bb, 64, L"卡兹克 X",      5, settingsViewport);
-                    DrawClippedPresetBtn(g.right - 124.0f, bt, g.right - 16.0f,  bb, 65, L"卡兹克 GitHub", 5, settingsViewport);
+                    DrawClippedPresetBtn(g.right - 284.0f, bt, g.right - 166.0f, bb, 64, L"数字生命卡兹克 X",      5, settingsViewport);
+                    DrawClippedPresetBtn(g.right - 160.0f, bt, g.right - 16.0f,  bb, 65, L"数字生命卡兹克 GitHub", 5, settingsViewport);
                 }
             }
 
@@ -7904,12 +7904,12 @@ private:
             }
             case 64: {
                 INT_PTR r = reinterpret_cast<INT_PTR>(ShellExecuteW(hwnd, L"open", APP_KHAZIX_X_URL_W, nullptr, nullptr, SW_SHOWNORMAL));
-                if (r <= 32) ShowToast(L"打开卡兹克 X 主页失败", true);
+                if (r <= 32) ShowToast(L"打开数字生命卡兹克 X 主页失败", true);
                 break;
             }
             case 65: {
                 INT_PTR r = reinterpret_cast<INT_PTR>(ShellExecuteW(hwnd, L"open", APP_KHAZIX_GH_URL_W, nullptr, nullptr, SW_SHOWNORMAL));
-                if (r <= 32) ShowToast(L"打开卡兹克 GitHub 主页失败", true);
+                if (r <= 32) ShowToast(L"打开数字生命卡兹克 GitHub 主页失败", true);
                 break;
             }
             case 17: {

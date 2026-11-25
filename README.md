@@ -41,8 +41,8 @@ Windows 10 / 11 超轻量贴边 Prompt 一键复制桌面小工具（纯原生 `
 
 本软件默认内置的 12 条精选 Prompt（10 条指挥 AI Agent 深度思考与工程复盘提示词 + 2 条产品用户体验与苹果级动效审查提示词）均整理自知名 AI 创作者**「数字生命卡兹克」**的公开分享，特此向原作者致谢（软件「设置 -> 帮助与反馈 -> 内置提示词致谢」中亦提供一键直达入口）：
 
-- **卡兹克 X（Twitter）**：https://x.com/Khazix0918
-- **卡兹克 GitHub**：https://github.com/KKKKhazix
+- **数字生命卡兹克 X（Twitter）**：https://x.com/Khazix0918
+- **数字生命卡兹克 GitHub**：https://github.com/KKKKhazix
 
 ## 从源码构建
 
