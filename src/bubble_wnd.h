@@ -58,7 +58,6 @@ public:
 
     int dockAnchorCardEdgePx = 0; // Right card edge in screen px when placeOnLeft; left card edge when !placeOnLeft
     RECT workAreaScreen{};
-    int slotCenterScreenY = 0;    // Hovered slot vertical center in screen px
 
     LARGE_INTEGER qpcFreq{};
     LARGE_INTEGER lastQpc{};
@@ -193,7 +192,6 @@ public:
 
         currentSlot = slotIdx;
         currentId = item.id;
-        slotCenterScreenY = slotCenterY;
 
         // Determine left vs right placement relative to dockCardScreenRect (clamped inside work area)
         RECT work = GetMonitorWorkAreaForPoint(midPt);
@@ -392,28 +390,17 @@ private:
     }
 
     void StartTimer() {
-        if (!animActive) {
-            QueryPerformanceCounter(&lastQpc);
-            if (SetTimer(hwnd, kTimerAnim, 10, nullptr) != 0) {
-                animActive = true;
-            } else {
-                SnapOrHide();
-            }
+        if (!StartWindowAnimTimer(hwnd, kTimerAnim, animActive, qpcFreq, lastQpc)) {
+            SnapOrHide();
         }
     }
 
     void StopTimer() {
-        if (animActive) {
-            KillTimer(hwnd, kTimerAnim);
-            animActive = false;
-        }
+        StopWindowAnimTimer(hwnd, kTimerAnim, animActive);
     }
 
     void OnTick() {
-        LARGE_INTEGER now{};
-        QueryPerformanceCounter(&now);
-        float dt = (float)(now.QuadPart - lastQpc.QuadPart) / (float)qpcFreq.QuadPart;
-        lastQpc = now;
+        float dt = StepDeltaQpc(qpcFreq, lastQpc);
 
         bool movingA = alphaSpring.Step(dt);
         bool movingY = ySpring.Step(dt, 0.25f, 1.5f);

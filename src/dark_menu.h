@@ -331,7 +331,6 @@ public:
 
     bool IsOpen() const { return visible; }
     bool IsOpenFor(MenuOwner targetOwner) const { return visible && owner == targetOwner; }
-    MenuOwner CurrentOwner() const { return visible ? owner : MenuOwner::None; }
 
     bool HandleForwardedKey(WPARAM vk) {
         if (!visible) return false;
@@ -506,20 +505,13 @@ private:
     }
 
     void EnsureAnimTimer() {
-        if (!hwnd || animActive) return;
-        QueryPerformanceCounter(&lastAnimQpc);
-        if (SetTimer(hwnd, kTimerAnim, 10, nullptr) != 0) {
-            animActive = true;
-        } else {
+        if (!StartWindowAnimTimer(hwnd, kTimerAnim, animActive, qpcFreq, lastAnimQpc)) {
             SnapAllAnims();
         }
     }
 
     void StopAnimTimer() {
-        if (animActive && hwnd) {
-            KillTimer(hwnd, kTimerAnim);
-            animActive = false;
-        }
+        StopWindowAnimTimer(hwnd, kTimerAnim, animActive);
     }
 
     void SetHoverIndex(int newHover) {

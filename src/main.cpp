@@ -1330,13 +1330,32 @@ inline int RunHeadlessSelfTest(const std::wstring& testRootDir) {
         }
         AutoStart::SetEnabled(false, staleRegVal);
 
-        // 9b. VaultWindow::ReorderVaultItemOnly must reorder vault WITHOUT mutating active slots!
-        AppState decSt{};
-        StorageManager::SeedDefaults(decSt, false);
-        auto origSlots = decSt.ActiveSlots();
-        if (!VaultWindow::ReorderVaultItemOnly(decSt, 0, 1)) return 139;
-        if (decSt.vault[0].id != L"seed_02" || decSt.vault[1].id != L"seed_01" || decSt.ActiveSlots() != origSlots) {
-            return 140;
+        // 9b. VaultWindow All-view drag-to-reorder must reorder vault WITHOUT mutating active slots!
+        {
+            StorageManager decSm;
+            decSm.Init(testDir + L"\\vault_decouple_case");
+            AppState decSt{};
+            if (!decSm.LoadOrSeed(decSt)) return 139;
+            auto origSlots = decSt.ActiveSlots();
+            VaultWindow vwDec;
+            vwDec.Init(GetModuleHandleW(nullptr), &decSt, &decSm, nullptr, nullptr);
+            vwDec.hwnd = CreateWindowExW(0, L"PromptPod_VaultWnd", L"DecTest", WS_POPUP, 0, 0, 760, 580, nullptr, nullptr, GetModuleHandleW(nullptr), &vwDec);
+            if (!vwDec.hwnd) return 139;
+            vwDec.dpiScale = 1.0f;
+            vwDec.activeTab = 0;
+            vwDec.vaultFilter = -1;
+            vwDec.vaultListTopDip = 110.0f;
+            vwDec.InvalidateCaches();
+            if (!vwDec.BeginVaultDragForRow(0, 140.0f, 110.0f)) { DestroyWindow(vwDec.hwnd); return 139; }
+            SendMessageW(vwDec.hwnd, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(100, 216));
+            // Mid-drag must NEVER mutate AppState
+            if (!vwDec.isVaultDragging || decSt.vault[0].id != L"seed_01") { DestroyWindow(vwDec.hwnd); return 140; }
+            SendMessageW(vwDec.hwnd, WM_LBUTTONUP, 0, MAKELPARAM(100, 216));
+            DestroyWindow(vwDec.hwnd);
+            if (decSt.vault[0].id != L"seed_02" || decSt.vault[1].id != L"seed_01" || decSt.ActiveSlots() != origSlots) {
+                return 140;
+            }
+            DiagLogger::Instance().Init(sm.dataDir);
         }
 
         // 9c. VaultWindow DeletePromptWithUndo + UndoLastDelete + DuplicatePrompt
@@ -2067,14 +2086,30 @@ inline int RunHeadlessSelfTest(const std::wstring& testRootDir) {
                 Motion::SetReducedMotionOverride(-1);
                 return 244;
             }
-            // Transactional vault card drag rollback restores original vault order
+            // Transactional vault card drag: preview buffer moves while AppState stays strictly unmutated; shortcuts blocked; Esc cancels
             std::wstring firstId = vSt.vault[0].id;
-            vw12.vaultDragOrigIdx = 0;
-            vw12.vaultDragIdx = 2;
+            vw12.activeTab = 0;
+            vw12.vaultFilter = -1;
+            vw12.InvalidateCaches();
+            if (!vw12.BeginVaultDragForRow(0, 140.0f, 110.0f)) {
+                Motion::SetReducedMotionOverride(-1);
+                return 245;
+            }
             vw12.isVaultDragging = true;
-            VaultWindow::ReorderVaultItemOnly(vSt, 0, 2);
-            vw12.CancelVaultDrag(true);
-            if (vw12.isVaultDragging || vSt.vault[0].id != firstId) {
+            vw12.vaultDragCurDipY = vw12.vaultListTopDip + 2.0f * 76.0f;
+            vw12.StepVaultDragReorder();
+            if (vw12.vaultDragRow != 2 || vw12.vaultDragPreviewOrder.size() < 3 ||
+                vSt.vault[vw12.vaultDragPreviewOrder[2]].id != firstId ||
+                vSt.vault[0].id != firstId) {
+                Motion::SetReducedMotionOverride(-1);
+                return 245;
+            }
+            // Shortcuts like Enter must be blocked during drag; Esc must cancel cleanly
+            if (!vw12.HandleShortcutKey(VK_RETURN, false) || !vw12.isVaultDragging) {
+                Motion::SetReducedMotionOverride(-1);
+                return 245;
+            }
+            if (!vw12.HandleShortcutKey(VK_ESCAPE, false) || vw12.isVaultDragging || vSt.vault[0].id != firstId) {
                 Motion::SetReducedMotionOverride(-1);
                 return 245;
             }
@@ -2222,6 +2257,372 @@ inline int RunHeadlessSelfTest(const std::wstring& testRootDir) {
         CoUninitialize();
         Motion::SetReducedMotionOverride(-1);
         if (bErr != 0) return bErr;
+    }
+
+    // 14. v0.14.0 regression: VaultWindow scene/unmounted drag-to-reorder & ScenePromptsDialog cross-pane drag-and-drop + status toggle
+    {
+        Motion::SetReducedMotionOverride(0);
+        StorageManager sm14;
+        sm14.Init(testDir + L"\\v14_case");
+        AppState st14{};
+        StorageManager::SeedDefaults(st14, false);
+        // Set up Scene 0 ("通用") with sparse slots: 00=seed_01, 02=seed_02, 05=seed_03 (gaps at 01, 03, 04 must be preserved!)
+        st14.ClearSceneSlots(0);
+        st14.scenes[0].slots[0] = L"seed_01";
+        st14.scenes[0].slots[2] = L"seed_02";
+        st14.scenes[0].slots[5] = L"seed_03";
+        sm14.Save(st14);
+
+        // 14a. VaultWindow scene/unmounted drag-to-reorder via real hidden HWND (private preview buffer, EN_CHANGE cancel, disk commit, read-only failure)
+        {
+            VaultWindow vw14;
+            int stateChangeCalls = 0;
+            vw14.Init(GetModuleHandleW(nullptr), &st14, &sm14, nullptr, [&]() { ++stateChangeCalls; });
+            vw14.hwnd = CreateWindowExW(0, L"PromptPod_VaultWnd", L"V14Test", WS_POPUP, 0, 0, 760, 580,
+                                        nullptr, nullptr, GetModuleHandleW(nullptr), &vw14);
+            if (!vw14.hwnd) return 270;
+            vw14.CreateSearchControl();
+            vw14.dpiScale = 1.0f;
+            vw14.activeTab = 0;
+            vw14.vaultFilter = 0; // Scene 0 ("通用")
+            vw14.vaultListTopDip = 110.0f;
+            vw14.InvalidateCaches();
+            vw14.EnsureVaultCache();
+            if (vw14.cachedFilteredIndices.size() != 3) { DestroyWindow(vw14.hwnd); return 270; }
+
+            // (1) Drag row 2 (seed_03 in slot 05) up to row 0 -> preview updates while AppState stays untouched; EN_CHANGE cancels cleanly
+            if (!vw14.BeginVaultDragForRow(2, 290.0f, 262.0f)) { DestroyWindow(vw14.hwnd); return 271; }
+            SendMessageW(vw14.hwnd, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(120, 128));
+            if (!vw14.isVaultDragging || vw14.vaultDragRow != 0 ||
+                vw14.vaultDragPreviewSlots[0] != L"seed_03" || !vw14.vaultDragPreviewSlots[1].empty() ||
+                vw14.vaultDragPreviewSlots[2] != L"seed_01" || vw14.vaultDragPreviewSlots[5] != L"seed_02" ||
+                st14.scenes[0].slots[0] != L"seed_01") { // AppState MUST remain untouched mid-drag!
+                DestroyWindow(vw14.hwnd);
+                return 272;
+            }
+            SetWindowTextW(vw14.hSearchEdit, L"x"); // Fires EN_CHANGE -> MUST cancel drag without mutating state!
+            if (vw14.isVaultDragging || st14.scenes[0].slots[0] != L"seed_01" || stateChangeCalls != 0) {
+                DestroyWindow(vw14.hwnd);
+                return 273;
+            }
+            SetWindowTextW(vw14.hSearchEdit, L"");
+
+            // (2) Full DOWN->MOVE->UP commit in Scene 0 sparse slots + verify disk persistence + onStateChanged
+            if (!vw14.BeginVaultDragForRow(2, 290.0f, 262.0f)) { DestroyWindow(vw14.hwnd); return 271; }
+            SendMessageW(vw14.hwnd, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(120, 128));
+            SendMessageW(vw14.hwnd, WM_LBUTTONUP, 0, MAKELPARAM(120, 128));
+            if (st14.scenes[0].slots[0] != L"seed_03" || !st14.scenes[0].slots[1].empty() ||
+                st14.scenes[0].slots[2] != L"seed_01" || !st14.scenes[0].slots[3].empty() ||
+                !st14.scenes[0].slots[4].empty() || st14.scenes[0].slots[5] != L"seed_02" ||
+                stateChangeCalls != 1) {
+                DestroyWindow(vw14.hwnd);
+                return 272;
+            }
+            {
+                AppState diskCheck{};
+                if (!sm14.LoadOrSeed(diskCheck) || diskCheck.scenes[0].slots[0] != L"seed_03" || diskCheck.scenes[0].slots[5] != L"seed_02") {
+                    DestroyWindow(vw14.hwnd);
+                    return 272;
+                }
+            }
+
+            // (3) Non-active enabled Scene 1 ("产品") drag commit must NOT alter activeSceneIndex (0)
+            st14.activeSceneIndex = 0;
+            vw14.vaultFilter = 1;
+            vw14.InvalidateCaches();
+            vw14.EnsureVaultCache();
+            if (vw14.cachedFilteredIndices.size() != 2 || !vw14.BeginVaultDragForRow(0, 130.0f, 110.0f)) {
+                DestroyWindow(vw14.hwnd);
+                return 274;
+            }
+            SendMessageW(vw14.hwnd, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(120, 210));
+            SendMessageW(vw14.hwnd, WM_LBUTTONUP, 0, MAKELPARAM(120, 210));
+            if (st14.scenes[1].slots[0] != L"seed_12" || st14.scenes[1].slots[1] != L"seed_11" ||
+                st14.activeSceneIndex != 0 || stateChangeCalls != 2) {
+                DestroyWindow(vw14.hwnd);
+                return 274;
+            }
+
+            // (4) Unmounted-filtered drag commits ONLY unmounted vault items without moving mounted items or calling onStateChanged
+            vw14.vaultFilter = -2;
+            vw14.InvalidateCaches();
+            vw14.EnsureVaultCache();
+            if (vw14.cachedFilteredIndices.size() < 3) { DestroyWindow(vw14.hwnd); return 275; }
+            size_t u0Idx = vw14.cachedFilteredIndices[0];
+            size_t u1Idx = vw14.cachedFilteredIndices[1];
+            std::wstring u0Id = st14.vault[u0Idx].id;
+            std::wstring u1Id = st14.vault[u1Idx].id;
+            std::wstring mountedZeroId = st14.vault[0].id;
+            if (!vw14.BeginVaultDragForRow(0, 130.0f, 110.0f)) { DestroyWindow(vw14.hwnd); return 275; }
+            SendMessageW(vw14.hwnd, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(120, 210));
+            if (st14.vault[u0Idx].id != u0Id) { DestroyWindow(vw14.hwnd); return 276; } // Unmutated mid-drag!
+            SendMessageW(vw14.hwnd, WM_LBUTTONUP, 0, MAKELPARAM(120, 210));
+            if (st14.vault[u0Idx].id != u1Id || st14.vault[u1Idx].id != u0Id ||
+                st14.vault[0].id != mountedZeroId || stateChangeCalls != 2) {
+                DestroyWindow(vw14.hwnd);
+                return 276;
+            }
+            {
+                AppState diskCheck{};
+                if (!sm14.LoadOrSeed(diskCheck) || diskCheck.vault[u0Idx].id != u1Id || diskCheck.vault[u1Idx].id != u0Id) {
+                    DestroyWindow(vw14.hwnd);
+                    return 276;
+                }
+            }
+
+            // (5) Read-only save failure leaves AppState untouched and displays error toast
+            sm14.readOnlyRecoveryMode = true;
+            vw14.vaultFilter = 0;
+            vw14.InvalidateCaches();
+            if (!vw14.BeginVaultDragForRow(0, 130.0f, 110.0f)) { sm14.readOnlyRecoveryMode = false; DestroyWindow(vw14.hwnd); return 277; }
+            SendMessageW(vw14.hwnd, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(120, 210));
+            SendMessageW(vw14.hwnd, WM_LBUTTONUP, 0, MAKELPARAM(120, 210));
+            bool roOk = (st14.scenes[0].slots[0] == L"seed_03" && st14.scenes[0].slots[2] == L"seed_01" &&
+                         stateChangeCalls == 2 && vw14.toastIsError);
+            sm14.readOnlyRecoveryMode = false;
+            DestroyWindow(vw14.hwnd);
+            if (!roOk) return 277;
+
+            // Restore canonical sparse Scene 0 layout for 14b
+            st14.ClearSceneSlots(0);
+            st14.scenes[0].slots[0] = L"seed_01";
+            st14.scenes[0].slots[2] = L"seed_02";
+            st14.scenes[0].slots[5] = L"seed_03";
+            sm14.Save(st14);
+        }
+
+        // 14b. ScenePromptsDialog full cross-pane drag-and-drop, boundary guards, Reduced Motion edge-scroll, undo & natural timer settle
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        int dlgErr = 0;
+        {
+            int mutatedCnt = 0;
+            ScenePromptsDialog dlg(GetModuleHandleW(nullptr), &st14, &sm14, nullptr, 0,
+                                   [](void* p) { ++(*static_cast<int*>(p)); }, &mutatedCnt);
+            WNDCLASSEXW wc{};
+            wc.cbSize = sizeof(wc);
+            wc.lpfnWndProc = ScenePromptsDialog::DlgWndProc;
+            wc.hInstance = GetModuleHandleW(nullptr);
+            wc.lpszClassName = L"PromptPod_ScenePromptsDlg_Test";
+            RegisterClassExW(&wc);
+            dlg.dpiScale = 1.0f;
+            dlg.hwnd = CreateWindowExW(0, wc.lpszClassName, L"Test", WS_POPUP, 0, 0, 800, 560, nullptr, nullptr, wc.hInstance, &dlg);
+            if (!dlg.hwnd) {
+                dlgErr = 278;
+            } else {
+                dlg.EnsureResources();
+                LayeredCanvas off;
+                auto paintOff = [&](int w = 800, int h = 560) {
+                    if (off.Begin(w, h, 1.0f)) {
+                        dlg.PaintContent(off.rt.Get(), off.solidBrush.Get(), (float)w, (float)h);
+                        off.rt->EndDraw();
+                    }
+                };
+                paintOff();
+                if (dlg.filteredIndices.size() != 9 || dlg.drawnRightCards.size() < 2) dlgErr = 278;
+
+                // (1) Action buttons inside right card (kind 70 '+ 加入' / kind 71 '编辑') MUST NOT start right-card drag (kind 72)!
+                if (dlgErr == 0) {
+                    const auto& c0 = dlg.drawnRightCards[0].cardRect;
+                    LPARAM lpActBtn = MAKELPARAM((short)(c0.right - 20.0f), (short)((c0.top + c0.bottom) * 0.5f));
+                    SendMessageW(dlg.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lpActBtn);
+                    if (dlg.rightDragPending || dlg.pressedKind != 70) dlgErr = 278;
+                    SendMessageW(dlg.hwnd, WM_CANCELMODE, 0, 0);
+                }
+
+                // (2) Real mouse Right -> Left drag onto empty Left Slot 01 + upward refill shift (+64 DIP)
+                std::wstring dropPid, belowPid;
+                if (dlgErr == 0) {
+                    dropPid = dlg.drawnRightCards[0].pid;
+                    belowPid = dlg.drawnRightCards[1].pid;
+                    const auto& c0 = dlg.drawnRightCards[0].hitRect;
+                    LPARAM lpDown = MAKELPARAM((short)(c0.left + 80.0f), (short)((c0.top + c0.bottom) * 0.5f));
+                    D2D1_RECT_F sl1 = dlg.LeftSlotRectDip(1);
+                    LPARAM lpDrop = MAKELPARAM((short)((sl1.left + sl1.right) * 0.5f), (short)((sl1.top + sl1.bottom) * 0.5f));
+
+                    SendMessageW(dlg.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lpDown);
+                    SendMessageW(dlg.hwnd, WM_MOUSEMOVE, MK_LBUTTON, lpDrop);
+                    if (!dlg.isRightDragging || dlg.rightDragMorphSpring.target < 0.99f ||
+                        dlg.rightDragHoverSlot != 1 || dlg.filteredIndices.size() != 9) {
+                        dlgErr = 279;
+                    }
+                    if (dlgErr == 0) {
+                        SendMessageW(dlg.hwnd, WM_LBUTTONUP, 0, lpDrop);
+                        if (st14.scenes[0].slots[1] != dropPid || mutatedCnt != 1 ||
+                            dlg.isRightDragging || dlg.filteredIndices.size() != 8) {
+                            dlgErr = 280;
+                        }
+                        if (dlgErr == 0 && (std::fabs(dlg.GetRightRowShift(belowPid) - ScenePromptsDialog::kRightStride) > 0.5f || !dlg.animActive)) {
+                            dlgErr = 281;
+                        }
+                    }
+                }
+
+                // (3) Right -> Left drop onto OCCUPIED Left Slot 02 (replaces cleanly, displaced seed_02 fades in smoothly & stays in vault!)
+                if (dlgErr == 0) {
+                    std::wstring dropPid2 = st14.vault[dlg.filteredIndices[0]].id;
+                    if (!dlg.HandleRightCardDropOnSlot(2, dropPid2) ||
+                        st14.scenes[0].slots[2] != dropPid2 || !st14.FindById(L"seed_02") ||
+                        dlg.rightFadeInPid != L"seed_02") {
+                        dlgErr = 282;
+                    }
+                }
+
+                // (4) WM_LBUTTONUP coordinate re-evaluation: hover over left slot on MOVE, then release in right pane -> MUST return, NOT mount!
+                if (dlgErr == 0) {
+                    dlg.rightRowShifts.clear();
+                    dlg.rightFadeInPid.clear();
+                    paintOff();
+                    const auto& c0 = dlg.drawnRightCards[0].hitRect;
+                    LPARAM lpDown = MAKELPARAM((short)(c0.left + 80.0f), (short)((c0.top + c0.bottom) * 0.5f));
+                    D2D1_RECT_F sl4 = dlg.LeftSlotRectDip(4);
+                    LPARAM lpOverLeft = MAKELPARAM((short)((sl4.left + sl4.right) * 0.5f), (short)((sl4.top + sl4.bottom) * 0.5f));
+                    LPARAM lpUpRight = MAKELPARAM(520, 260);
+                    SendMessageW(dlg.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lpDown);
+                    SendMessageW(dlg.hwnd, WM_MOUSEMOVE, MK_LBUTTON, lpOverLeft);
+                    if (dlg.rightDragHoverSlot != 4) dlgErr = 283;
+                    if (dlgErr == 0) {
+                        SendMessageW(dlg.hwnd, WM_LBUTTONUP, 0, lpUpRight);
+                        if (!st14.scenes[0].slots[4].empty() || !dlg.rightDragReturning || dlg.rightDragMorphSpring.target > 0.01f) {
+                            dlgErr = 283;
+                        }
+                    }
+                    dlg.CancelRightDrag();
+                }
+
+                // (5) Left-slot drag: AppState unmutated mid-drag, search-bar (400,80) & out-of-window (900,260) MUST NOT remove,
+                //     no-op drag skips disk write, and valid right-pane drop removes + arms 5s single-slot undo (preserved on save fail!)
+                if (dlgErr == 0) {
+                    paintOff();
+                    std::wstring origSl0 = st14.scenes[0].slots[0];
+                    std::wstring origSl1 = st14.scenes[0].slots[1];
+                    D2D1_RECT_F sl0 = dlg.LeftSlotRectDip(0);
+                    D2D1_RECT_F sl1 = dlg.LeftSlotRectDip(1);
+                    LPARAM lpSl0 = MAKELPARAM((short)((sl0.left + sl0.right) * 0.5f), (short)((sl0.top + sl0.bottom) * 0.5f));
+                    LPARAM lpSl1 = MAKELPARAM((short)((sl1.left + sl1.right) * 0.5f), (short)((sl1.top + sl1.bottom) * 0.5f));
+                    LPARAM lpSearchBar = MAKELPARAM(400, 80);
+                    LPARAM lpOutWin = MAKELPARAM(900, 260);
+                    LPARAM lpRight = MAKELPARAM(540, 260);
+
+                    // 5a. Mid-drag swap stays in preview buffer only; dropping over search bar (400,80) neither removes nor reorders
+                    SendMessageW(dlg.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lpSl0);
+                    SendMessageW(dlg.hwnd, WM_MOUSEMOVE, MK_LBUTTON, lpSl1);
+                    if (!dlg.isSlotDragging || dlg.slotDragPreviewSlots[1] != origSl0 || st14.scenes[0].slots[0] != origSl0) dlgErr = 284;
+                    if (dlgErr == 0) {
+                        SendMessageW(dlg.hwnd, WM_MOUSEMOVE, MK_LBUTTON, lpSearchBar);
+                        if (dlg.slotDragOverRight) dlgErr = 284;
+                        SendMessageW(dlg.hwnd, WM_LBUTTONUP, 0, lpSearchBar);
+                        if (st14.scenes[0].slots[0] != origSl0 || st14.scenes[0].slots[1] != origSl1) dlgErr = 284;
+                    }
+
+                    // 5b. Drag into right remove zone then release out-of-window (900,260) -> MUST NOT remove!
+                    if (dlgErr == 0) {
+                        SendMessageW(dlg.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lpSl0);
+                        SendMessageW(dlg.hwnd, WM_MOUSEMOVE, MK_LBUTTON, lpRight);
+                        if (!dlg.slotDragOverRight) dlgErr = 284;
+                        SendMessageW(dlg.hwnd, WM_LBUTTONUP, 0, lpOutWin);
+                        if (st14.scenes[0].slots[0] != origSl0) dlgErr = 284;
+                    }
+
+                    // 5c. Drag slot 0 down then back to slot 0 (no order change) -> MUST skip disk write / NotifyMutated
+                    if (dlgErr == 0) {
+                        int mutBefore = mutatedCnt;
+                        SendMessageW(dlg.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lpSl0);
+                        SendMessageW(dlg.hwnd, WM_MOUSEMOVE, MK_LBUTTON, lpSl1);
+                        SendMessageW(dlg.hwnd, WM_MOUSEMOVE, MK_LBUTTON, lpSl0);
+                        SendMessageW(dlg.hwnd, WM_LBUTTONUP, 0, lpSl0);
+                        if (mutatedCnt != mutBefore || st14.scenes[0].slots[0] != origSl0) dlgErr = 284;
+                    }
+
+                    // 5d. Valid Left -> Right drag-to-remove + 5s single-slot undo (save fail retains undo, normal save restores slot!)
+                    if (dlgErr == 0) {
+                        SendMessageW(dlg.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lpSl0);
+                        SendMessageW(dlg.hwnd, WM_MOUSEMOVE, MK_LBUTTON, lpSl1);
+                        SendMessageW(dlg.hwnd, WM_MOUSEMOVE, MK_LBUTTON, lpRight);
+                        SendMessageW(dlg.hwnd, WM_LBUTTONUP, 0, lpRight);
+                        if (!st14.scenes[0].slots[0].empty() || st14.scenes[0].slots[1] != origSl1 ||
+                            !st14.FindById(origSl0) || !dlg.undoClearActive || !dlg.undoIsSingleSlot) {
+                            dlgErr = 285;
+                        }
+                        if (dlgErr == 0) {
+                            sm14.readOnlyRecoveryMode = true;
+                            dlg.HandleUndoClear();
+                            if (!st14.scenes[0].slots[0].empty() || !dlg.undoClearActive) dlgErr = 285;
+                            sm14.readOnlyRecoveryMode = false;
+                            if (dlgErr == 0) {
+                                dlg.HandleUndoClear();
+                                if (st14.scenes[0].slots[0] != origSl0 || dlg.undoClearActive) dlgErr = 285;
+                            }
+                        }
+                    }
+                }
+
+                // (6) Reduced Motion: drop produces ZERO row shift animation, AND functional left edge-scroll works while animActive == false!
+                if (dlgErr == 0) {
+                    Motion::SetReducedMotionOverride(1);
+                    dlg.StopAnimTimer();
+                    dlg.rightRowShifts.clear();
+                    dlg.EnsureFiltered();
+                    std::wstring dropPid3 = st14.vault[dlg.filteredIndices[0]].id;
+                    if (!dlg.HandleRightCardDropOnSlot(3, dropPid3) || !dlg.rightRowShifts.empty()) dlgErr = 286;
+                    if (dlgErr == 0) {
+                        paintOff(800, 360); // Short viewport so leftMaxScrollY > 20 DIP
+                        if (dlg.leftMaxScrollY <= 10.0f || dlg.drawnRightCards.empty()) dlgErr = 286;
+                        else {
+                            const auto& c0 = dlg.drawnRightCards[0].hitRect;
+                            LPARAM lpDown = MAKELPARAM((short)(c0.left + 80.0f), (short)((c0.top + c0.bottom) * 0.5f));
+                            LPARAM lpEdgeBot = MAKELPARAM((short)(dlg.leftSlotsVp.left + 80.0f), (short)(dlg.leftSlotsVp.bottom - 10.0f));
+                            SendMessageW(dlg.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lpDown);
+                            SendMessageW(dlg.hwnd, WM_MOUSEMOVE, MK_LBUTTON, lpEdgeBot);
+                            if (!dlg.leftEdgeScrollActive || dlg.animActive) dlgErr = 286;
+                            if (dlgErr == 0) {
+                                SendMessageW(dlg.hwnd, WM_TIMER, ScenePromptsDialog::kTimerEdgeScroll, 0);
+                                if (dlg.leftScrollY <= 0.5f) dlgErr = 286;
+                            }
+                            dlg.CancelRightDrag();
+                            if (dlg.leftEdgeScrollActive) dlgErr = 286;
+                        }
+                        paintOff(800, 560);
+                    }
+                    Motion::SetReducedMotionOverride(0);
+                }
+
+                // (7) ToggleSceneEnabled ("已启用" / "未启用") + at-least-1 enabled scene guard
+                if (dlgErr == 0) {
+                    dlg.sceneIndex = 2;
+                    if (st14.scenes[2].enabled) dlgErr = 287;
+                    dlg.HandleToggleSceneEnabled();
+                    if (!st14.scenes[2].enabled) dlgErr = 288;
+                    dlg.HandleToggleSceneEnabled();
+                    if (st14.scenes[2].enabled) dlgErr = 289;
+                    // Guard: when only Scene 0 is enabled, disabling Scene 0 MUST fail with statusIsErr
+                    st14.SetSceneEnabled(1, false);
+                    dlg.sceneIndex = 0;
+                    dlg.HandleToggleSceneEnabled();
+                    if (!st14.scenes[0].enabled || !dlg.statusIsErr) dlgErr = 290;
+                    st14.SetSceneEnabled(1, true);
+                }
+
+                // (8) Natural spring settle + expired micro-shake stops kTimerAnim (0% idle CPU guarantee)
+                if (dlgErr == 0) {
+                    if (dlg.lockedShakeTick != 0) dlg.lockedShakeTick = GetTickCount64() - 350;
+                    if (dlg.slotLandFlashSlot >= 0) dlg.slotLandFlashTick = GetTickCount64() - 450;
+                    dlg.rightDragMorphSpring.Snap(0.0f);
+                    dlg.rightDragMorphSpring.target = 1.0f;
+                    dlg.EnsureAnimTimer();
+                    for (int step = 0; step < 120 && dlg.animActive; ++step) {
+                        dlg.lastAnimQpc.QuadPart -= (dlg.qpcFreq.QuadPart / 60);
+                        SendMessageW(dlg.hwnd, WM_TIMER, ScenePromptsDialog::kTimerAnim, 0);
+                    }
+                    if (dlg.animActive || dlg.lockedShakeTick != 0) dlgErr = 291;
+                }
+
+                DestroyWindow(dlg.hwnd);
+            }
+        }
+        CoUninitialize();
+        DiagLogger::Instance().Init(sm.dataDir);
+        Motion::SetReducedMotionOverride(-1);
+        if (dlgErr != 0) return dlgErr;
     }
 
     return 0;

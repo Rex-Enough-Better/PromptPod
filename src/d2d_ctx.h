@@ -483,6 +483,30 @@ public:
     FillRMRim(rt, br, box, radius, Rgba(fillHex, 1.0f), rimTop, Rgba(0xFFFFFF, 0.05f));
 }
 
+inline bool PtInDip(const D2D1_RECT_F& r, float x, float y) {
+    return r.right > r.left && r.bottom > r.top &&
+           x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+}
+
+inline bool IntersectDip(const D2D1_RECT_F& a, const D2D1_RECT_F& b, D2D1_RECT_F& out) {
+    out = D2D1::RectF(
+        std::max(a.left, b.left),
+        std::max(a.top, b.top),
+        std::min(a.right, b.right),
+        std::min(a.bottom, b.bottom));
+    return out.right > out.left && out.bottom > out.top;
+}
+
+template <typename T>
+inline T* ResolveWndUserData(HWND h, UINT msg, LPARAM lp) {
+    if (msg == WM_NCCREATE) {
+        auto* self = static_cast<T*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
+        SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        return self;
+    }
+    return reinterpret_cast<T*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+}
+
 [[gnu::noinline]] inline bool StartWindowAnimTimer(HWND hwnd, UINT_PTR timerId, bool& active,
                                                    LARGE_INTEGER& qpcFreq, LARGE_INTEGER& lastQpc) {
     if (!hwnd || !IsWindow(hwnd)) return false;
@@ -494,6 +518,13 @@ public:
         return true;
     }
     return false;
+}
+
+[[gnu::noinline]] inline void StopWindowAnimTimer(HWND hwnd, UINT_PTR timerId, bool& active) {
+    if (active) {
+        if (hwnd && IsWindow(hwnd)) KillTimer(hwnd, timerId);
+        active = false;
+    }
 }
 
 [[gnu::noinline]] inline float StepDeltaQpc(LARGE_INTEGER& qpcFreq, LARGE_INTEGER& lastQpc) {

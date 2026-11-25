@@ -389,20 +389,13 @@ private:
     }
 
     void EnsureAnimTimer() {
-        if (!hwnd || animActive) return;
-        QueryPerformanceCounter(&lastAnimQpc);
-        if (SetTimer(hwnd, kTimerAnim, 10, nullptr) != 0) {
-            animActive = true;
-        } else {
+        if (!StartWindowAnimTimer(hwnd, kTimerAnim, animActive, qpcFreq, lastAnimQpc)) {
             SnapAllAnims();
         }
     }
 
     void StopAnimTimer() {
-        if (animActive && hwnd) {
-            KillTimer(hwnd, kTimerAnim);
-            animActive = false;
-        }
+        StopWindowAnimTimer(hwnd, kTimerAnim, animActive);
     }
 
     [[gnu::noinline]] void OnAnimTick() {
@@ -433,10 +426,6 @@ private:
         if (fmtBody) fmtBody->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, 18.5f, 14.5f);
         fmtBtn   = eng.CreateFormat(12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, true, DWRITE_TEXT_ALIGNMENT_CENTER);
         fmtLabel = eng.CreateFormat(12.0f, DWRITE_FONT_WEIGHT_MEDIUM);
-    }
-
-    static bool PtInDip(const D2D1_RECT_F& r, float x, float y) {
-        return r.right > r.left && r.bottom > r.top && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
     }
 
     int HitZone(float x, float y) const {
@@ -1293,11 +1282,6 @@ public:
         if (storage) storage->Save(*state);
         DiagLogger::Instance().LogFmt("INFO", "DOCK", L"ResetToEdgeDefault triggered by user (edge=%d)", (int)state->dockEdge);
         ExpandAndReveal(2000);
-    }
-
-    void ResetToRightEdgeDefault() {
-        if (state) state->dockEdge = DockEdge::Right;
-        ResetToEdgeDefault();
     }
 
     std::wstring DescribeDockLocation() const {

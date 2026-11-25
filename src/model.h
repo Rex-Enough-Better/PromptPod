@@ -377,14 +377,11 @@ struct AppState {
         if (sceneIdx < 0 || sceneIdx >= kMaxScenes || id.empty() || !FindById(id)) return -1;
         int existing = FindSlotOfIdInScene(sceneIdx, id);
         if (existing >= 0) return existing;
-        auto& sl = scenes[(size_t)sceneIdx].slots;
-        for (int i = 0; i < 10; ++i) {
-            if (sl[(size_t)i].empty()) {
-                sl[(size_t)i] = id;
-                return i;
-            }
+        int emptySlot = FindFirstEmptySlotInScene(sceneIdx);
+        if (emptySlot >= 0) {
+            scenes[(size_t)sceneIdx].slots[(size_t)emptySlot] = id;
         }
-        return -1;
+        return emptySlot;
     }
 
     bool RemoveFromScene(int sceneIdx, const std::wstring& id) {
