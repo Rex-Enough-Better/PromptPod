@@ -587,4 +587,51 @@ inline float GetDpiScaleForPoint(POINT pt, HWND fallbackHwnd = nullptr) {
     return rc;
 }
 
+// Reliable foreground activation for windows launched from WS_EX_NOACTIVATE popups or System Tray
+// under Windows ForegroundLockTimeout (200s): tries standard SetForegroundWindow first, then
+// safely borrows foreground thread input (guarded against hung windows), and guarantees top Z-order
+// even when the previous foreground window is UIPI-elevated.
+[[gnu::noinline]] inline bool BringWindowToForegroundReliable(HWND hwnd, bool keepTopmost = false) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    ShowWindow(hwnd, IsIconic(hwnd) ? SW_RESTORE : SW_SHOWNORMAL);
+
+    // Tier 0: Fast path when OS already allows foreground transfer
+    if (SetForegroundWindow(hwnd) && GetForegroundWindow() == hwnd) {
+        BringWindowToTop(hwnd);
+        return true;
+    }
+
+    // Tier 1: AttachThreadInput with current foreground thread (skip hung windows to never stall)
+    HWND fg = GetForegroundWindow();
+    if (fg && fg != hwnd && IsWindow(fg) && !IsHungAppWindow(fg)) {
+        DWORD fgTid = GetWindowThreadProcessId(fg, nullptr);
+        DWORD curTid = GetCurrentThreadId();
+        if (fgTid != 0 && fgTid != curTid) {
+            bool attached = (AttachThreadInput(curTid, fgTid, TRUE) != FALSE);
+            BringWindowToTop(hwnd);
+            SetWindowPos(hwnd, keepTopmost ? HWND_TOPMOST : HWND_TOP, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            SetForegroundWindow(hwnd);
+            SetActiveWindow(hwnd);
+            if (attached) AttachThreadInput(curTid, fgTid, FALSE);
+        }
+    }
+
+    if (GetForegroundWindow() == hwnd) {
+        return true;
+    }
+
+    // Tier 2: UIPI / elevated foreground fallback -- guarantee visual top of normal Z-order band
+    // so the window is NEVER silently buried behind a maximized browser/IDE!
+    if (!keepTopmost) {
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    } else {
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    }
+    BringWindowToTop(hwnd);
+    SetForegroundWindow(hwnd);
+    return GetForegroundWindow() == hwnd;
+}
+
 } // namespace pp

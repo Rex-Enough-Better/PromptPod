@@ -3425,7 +3425,8 @@ private:
                     self->OnAnimTick();
                 } else if (wp == kTimerHoverExpand) {
                     KillTimer(h, kTimerHoverExpand);
-                    if (!self->isDragging && self->handleHovered && self->state->dockEdge != DockEdge::None) {
+                    if (!self->isDragging && self->handleHovered && !self->IsDockMenuOpen() &&
+                        self->state->dockEdge != DockEdge::None) {
                         self->ExpandAndReveal();
                     }
                 } else if (wp == kTimerLeaveWatch) {
@@ -4057,6 +4058,8 @@ private:
             }
 
             case WM_RBUTTONUP: {
+                KillTimer(h, kTimerHoverExpand);
+                self->handleHovered = false;
                 self->HideHoverBubbleHard(true);
                 POINT cur = MsgScreenPoint(h, lp);
                 if (self->IsCompactCollapsedMode()) {

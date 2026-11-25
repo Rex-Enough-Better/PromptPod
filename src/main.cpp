@@ -2625,6 +2625,143 @@ inline int RunHeadlessSelfTest(const std::wstring& testRootDir) {
         if (dlgErr != 0) return dlgErr;
     }
 
+    // 15. v0.14.1 Regression: right-click -> Settings first-try reliability
+    //     15a. DarkPopupMenu click pressed near item edge mid-emerge still fires after emerge settles (while far drag cancels)
+    //     15b. DarkPopupMenu Tray owner adopts transient Win11 tray/overflow foreground handoff within 450 ms, then closes on later switch
+    //     15c. DockWindow right-click on collapsed capsule cancels kTimerHoverExpand so panel never covers open context menu
+    //     15d. VaultWindow::Open re-clamps off-screen hidden window back onto visible monitor work area cleanly
+    {
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        int r15Err = 0;
+        Motion::SetReducedMotionOverride(0);
+        if (D2DEngine::Instance().Init()) {
+            DarkPopupMenu menu15;
+            if (!menu15.Init(GetModuleHandleW(nullptr))) {
+                r15Err = 295;
+            } else {
+                // 15a: Press near bottom edge of Settings row while openSpring is at 0.25, then finish emerge to 1.0 before WM_LBUTTONUP
+                int firedCmd = 0;
+                std::vector<DarkMenuItem> mi = {
+                    DarkMenuItem::Action(1, L"Item A"),
+                    DarkMenuItem::Action(6, L"打开设置...")
+                };
+                menu15.ShowAt(POINT{ 400, 400 }, mi, [&](int id) { firedCmd = id; }, 220.0f, MenuOwner::Dock);
+                menu15.openSpring.Snap(0.25f);
+                menu15.Render();
+                float a = Motion::EaseOutCubic(menu15.lastRenderOpenT);
+                float sc = 0.955f + 0.045f * a;
+                float ax = menu15.openFlipLeft ? (DarkPopupMenu::kPad + menu15.menuW) : DarkPopupMenu::kPad;
+                float ay = menu15.openFlipUp ? (DarkPopupMenu::kPad + menu15.menuH) : DarkPopupMenu::kPad;
+                float dyShift = (menu15.openFlipUp ? 4.0f : -4.0f) * (1.0f - a);
+                const auto& r1 = menu15.itemRects[1];
+                float visX = ax + ((r1.left + r1.right) * 0.5f - ax) * sc;
+                float visY = ay + ((r1.top + 0.6f) - ay) * sc + dyShift; // Very top edge of item 1 during emerge
+                LPARAM lpEdge = MAKELPARAM((short)std::round(visX * menu15.dpiScale),
+                                           (short)std::round(visY * menu15.dpiScale));
+                SendMessageW(menu15.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lpEdge);
+                if (menu15.pressedIndex != 1 || !menu15.pressDuringEmerge) r15Err = 296;
+                if (r15Err == 0) {
+                    // Emerge completes before button up; top-edge pixel shifts slightly outside static rect, yet steady click MUST fire!
+                    menu15.openSpring.Snap(1.0f);
+                    menu15.Render();
+                    SendMessageW(menu15.hwnd, WM_LBUTTONUP, 0, lpEdge);
+                    if (firedCmd != 6 || menu15.IsOpen()) r15Err = 297;
+                }
+                // Dragging far away before release MUST still cancel cleanly
+                if (r15Err == 0) {
+                    firedCmd = 0;
+                    menu15.ShowAt(POINT{ 400, 400 }, mi, [&](int id) { firedCmd = id; }, 220.0f, MenuOwner::Dock);
+                    menu15.openSpring.Snap(0.25f);
+                    menu15.Render();
+                    SendMessageW(menu15.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lpEdge);
+                    SendMessageW(menu15.hwnd, WM_LBUTTONUP, 0, MAKELPARAM(4, 4));
+                    if (firedCmd != 0 || !menu15.IsOpen()) r15Err = 298;
+                    menu15.Close();
+                }
+
+                // 15b: Tray menu adopts first foreground transition within 450 ms, then closes on subsequent foreground switch
+                if (r15Err == 0) {
+                    HWND simFg = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(0x3001));
+                    menu15.foregroundProvider = [&]() -> HWND { return simFg; };
+                    menu15.cursorPosProvider = [](POINT* outPt) -> BOOL {
+                        if (outPt) *outPt = POINT{ 450, 430 };
+                        return TRUE;
+                    };
+                    menu15.ShowAt(POINT{ 400, 400 }, mi, nullptr, 220.0f, MenuOwner::Tray);
+                    simFg = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(0x3002)); // Overflow flyout auto-dismissed -> prev app
+                    SendMessageW(menu15.hwnd, WM_TIMER, DarkPopupMenu::kTimerPoll, 0);
+                    if (!menu15.IsOpen() || menu15.openForegroundHwnd != simFg) r15Err = 299;
+                    if (r15Err == 0) {
+                        simFg = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(0x3003)); // Real Alt+Tab switch -> MUST close
+                        SendMessageW(menu15.hwnd, WM_TIMER, DarkPopupMenu::kTimerPoll, 0);
+                        if (menu15.IsOpen()) r15Err = 300;
+                    }
+                    menu15.foregroundProvider = nullptr;
+                    menu15.cursorPosProvider = nullptr;
+                }
+
+                // 15c: DockWindow right-click on collapsed capsule cancels kTimerHoverExpand so Dock never covers open menu
+                if (r15Err == 0) {
+                    StorageManager sm15;
+                    sm15.Init(testDir + L"\\r15_case");
+                    AppState st15{};
+                    sm15.LoadOrSeed(st15);
+                    st15.onboardingCompleted = true;
+                    st15.dockEdge = DockEdge::Right;
+                    DockWindow dock15;
+                    dock15.monitorProvider = makeFixedMon(RECT{ 0, 0, 1920, 1080 }, RECT{ 0, 0, 1920, 1040 });
+                    if (!dock15.Init(GetModuleHandleW(nullptr), &st15, &sm15, &menu15, nullptr, [&](POINT pt) {
+                        menu15.ShowAt(pt, mi, nullptr, 220.0f, MenuOwner::Dock);
+                    }, false)) {
+                        r15Err = 301;
+                    } else {
+                        dock15.expandSpring.Snap(0.0f);
+                        dock15.handleHovered = true;
+                        SendMessageW(dock15.hwnd, WM_RBUTTONUP, 0, MAKELPARAM(4, 24));
+                        if (!menu15.IsOpenFor(MenuOwner::Dock) || dock15.handleHovered) r15Err = 302;
+                        if (r15Err == 0) {
+                            dock15.handleHovered = true;
+                            SendMessageW(dock15.hwnd, WM_TIMER, DockWindow::kTimerHoverExpand, 0);
+                            if (dock15.expandSpring.target > 0.5f) r15Err = 303;
+                        }
+                        menu15.Close();
+                        DestroyWindow(dock15.hwnd);
+                    }
+                }
+
+                // 15d: VaultWindow::Open(2, -1) recovers an off-screen hidden window back into visible work area
+                if (r15Err == 0) {
+                    StorageManager sm15v;
+                    sm15v.Init(testDir + L"\\r15v_case");
+                    AppState st15v{};
+                    sm15v.LoadOrSeed(st15v);
+                    VaultWindow vw15;
+                    vw15.Init(GetModuleHandleW(nullptr), &st15v, &sm15v, &menu15, nullptr);
+                    vw15.Open(2, -1);
+                    if (!vw15.hwnd || !IsWindowVisible(vw15.hwnd) || vw15.activeTab != 2) {
+                        r15Err = 304;
+                    } else {
+                        // Simulate user closing VaultWindow after monitor unplug moved it far off-screen
+                        SendMessageW(vw15.hwnd, WM_CLOSE, 0, 0);
+                        SetWindowPos(vw15.hwnd, nullptr, -28000, -28000, 760, 580, SWP_NOZORDER | SWP_NOACTIVATE);
+                        vw15.Open(2, -1);
+                        RECT wr{};
+                        GetWindowRect(vw15.hwnd, &wr);
+                        if (!IsWindowVisible(vw15.hwnd) || MonitorFromRect(&wr, MONITOR_DEFAULTTONULL) == nullptr) {
+                            r15Err = 305;
+                        }
+                        DestroyWindow(vw15.hwnd);
+                    }
+                }
+                DestroyWindow(menu15.hwnd);
+            }
+        }
+        CoUninitialize();
+        DiagLogger::Instance().Init(sm.dataDir);
+        Motion::SetReducedMotionOverride(-1);
+        if (r15Err != 0) return r15Err;
+    }
+
     return 0;
 }
 

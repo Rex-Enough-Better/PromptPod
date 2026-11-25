@@ -1016,8 +1016,7 @@ private:
                                      parent, 510.0f, 440.0f, dpiScale, this);
         if (!hwnd) return;
         SetupChildControls();
-        ShowWindow(hwnd, SW_SHOW);
-        SetForegroundWindow(hwnd);
+        BringWindowToForegroundReliable(hwnd, true);
         SetFocus(initialTitle.empty() ? hEditTitle : hEditBody);
 
         RunDarkModalLoop(hwnd, parent, done, [this](const MSG& msg) -> bool {
@@ -1509,8 +1508,7 @@ private:
                                      parent, 456.0f, 244.0f, dpiScale, this);
         if (!hwnd) return;
         LayoutButtons();
-        ShowWindow(hwnd, SW_SHOW);
-        SetForegroundWindow(hwnd);
+        BringWindowToForegroundReliable(hwnd, true);
 
         RunDarkModalLoop(hwnd, parent, done, [this](const MSG& msg) -> bool {
             if (msg.wParam == VK_ESCAPE) {
@@ -1819,8 +1817,7 @@ private:
             SendMessageW(hEdit, EM_SETSEL, 0, -1);
         }
         Layout();
-        ShowWindow(hwnd, SW_SHOW);
-        SetForegroundWindow(hwnd);
+        BringWindowToForegroundReliable(hwnd, true);
         SetFocus(hEdit);
 
         RunDarkModalLoop(hwnd, parent, done, [this](const MSG& msg) -> bool {
@@ -3814,8 +3811,7 @@ private:
         // Enable double-click support on dialog class
         SetClassLongPtrW(hwnd, GCL_STYLE, GetClassLongPtrW(hwnd, GCL_STYLE) | CS_DBLCLKS);
         SetupSearchControl();
-        ShowWindow(hwnd, SW_SHOW);
-        SetForegroundWindow(hwnd);
+        BringWindowToForegroundReliable(hwnd, true);
 
         RunDarkModalLoop(hwnd, parent, done, [this](const MSG& msg) {
             return (msg.hwnd == hwnd || IsChild(hwnd, msg.hwnd)) && msg.message == WM_KEYDOWN &&
@@ -4789,8 +4785,7 @@ private:
                                      parent, 548.0f, 472.0f, dpiScale, this);
         if (!hwnd) return;
         SetupChildControls();
-        ShowWindow(hwnd, SW_SHOW);
-        SetForegroundWindow(hwnd);
+        BringWindowToForegroundReliable(hwnd, true);
         SetFocus(hEditTitle);
 
         RunDarkModalLoop(hwnd, parent, done, [this](const MSG& msg) -> bool {
@@ -5609,6 +5604,7 @@ public:
         pendingScrollToUpdate = (tab == 2 && scrollToUpdate);
         InvalidateCaches();
 
+        bool createdNew = false;
         if (!hwnd || !IsWindow(hwnd)) {
             POINT pt{};
             GetCursorPos(&pt);
@@ -5630,13 +5626,43 @@ public:
                 nullptr, nullptr, hInst, this
             );
             if (!hwnd) return;
+            createdNew = true;
             ApplyWin11DarkWindowAttributes(hwnd);
             CreateSearchControl();
+        } else if (!IsIconic(hwnd)) {
+            // Re-clamp onto visible monitor work area if a previously used monitor was disconnected/resized
+            RECT wr{};
+            if (GetWindowRect(hwnd, &wr)) {
+                HMONITOR mon = MonitorFromRect(&wr, MONITOR_DEFAULTTONULL);
+                bool offscreen = (mon == nullptr);
+                if (!offscreen) {
+                    MONITORINFO mi{ sizeof(mi) };
+                    if (GetMonitorInfoW(mon, &mi)) {
+                        RECT inter{};
+                        if (!IntersectRect(&inter, &wr, &mi.rcWork) ||
+                            (inter.right - inter.left) < 120 || (inter.bottom - inter.top) < 80) {
+                            offscreen = true;
+                        }
+                    }
+                }
+                if (offscreen) {
+                    POINT pt{};
+                    GetCursorPos(&pt);
+                    RECT work = GetMonitorWorkAreaForPoint(pt);
+                    int wPx = std::max<int>(320, wr.right - wr.left);
+                    int hPx = std::max<int>(260, wr.bottom - wr.top);
+                    int x = 0, y = 0;
+                    ClampDialogRectToWorkArea(work, wPx, hPx, x, y);
+                    SetWindowPos(hwnd, nullptr, x, y, wPx, hPx, SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+            }
         }
 
         UpdateSearchVisibility();
-        ShowWindow(hwnd, IsIconic(hwnd) ? SW_RESTORE : SW_SHOWNORMAL);
-        SetForegroundWindow(hwnd);
+        bool fgOk = BringWindowToForegroundReliable(hwnd, false);
+        DiagLogger::Instance().LogFmt("INFO", "VAULT",
+            L"Open(tab=%d, targetSlot=%d, created=%d, fgOk=%d)",
+            activeTab, assignTargetSlot, createdNew ? 1 : 0, fgOk ? 1 : 0);
         if (activeTab == 0 && hSearchEdit && IsWindow(hSearchEdit)) {
             SetFocus(hSearchEdit);
         }
@@ -5653,8 +5679,7 @@ public:
 
     void ShowOrFocus(int defaultTab = 0) {
         if (hwnd && IsWindow(hwnd) && IsWindowVisible(hwnd)) {
-            if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
-            SetForegroundWindow(hwnd);
+            BringWindowToForegroundReliable(hwnd, false);
             InvalidateRect(hwnd, nullptr, FALSE);
         } else {
             Open(defaultTab, -1);

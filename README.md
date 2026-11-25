@@ -1,13 +1,13 @@
-# 词舱 PromptPod v0.14.0
+# 词舱 PromptPod v0.14.1
 
-Windows 10 / 11 超轻量贴边 Prompt 一键复制桌面小工具（纯原生 `C++17` + `Win32` + `Direct2D` + `DirectWrite`，MIT 开源）。单文件绿色可执行体量约 `662 KB`，仅依赖 13 个 Windows 系统原生 DLL，零第三方运行时依赖，贴边静止时 `0% CPU` 占用 -- 把最常用的高价值 Prompt 放进屏幕边缘的肌肉记忆里，抬手一触即得。
+Windows 10 / 11 超轻量贴边 Prompt 一键复制桌面小工具（纯原生 `C++17` + `Win32` + `Direct2D` + `DirectWrite`，MIT 开源）。单文件绿色可执行体量约 `667.5 KB`，仅依赖 13 个 Windows 系统原生 DLL，零第三方运行时依赖，贴边静止时 `0% CPU` 占用 -- 把最常用的高价值 Prompt 放进屏幕边缘的肌肉记忆里，抬手一触即得。
 
 ## 下载与运行
 
 前往 [**GitHub Releases 页面**](https://github.com/Rex-Enough-Better/PromptPod/releases/latest) 下载最新版本：
 
-- **直接运行版**：下载 `PromptPod-0.14.0.exe`（约 `662 KB`），放到任意常用目录双击即用，无需安装，无需管理员权限。
-- **压缩包版**：若浏览器拦截裸 `.exe` 下载，可下载 `PromptPod-0.14.0-win64.zip` 解压后双击运行 `PromptPod.exe`。
+- **直接运行版**：下载 `PromptPod-0.14.1.exe`（约 `667.5 KB`），放到任意常用目录双击即用，无需安装，无需管理员权限。
+- **压缩包版**：若浏览器拦截裸 `.exe` 下载，可下载 `PromptPod-0.14.1-win64.zip` 解压后双击运行 `PromptPod.exe`。
 - **关于 Windows SmartScreen 首次运行提示**：本项目完全开源且仅在本地运行（联网仅用于按需检查 GitHub Releases 更新），因未购买昂贵的商业 EV 代码签名证书，首次运行可能弹出「Windows 已保护你的电脑」提示。你可以点击 **「更多信息」->「仍要运行」**，也可以直接克隆本仓库运行 `.\build.ps1` 在本机从源码独立编译验证。
 - **无损在线更新与无缝升级**：已安装 `v0.6.0` 及以上版本可直接在「设置 -> 启动与更新」或托盘右键点击「检查更新」原地升级（点击托盘更新入口会自动滚动定位至更新卡片）；直接双击新版 `.exe` 也会自动优雅接管旧版常驻实例。老用户升级时原有 `%APPDATA%\PromptPod\data.json` 词库与统计完整保留，并支持在设置页「导出备份」的保存类型下拉框中导出旧版 `v2` 兼容备份。
 

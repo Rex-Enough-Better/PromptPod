@@ -250,6 +250,8 @@ public:
 
     int hoverIndex = -1;
     int pressedIndex = -1;
+    POINT pressDownClientPt{ -99999, -99999 };
+    bool pressDuringEmerge = false;
     bool visible = false;
     bool kbNavActive = false;
     MenuOwner owner = MenuOwner::None;
@@ -259,7 +261,7 @@ public:
     POINT lastOutsideClickPt{ -99999, -99999 };
     HWND openForegroundHwnd = nullptr;
     ULONGLONG openTick = 0;
-    bool openFgWasTrayOverflow = false;
+    bool openFgWasTrayShell = false;
     bool prevLDown = false;
     bool prevRDown = false;
     bool prevUpDown = false;
@@ -372,8 +374,11 @@ public:
             lastOutsideClickPt = POINT{ -99999, -99999 };
         }
         openForegroundHwnd = nullptr;
+        openFgWasTrayShell = false;
         hoverIndex = -1;
         pressedIndex = -1;
+        pressDownClientPt = POINT{ -99999, -99999 };
+        pressDuringEmerge = false;
         hoverPillInit = false;
         hoverAlpha = 0.0f;
         hoverDangerT = 0.0f;
@@ -382,6 +387,7 @@ public:
         lastRenderOpenT = 1.0f;
         StopAnimTimer();
         KillTimer(hwnd, kTimerPoll);
+        if (hwnd && GetCapture() == hwnd) ReleaseCapture();
         ShowWindow(hwnd, SW_HIDE);
         if (onClosed) onClosed(closedOwner);
     }
@@ -434,6 +440,8 @@ public:
         winY = yPos;
         hoverIndex = -1;
         pressedIndex = -1;
+        pressDownClientPt = POINT{ -99999, -99999 };
+        pressDuringEmerge = false;
         hoverPillInit = false;
         hoverAlpha = 0.0f;
         hoverDangerT = 0.0f;
@@ -460,14 +468,8 @@ public:
         }
         openForegroundHwnd = foregroundProvider ? foregroundProvider() : GetForegroundWindow();
         openTick = GetTickCount64();
-        openFgWasTrayOverflow = false;
-        if (!foregroundProvider && openForegroundHwnd) {
-            wchar_t cls[64]{};
-            if (GetClassNameW(openForegroundHwnd, cls, _countof(cls)) > 0 &&
-                wcscmp(cls, L"NotifyIconOverflowWindow") == 0) {
-                openFgWasTrayOverflow = true;
-            }
-        }
+        openFgWasTrayShell = (menuOwner == MenuOwner::Tray) ||
+                             (!foregroundProvider && IsShellTrayOrOverflowWindow(openForegroundHwnd));
 
         if (!Render()) {
             DiagLogger::Instance().LogFmt("ERROR", "MENU",
@@ -698,6 +700,17 @@ private:
         }
     }
 
+    static bool IsShellTrayOrOverflowWindow(HWND h) {
+        if (!h) return false;
+        wchar_t cls[64]{};
+        if (GetClassNameW(h, cls, _countof(cls)) <= 0) return false;
+        return wcscmp(cls, L"NotifyIconOverflowWindow") == 0 ||
+               wcscmp(cls, L"TopLevelWindowForOverflowXamlIsland") == 0 ||
+               wcscmp(cls, L"Shell_TrayWnd") == 0 ||
+               wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0 ||
+               wcscmp(cls, L"XamlExplorerHostIslandWindow") == 0;
+    }
+
     bool IsKeyboardPollAllowed(HWND curFg) const {
         // VaultWindow synchronously forwards Up/Down/Enter/Esc directly to popupMenu so SearchEdit & menu NEVER double-fire!
         if (owner == MenuOwner::Vault) return false;
@@ -705,15 +718,7 @@ private:
         DWORD fgPid = 0;
         GetWindowThreadProcessId(curFg, &fgPid);
         if (fgPid == GetCurrentProcessId()) return true;
-        wchar_t cls[64]{};
-        if (GetClassNameW(curFg, cls, _countof(cls)) > 0) {
-            if (wcscmp(cls, L"Shell_TrayWnd") == 0 ||
-                wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0 ||
-                wcscmp(cls, L"NotifyIconOverflowWindow") == 0) {
-                return true;
-            }
-        }
-        return false;
+        return IsShellTrayOrOverflowWindow(curFg);
     }
 
     void ConfirmSelection() {
@@ -739,10 +744,11 @@ private:
         // Detect foreground window switches (Alt+Tab, Win key, or elevated UIPI windows where GetAsyncKeyState returns 0)
         HWND curFg = foregroundProvider ? foregroundProvider() : GetForegroundWindow();
         if (curFg != openForegroundHwnd) {
-            // Adopt once if Windows 11 tray overflow flyout auto-dismissed right after spawning our menu
-            if (openFgWasTrayOverflow && (GetTickCount64() - openTick) < 300) {
+            // Adopt once if Windows 10/11 tray overflow flyout (TopLevelWindowForOverflowXamlIsland / NotifyIconOverflowWindow)
+            // or Shell_TrayWnd auto-dismissed / settled right after spawning our Tray menu
+            if (openFgWasTrayShell && (GetTickCount64() - openTick) < 450) {
                 openForegroundHwnd = curFg;
-                openFgWasTrayOverflow = false;
+                openFgWasTrayShell = false;
             } else {
                 Close();
                 return;
@@ -856,29 +862,57 @@ private:
                 else if (wp == VK_ESCAPE) self->Close();
                 return 0;
             case WM_LBUTTONDOWN: {
-                float dx = (float)(short)LOWORD(lp) / self->dpiScale;
-                float dy = (float)(short)HIWORD(lp) / self->dpiScale;
+                int cx = (int)(short)LOWORD(lp);
+                int cy = (int)(short)HIWORD(lp);
+                float dx = (float)cx / self->dpiScale;
+                float dy = (float)cy / self->dpiScale;
                 self->pressedIndex = self->HitTestDip(dx, dy);
                 if (self->pressedIndex >= 0) {
+                    self->pressDownClientPt = POINT{ cx, cy };
+                    self->pressDuringEmerge = (!Motion::IsReducedMotion() && self->lastRenderOpenT < 0.998f);
+                    SetCapture(h);
                     if (Motion::IsReducedMotion()) { self->pressAnim = 1.0f; self->Render(); }
                     else { self->EnsureAnimTimer(); self->Render(); }
                 }
                 return 0;
             }
             case WM_LBUTTONUP: {
-                float dx = (float)(short)LOWORD(lp) / self->dpiScale;
-                float dy = (float)(short)HIWORD(lp) / self->dpiScale;
+                int cx = (int)(short)LOWORD(lp);
+                int cy = (int)(short)HIWORD(lp);
+                float dx = (float)cx / self->dpiScale;
+                float dy = (float)cy / self->dpiScale;
                 int hit = self->HitTestDip(dx, dy);
                 int downIdx = self->pressedIndex;
+                POINT downPt = self->pressDownClientPt;
+                bool duringEmerge = self->pressDuringEmerge;
                 self->pressedIndex = -1;
-                if (hit >= 0 && hit == downIdx && hit < (int)self->items.size()) {
-                    int chosenId = self->items[(size_t)hit].id;
+                self->pressDownClientPt = POINT{ -99999, -99999 };
+                self->pressDuringEmerge = false;
+                if (GetCapture() == h) ReleaseCapture();
+                int tolPx = (int)std::round(6.0f * self->dpiScale);
+                bool emergeSteadyClick = (duringEmerge && downIdx >= 0 &&
+                                          std::abs(cx - downPt.x) <= tolPx &&
+                                          std::abs(cy - downPt.y) <= tolPx);
+                if (downIdx >= 0 && downIdx < (int)self->items.size() && (hit == downIdx || emergeSteadyClick)) {
+                    int chosenId = self->items[(size_t)downIdx].id;
                     auto cb = self->onSelect;
                     self->Close();
                     if (cb) cb(chosenId);
                 } else if (downIdx >= 0) {
                     if (Motion::IsReducedMotion()) { self->pressAnim = 0.0f; self->Render(); }
                     else { self->EnsureAnimTimer(); self->Render(); }
+                }
+                return 0;
+            }
+            case WM_CAPTURECHANGED: {
+                if (self->pressedIndex >= 0) {
+                    self->pressedIndex = -1;
+                    self->pressDownClientPt = POINT{ -99999, -99999 };
+                    self->pressDuringEmerge = false;
+                    if (self->visible) {
+                        if (Motion::IsReducedMotion()) { self->pressAnim = 0.0f; self->Render(); }
+                        else { self->EnsureAnimTimer(); self->Render(); }
+                    }
                 }
                 return 0;
             }
