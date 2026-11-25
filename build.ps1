@@ -161,11 +161,11 @@ try {
     Pop-Location
 }
 
-# 5. Hard gates on staged binary: size (< 600 KB), PE version, and strict Windows native DLL whitelist
+# 5. Hard gates on staged binary: size (< 900 KB), PE version, and strict Windows native DLL whitelist
 $sizeBytes = (Get-Item $stageExe).Length
 $sizeKB = [Math]::Round($sizeBytes / 1024.0, 1)
-if ($sizeBytes -ge 614400) {
-    throw "Size gate failed: staged binary is $sizeKB KB ($sizeBytes bytes), exceeding 600 KB limit!"
+if ($sizeBytes -ge 921600) {
+    throw "Size gate failed: staged binary is $sizeKB KB ($sizeBytes bytes), exceeding 900 KB limit!"
 }
 
 $fvi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($stageExe)

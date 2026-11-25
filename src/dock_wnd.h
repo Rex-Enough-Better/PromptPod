@@ -647,6 +647,7 @@ public:
     bool mouseTracking = false;
     int bubblePendingSlot = -1;
     ULONGLONG bubbleHoverDeadline = 0;
+    bool bubbleHideGraceActive = false;
 
     // Slot drag-to-reorder & press-release ownership state
     int pressedSlot = -1;
@@ -764,6 +765,7 @@ public:
     static constexpr UINT_PTR kTimerQuickVerify = 5009;
     static constexpr UINT_PTR kTimerDockToast   = 5010;
     static constexpr UINT_PTR kTimerCopyClear   = 5011;
+    static constexpr UINT_PTR kTimerBubbleHideGrace = 5012;
 
     bool Init(HINSTANCE inst, AppState* st, StorageManager* stor, DarkPopupMenu* menu, VaultWindow* vault,
               std::function<void(POINT)> appMenuCb, bool showInitial = true) {
@@ -929,19 +931,32 @@ public:
         }
     }
 
+    void CancelBubbleHideGrace() {
+        if (bubbleHideGraceActive) {
+            if (hwnd) KillTimer(hwnd, kTimerBubbleHideGrace);
+            bubbleHideGraceActive = false;
+        }
+    }
+
+    void HideHoverBubbleHard(bool immediate) {
+        if (hwnd) KillTimer(hwnd, kTimerBubbleHover);
+        CancelBubbleHideGrace();
+        bubblePendingSlot = -1;
+        bubbleHoverDeadline = 0;
+        if (immediate) hoverBubble.HideImmediate();
+        else hoverBubble.HideSmooth();
+    }
+
     void ClearSceneTransientState() {
         if (isSlotDragging || pressedSlot >= 0) CancelSlotDrag(true);
         if (hwnd) {
-            KillTimer(hwnd, kTimerBubbleHover);
             KillTimer(hwnd, kTimerAutoRetract);
             KillTimer(hwnd, kTimerCopyClear);
         }
         pendingAutoRetract = false;
         ++retractGen;
         resyncHoverAfterScroll = false;
-        bubblePendingSlot = -1;
-        bubbleHoverDeadline = 0;
-        hoverBubble.HideImmediate();
+        HideHoverBubbleHard(true);
         hoverSlot = -1;
         copiedSlot = -1;
         copiedTick = 0;
@@ -997,10 +1012,7 @@ public:
     void Refresh() {
         if (!hwnd) return;
         if (!state->showHoverBubble) {
-            KillTimer(hwnd, kTimerBubbleHover);
-            bubblePendingSlot = -1;
-            bubbleHoverDeadline = 0;
-            hoverBubble.HideImmediate();
+            HideHoverBubbleHard(true);
         }
         if (state) {
             int liveScene = state->EffectiveActiveSceneIndex();
@@ -1154,10 +1166,7 @@ public:
         onboardPulseStartTick = GetTickCount64();
         KillTimer(hwnd, kTimerHoverExpand);
         KillTimer(hwnd, kTimerAutoRetract);
-        KillTimer(hwnd, kTimerBubbleHover);
-        bubblePendingSlot = -1;
-        bubbleHoverDeadline = 0;
-        hoverBubble.HideImmediate();
+        HideHoverBubbleHard(true);
         pendingAutoRetract = false;
         ++retractGen;
         holdOpenUntilTick = 0;
@@ -1521,14 +1530,11 @@ private:
 
     void CancelActiveInteractions() {
         KillTimer(hwnd, kTimerHoverExpand);
-        KillTimer(hwnd, kTimerBubbleHover);
         KillTimer(hwnd, kTimerAutoRetract);
         pendingAutoRetract = false;
         ++retractGen;
         handleHovered = false;
-        bubblePendingSlot = -1;
-        bubbleHoverDeadline = 0;
-        hoverBubble.HideImmediate();
+        HideHoverBubbleHard(true);
         if (popupMenu && popupMenu->IsOpenFor(MenuOwner::Dock)) popupMenu->Close();
         bool hadDrag = isDragging;
         CancelSlotDrag(true);
@@ -1658,10 +1664,7 @@ private:
 
     void StartSpringTo(float target) {
         if (target < 0.5f) {
-            KillTimer(hwnd, kTimerBubbleHover);
-            bubblePendingSlot = -1;
-            bubbleHoverDeadline = 0;
-            hoverBubble.HideSmooth();
+            HideHoverBubbleHard(false);
             StopLeaveWatchTimer();
         }
         expandSpring.target = target;
@@ -1669,26 +1672,41 @@ private:
     }
 
     void SyncHoverBubble(bool immediate) {
-        if (!hwnd || !state || !state->showHoverBubble || hoverSlot < 0 || hoverSlot >= 10 ||
+        if (!hwnd || !state || !state->showHoverBubble ||
             isDragging || isSlotDragging || IsDockMenuOpen() || IsOnboardingActive() ||
             IsCompactCollapsedMode() || expandSpring.target < 0.5f) {
-            KillTimer(hwnd, kTimerBubbleHover);
-            bubblePendingSlot = -1;
-            bubbleHoverDeadline = 0;
-            hoverBubble.HideSmooth();
+            HideHoverBubbleHard(false);
             return;
         }
-        const PromptItem* item = state->FindById(state->ActiveSlots()[(size_t)hoverSlot]);
+        const PromptItem* item = (hoverSlot >= 0 && hoverSlot < 10)
+            ? state->FindById(state->ActiveSlots()[(size_t)hoverSlot])
+            : nullptr;
         if (!item) {
+            // Soft leave onto 5 DIP inter-slot gap or empty slot: hold the bubble alive for 130 ms
+            // so sliding across adjacent slots morphs continuously with ZERO fade-out/pop-in flicker!
             KillTimer(hwnd, kTimerBubbleHover);
             bubblePendingSlot = -1;
             bubbleHoverDeadline = 0;
-            hoverBubble.HideSmooth();
+            if (hoverBubble.IsShowingOrAppearing()) {
+                if (Motion::IsReducedMotion()) {
+                    hoverBubble.HideImmediate();
+                } else if (!bubbleHideGraceActive) {
+                    if (SetTimer(hwnd, kTimerBubbleHideGrace, 130, nullptr) != 0) {
+                        bubbleHideGraceActive = true;
+                    } else {
+                        hoverBubble.HideSmooth();
+                    }
+                }
+            } else {
+                CancelBubbleHideGrace();
+                hoverBubble.HideSmooth();
+            }
             return;
         }
+        CancelBubbleHideGrace();
         ULONGLONG now = GetTickCount64();
         bool deadlineReached = (bubblePendingSlot == hoverSlot && bubbleHoverDeadline != 0 && now >= bubbleHoverDeadline);
-        if (expandSpring.value >= 0.72f && (immediate || deadlineReached || hoverBubble.IsShowingOrAppearing())) {
+        if (expandSpring.value >= 0.72f && (immediate || deadlineReached || hoverBubble.IsAliveForMorph())) {
             KillTimer(hwnd, kTimerBubbleHover);
             bubblePendingSlot = -1;
             bubbleHoverDeadline = 0;
@@ -2503,8 +2521,7 @@ private:
 
     [[gnu::noinline]] void TriggerSlotCopy(int slotIdx) {
         if (slotIdx < 0 || slotIdx >= 10) return;
-        KillTimer(hwnd, kTimerBubbleHover);
-        hoverBubble.HideSmooth();
+        HideHoverBubbleHard(false);
         PromptItem* item = state->FindById(state->ActiveSlots()[(size_t)slotIdx]);
         if (!item) return;
 
@@ -2672,7 +2689,7 @@ private:
         int mounted = state->CountMountedInScene(sceneIdx);
         std::vector<DarkMenuItem> items;
         items.push_back(DarkMenuItem::Header(L"\x573A\x666F \x00B7 " + state->scenes[(size_t)sceneIdx].name));
-        items.push_back(DarkMenuItem::Action(6, L"\x914D\x7F6E\x6B64\x573A\x666F\x63D0\x793A\x8BCD..."));
+        items.push_back(DarkMenuItem::Action(6, L"\x7F16\x8F91\x6B64\x573A\x666F\x53F0\x9762..."));
         items.push_back(DarkMenuItem::Action(1, L"\x91CD\x547D\x540D\x6B64\x573A\x666F..."));
         if (mounted > 0) {
             items.push_back(DarkMenuItem::Action(2, L"\x6E05\x7A7A\x6B64\x573A\x666F\x69FD\x4F4D\xFF08\x4FDD\x7559\x8BCD\x8231\xFF09", L"", false, true));
@@ -3402,10 +3419,7 @@ private:
                         if (std::fabs(nextScroll - self->slotScrollTargetDip) > 0.1f) {
                             self->slotScrollTargetDip = nextScroll;
                             self->hoverSlot = -1;
-                            self->bubblePendingSlot = -1;
-                            self->bubbleHoverDeadline = 0;
-                            KillTimer(h, kTimerBubbleHover);
-                            self->hoverBubble.HideImmediate();
+                            self->HideHoverBubbleHard(true);
                             if (Motion::IsReducedMotion()) {
                                 self->slotScrollDip = nextScroll;
                                 self->RenderAndPresent("slot-wheel");
@@ -3451,6 +3465,16 @@ private:
                 } else if (wp == kTimerBubbleHover) {
                     KillTimer(h, kTimerBubbleHover);
                     self->SyncHoverBubble(true);
+                } else if (wp == kTimerBubbleHideGrace) {
+                    self->CancelBubbleHideGrace();
+                    const PromptItem* liveItem = (self->hoverSlot >= 0 && self->hoverSlot < 10 && self->state)
+                        ? self->state->FindById(self->state->ActiveSlots()[(size_t)self->hoverSlot])
+                        : nullptr;
+                    if (!liveItem || !self->state || !self->state->showHoverBubble ||
+                        self->isDragging || self->isSlotDragging || self->IsDockMenuOpen() ||
+                        self->IsOnboardingActive() || self->IsCompactCollapsedMode() || self->expandSpring.target < 0.5f) {
+                        self->hoverBubble.HideSmooth();
+                    }
                 } else if (wp == kTimerDisplaySync) {
                     self->OnDisplaySyncTimer();
                 } else if (wp == kTimerWatchdog) {
@@ -3509,8 +3533,7 @@ private:
                             KillTimer(h, kTimerAutoRetract);
                             self->pendingAutoRetract = false;
                             ++self->retractGen;
-                            KillTimer(h, kTimerBubbleHover);
-                            self->hoverBubble.HideImmediate();
+                            self->HideHoverBubbleHard(true);
                         }
                     }
                     if (self->isSlotDragging) {
@@ -3760,11 +3783,10 @@ private:
                 self->HitTestExpandedDip(dx, dy, hs, onHeader);
 
                 if (onHeader) {
-                    KillTimer(h, kTimerBubbleHover);
                     KillTimer(h, kTimerAutoRetract);
                     self->pendingAutoRetract = false;
                     ++self->retractGen;
-                    self->hoverBubble.HideImmediate();
+                    self->HideHoverBubbleHard(true);
                     self->isDragging = true;
                     self->dragMoved = false;
                     self->dragStartedCollapsed = false;
@@ -4016,8 +4038,7 @@ private:
 
                 if (downEmpty >= 0 && hs == downEmpty && hs < 10 &&
                     self->state->FindById(self->state->ActiveSlots()[(size_t)hs]) == nullptr) {
-                    KillTimer(h, kTimerBubbleHover);
-                    self->hoverBubble.HideImmediate();
+                    self->HideHoverBubbleHard(true);
                     self->RenderAndPresent();
                     if (self->onboardingWnd.step == OnboardingStep::Step2Create && !self->onboardingWnd.step2Done) {
                         self->TriggerOnboardingCreatePrompt(hs);
@@ -4052,8 +4073,7 @@ private:
             }
 
             case WM_RBUTTONUP: {
-                KillTimer(h, kTimerBubbleHover);
-                self->hoverBubble.HideImmediate();
+                self->HideHoverBubbleHard(true);
                 POINT cur = MsgScreenPoint(h, lp);
                 if (self->IsCompactCollapsedMode()) {
                     if (self->onRequestAppMenu) self->onRequestAppMenu(cur);

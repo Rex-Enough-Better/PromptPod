@@ -61,6 +61,10 @@ inline uint32_t PackAppVersion(uint32_t major, uint32_t minor, uint32_t patch) {
     return ((major & 0x3FFu) << 20) | ((minor & 0x3FFu) << 10) | (patch & 0x3FFu);
 }
 
+inline bool ShouldTakeOverExistingInstance(uint32_t runningVer, uint32_t currentVer, bool forceReplace) {
+    return forceReplace || (runningVer < currentVer);
+}
+
 class AppController {
 public:
     HINSTANCE hInst = nullptr;
@@ -2084,6 +2088,142 @@ inline int RunHeadlessSelfTest(const std::wstring& testRootDir) {
         Motion::SetReducedMotionOverride(-1);
     }
 
+    // 13. v0.13.0 regression: zero-flicker 2D morphing bubble + gap grace, dual-pane scene picker filters, and --replace handoff
+    {
+        // 13a. ScenePromptsDialog 3-way filter buckets & IsMountedInAnyScene (including disabled scenes!)
+        AppState scSt{};
+        StorageManager::SeedDefaults(scSt, false);
+        int nNotCur = 0, nUnm = 0, nAll = 0;
+        ScenePromptsDialog::CountFilterBuckets(scSt, 0, nNotCur, nUnm, nAll);
+        if (nAll != 12 || nNotCur != 10 || nUnm != 8) return 250;
+
+        auto fNotCur = ScenePromptsDialog::FilterVaultCandidates(scSt, 0, ScenePromptsDialog::PickerFilter::NotInCurrent, L"");
+        auto fUnm    = ScenePromptsDialog::FilterVaultCandidates(scSt, 0, ScenePromptsDialog::PickerFilter::UnmountedAll, L"");
+        auto fAll    = ScenePromptsDialog::FilterVaultCandidates(scSt, 0, ScenePromptsDialog::PickerFilter::All, L"");
+        if (fNotCur.size() != 10 || fUnm.size() != 8 || fAll.size() != 12) return 251;
+        for (size_t vi : fNotCur) {
+            if (scSt.FindSlotOfIdInScene(0, scSt.vault[vi].id) >= 0) return 252;
+        }
+        for (size_t vi : fUnm) {
+            if (scSt.IsMountedInAnyScene(scSt.vault[vi].id)) return 253;
+        }
+
+        // Mounting into disabled scene 2 ('开发') at explicit slot 4 ('05') must immediately reduce UnmountedAll count from 8 -> 7
+        std::wstring pickedId = scSt.vault[fUnm[0]].id;
+        scSt.AssignToSlotInScene(2, 4, pickedId);
+        if (scSt.FindSlotOfIdInScene(2, pickedId) != 4 || !scSt.IsMountedInAnyScene(pickedId)) return 254;
+        ScenePromptsDialog::CountFilterBuckets(scSt, 0, nNotCur, nUnm, nAll);
+        if (nNotCur != 10 || nUnm != 7 || nAll != 12) return 255;
+
+        // Case-insensitive search across filters
+        auto fSearch = ScenePromptsDialog::FilterVaultCandidates(scSt, 0, ScenePromptsDialog::PickerFilter::All, L"ux");
+        if (fSearch.empty()) return 256;
+
+        // 13b. --replace single-instance takeover logic (allows same-version silent hot reload while preserving default behavior)
+        uint32_t v13 = PackAppVersion(0, 13, 0);
+        uint32_t v12 = PackAppVersion(0, 12, 0);
+        if (ShouldTakeOverExistingInstance(v13, v13, false)) return 257;
+        if (!ShouldTakeOverExistingInstance(v13, v13, true)) return 258;
+        if (!ShouldTakeOverExistingInstance(v12, v13, false)) return 259;
+        if (ShouldTakeOverExistingInstance(v13, v12, false)) return 260;
+        if (!ShouldTakeOverExistingInstance(v13, v12, true)) return 261;
+
+        // 13c. HoverBubbleWindow 2D width+height morphing, DIB capacity stability, 130 ms gap grace, and mid-fade interruption
+        Motion::SetReducedMotionOverride(0);
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        int bErr = 0;
+        {
+            AppState bSt{};
+            StorageManager::SeedDefaults(bSt, false);
+            bSt.showHoverBubble = true;
+            bSt.vault[0].title = L"短词";
+            bSt.vault[0].content = L"短内容";
+            bSt.vault[1].title = L"长提示词标题较宽展示测试";
+            bSt.vault[1].content.clear();
+            for (int k = 0; k < 18; ++k) bSt.vault[1].content += L"这是一段用于验证二维平滑形变与宽度自适应扩展的较长正文内容。\n";
+            bSt.AssignToSlotInScene(0, 0, bSt.vault[0].id);
+            bSt.AssignToSlotInScene(0, 1, bSt.vault[1].id);
+
+            DockWindow dock13;
+            dock13.monitorProvider = makeFixedMon(RECT{ 0, 0, 1920, 1080 }, RECT{ 0, 0, 1920, 1040 });
+            if (!dock13.Init(GetModuleHandleW(nullptr), &bSt, &sm, nullptr, nullptr, nullptr, false)) {
+                bErr = 262;
+            } else {
+                dock13.expandSpring.Snap(1.0f);
+                dock13.RenderAndPresent("selftest-v13-init");
+
+                // Open on short slot 0
+                dock13.hoverSlot = 0;
+                dock13.SyncHoverBubble(true);
+                HBITMAP dibBefore = dock13.hoverBubble.canvas.dib;
+                float w0 = dock13.hoverBubble.widthSpring.value;
+                float h0 = dock13.hoverBubble.heightSpring.value;
+                if (!dock13.hoverBubble.IsShowingOrAppearing() || !dibBefore || w0 >= HoverBubbleWindow::kMaxCardW - 10.0f) bErr = 263;
+
+                // Slide into 5 DIP inter-slot gap (hoverSlot = -1): MUST stay visible & arm grace timer (zero flicker!)
+                if (bErr == 0) {
+                    dock13.hoverSlot = -1;
+                    dock13.SyncHoverBubble(false);
+                    if (!dock13.bubbleHideGraceActive || !dock13.hoverBubble.IsShowingOrAppearing() ||
+                        dock13.hoverBubble.alphaSpring.target < 0.5f) {
+                        bErr = 264;
+                    }
+                }
+
+                // Enter tall wide slot 1 within grace window: cancels grace, morphs width & height smoothly, starts cross-fade, zero DIB re-alloc!
+                if (bErr == 0) {
+                    dock13.hoverSlot = 1;
+                    dock13.SyncHoverBubble(false);
+                    if (dock13.bubbleHideGraceActive || dock13.hoverBubble.currentSlot != 1 ||
+                        dock13.hoverBubble.prevSlot != 0 || dock13.hoverBubble.contentBlend > 0.05f ||
+                        dock13.hoverBubble.widthSpring.target <= w0 + 15.0f ||
+                        dock13.hoverBubble.heightSpring.target <= h0 + 40.0f ||
+                        dock13.hoverBubble.canvas.dib != dibBefore) {
+                        bErr = 265;
+                    }
+                }
+
+                // Grace timeout starts smooth fade-out; re-entering slot 0 mid-fade MUST catch & morph in place!
+                if (bErr == 0) {
+                    dock13.hoverBubble.alphaSpring.Snap(1.0f);
+                    dock13.hoverSlot = -1;
+                    dock13.SyncHoverBubble(false);
+                    SendMessageW(dock13.hwnd, WM_TIMER, DockWindow::kTimerBubbleHideGrace, 0);
+                    if (dock13.bubbleHideGraceActive || dock13.hoverBubble.alphaSpring.target != 0.0f ||
+                        !dock13.hoverBubble.IsAliveForMorph()) {
+                        bErr = 266;
+                    }
+                    if (bErr == 0) {
+                        dock13.hoverBubble.alphaSpring.value = 0.65f; // Mid-fade-out
+                        dock13.hoverSlot = 0;
+                        dock13.SyncHoverBubble(false);
+                        if (dock13.hoverBubble.alphaSpring.target < 0.5f || dock13.hoverBubble.currentSlot != 0) {
+                            bErr = 267;
+                        }
+                    }
+                }
+
+                // Reduced Motion snaps width/height/notch and clears cross-fade snapshot immediately
+                if (bErr == 0) {
+                    Motion::SetReducedMotionOverride(1);
+                    dock13.hoverSlot = 1;
+                    dock13.SyncHoverBubble(true);
+                    if (std::fabs(dock13.hoverBubble.widthSpring.value - dock13.hoverBubble.widthSpring.target) > 0.5f ||
+                        dock13.hoverBubble.prevBodyLayout != nullptr || dock13.hoverBubble.contentBlend < 0.99f) {
+                        bErr = 268;
+                    }
+                    dock13.hoverBubble.HideImmediate();
+                }
+
+                if (dock13.hoverBubble.hwnd) DestroyWindow(dock13.hoverBubble.hwnd);
+                if (dock13.hwnd) DestroyWindow(dock13.hwnd);
+            }
+        }
+        CoUninitialize();
+        Motion::SetReducedMotionOverride(-1);
+        if (bErr != 0) return bErr;
+    }
+
     return 0;
 }
 
@@ -2094,6 +2234,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 
     bool silentAutostart = false;
+    bool forceReplace = false;
     bool selfTest = false;
     std::wstring selfTestDir;
     std::wstring customDataDir;
@@ -2105,6 +2246,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
             std::wstring arg = argv[i];
             if (arg == L"--autostart") {
                 silentAutostart = true;
+            } else if (arg == L"--replace") {
+                forceReplace = true;
             } else if (arg == L"--data-dir") {
                 if (i + 1 < argc) customDataDir = argv[++i];
             } else if (arg == L"--self-test") {
@@ -2164,9 +2307,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         uint32_t runningVer = existing ? (uint32_t)(ULONG_PTR)GetPropW(existing, L"PP_AppVerPacked") : 0;
         uint32_t currentVer = pp::PackAppVersion(APP_VER_MAJOR, APP_VER_MINOR, APP_VER_PATCH);
 
-        // Seamless upgrade handoff: if user double-clicks a NEWER version while an older version is resident,
-        // gracefully ask the older instance to save & exit (WM_CLOSE) and take over automatically!
-        if (existing && runningVer < currentVer) {
+        // Seamless upgrade handoff: take over automatically if a NEWER version is launched or --replace is passed
+        if (existing && pp::ShouldTakeOverExistingInstance(runningVer, currentVer, forceReplace)) {
             // Must close our duplicate handle BEFORE waiting, otherwise the named kernel mutex stays alive!
             CloseHandle(hMutex);
             hMutex = nullptr;

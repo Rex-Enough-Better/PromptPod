@@ -7,12 +7,12 @@
 #define APP_DISPLAY_TITLE_W     L"\x8BCD\x8231 PromptPod"
 
 #define APP_VER_MAJOR           0
-#define APP_VER_MINOR           12
+#define APP_VER_MINOR           13
 #define APP_VER_PATCH           0
 #define APP_VER_BUILD           0
 
-#define APP_VERSION_A           "0.12.0"
-#define APP_VERSION_W           L"0.12.0"
+#define APP_VERSION_A           "0.13.0"
+#define APP_VERSION_W           L"0.13.0"
 #define APP_MUTEX_NAME_W        L"Local\\PromptPod_SingleInstance_Mutex_v1"
 #define APP_RUN_REG_VALUE_W     L"PromptPod"
 

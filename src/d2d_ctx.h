@@ -211,6 +211,20 @@ public:
         return true;
     }
 
+    // Pre-reserve DIBSection capacity once so morphing animations never reallocate GDI bitmaps mid-flight
+    [[gnu::noinline]] bool ReserveCapacity(int minW, int minH) {
+        if (minW <= 0 || minH <= 0) return false;
+        if (memDC && dib && capWidthPx >= minW && capHeightPx >= minH) return true;
+        int prevW = widthPx;
+        int prevH = heightPx;
+        if (!EnsureSize(std::max(capWidthPx, minW), std::max(capHeightPx, minH))) return false;
+        if (prevW > 0 && prevH > 0) {
+            widthPx = prevW;
+            heightPx = prevH;
+        }
+        return true;
+    }
+
     // Sample premultiplied BGRA alpha byte at (x, y) in the top-down DIB after EndDraw()+GdiFlush()
     BYTE SampleAlphaAt(int x, int y) const {
         if (!bits || x < 0 || y < 0 || x >= capWidthPx || y >= capHeightPx) return 0;

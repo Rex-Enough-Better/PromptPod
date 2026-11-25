@@ -402,6 +402,14 @@ struct AppState {
         return false;
     }
 
+    [[gnu::noinline]] bool IsMountedInAnyScene(const std::wstring& id) const {
+        if (id.empty()) return false;
+        for (int s = 0; s < kMaxScenes; ++s) {
+            if (FindSlotOfIdInScene(s, id) >= 0) return true;
+        }
+        return false;
+    }
+
     // Counts how many OTHER enabled scenes (excluding `excludeSceneIdx`, or activeScene if < 0) contain `id`.
     [[gnu::noinline]] int CountOtherEnabledScenesWithId(const std::wstring& id, int* outFirstScene = nullptr, int* outFirstSlot = nullptr, int excludeSceneIdx = -1) const {
         if (outFirstScene) *outFirstScene = -1;

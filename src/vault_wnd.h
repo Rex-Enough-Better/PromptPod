@@ -88,6 +88,10 @@ inline size_t FindIgnoreCasePos(const std::wstring& hay, const std::wstring& nee
     return std::wstring::npos;
 }
 
+inline bool ContainsIgnoreCaseStr(const std::wstring& hay, const std::wstring& needle) {
+    return needle.empty() || FindIgnoreCasePos(hay, needle) != std::wstring::npos;
+}
+
 inline std::wstring BuildSearchPreviewSnippet(const std::wstring& content, const std::wstring& query, size_t maxChars = 104) {
     std::wstring single = CollapseWhitespaceSingleLine(content, 2000);
     if (query.empty() || single.size() <= maxChars) {
@@ -2003,49 +2007,127 @@ private:
 };
 
 // ============================================================================
-// Modal Dark Scene Prompts Manager Dialog (Check/Uncheck, Edit & Create Prompt)
+// Modal Dual-Pane Scene Workbench (1:1 Dock 10-Slot Deck + Filterable Vault Picker)
 // ============================================================================
 class ScenePromptsDialog {
 public:
     using MutatedFn = void(*)(void*);
 
-    [[gnu::noinline]] static void Show(HINSTANCE hInst, HWND parent, AppState* st, StorageManager* sm, int sceneIdx,
-                                       MutatedFn onMutated, void* mutatedCtx) {
+    enum class PickerFilter : int {
+        NotInCurrent = 0, // Exclude prompts already mounted in current scene
+        UnmountedAll = 1, // Exclude prompts mounted in ANY scene (unassigned inventory only)
+        All          = 2  // Show all vault prompts with scene membership badges
+    };
+
+    [[gnu::noinline]] static std::vector<size_t> FilterVaultCandidates(
+        const AppState& st, int sceneIdx, PickerFilter filter, const std::wstring& query) {
+        std::vector<size_t> out;
+        out.reserve(st.vault.size());
+        for (size_t i = 0; i < st.vault.size(); ++i) {
+            const auto& item = st.vault[i];
+            if (filter == PickerFilter::NotInCurrent) {
+                if (st.FindSlotOfIdInScene(sceneIdx, item.id) >= 0) continue;
+            } else if (filter == PickerFilter::UnmountedAll) {
+                if (st.IsMountedInAnyScene(item.id)) continue;
+            }
+            if (!query.empty() &&
+                !ContainsIgnoreCaseStr(item.title, query) &&
+                !ContainsIgnoreCaseStr(item.content, query)) {
+                continue;
+            }
+            out.push_back(i);
+        }
+        return out;
+    }
+
+    [[gnu::noinline]] static void CountFilterBuckets(
+        const AppState& st, int sceneIdx, int& outNotInCur, int& outUnmountedAll, int& outAll) {
+        outNotInCur = 0;
+        outUnmountedAll = 0;
+        outAll = (int)st.vault.size();
+        for (const auto& item : st.vault) {
+            if (st.FindSlotOfIdInScene(sceneIdx, item.id) < 0) ++outNotInCur;
+            if (!st.IsMountedInAnyScene(item.id)) ++outUnmountedAll;
+        }
+    }
+
+    [[gnu::noinline]] static void Show(HINSTANCE hInst, HWND parent, AppState* st, StorageManager* sm,
+                                       DarkPopupMenu* menu, int sceneIdx, MutatedFn onMutated, void* mutatedCtx) {
         if (!st || !sm || sceneIdx < 0 || sceneIdx >= kMaxScenes) return;
-        ScenePromptsDialog dlg(hInst, st, sm, sceneIdx, onMutated, mutatedCtx);
+        ScenePromptsDialog dlg(hInst, st, sm, menu, sceneIdx, onMutated, mutatedCtx);
         dlg.RunModal(parent);
     }
 
 private:
     struct Zone {
-        int kind = 0; // 1:NewPrompt, 2:Done, 10:ToggleCheck, 11:EditPrompt
+        // 1:NewPrompt, 2:Done, 3:ToggleSceneEnabled, 4:RenameScene, 5:ClearScene, 6:UndoClear,
+        // 7:ClearSearch, 8:ClearTargetSlot, 9:NewFromSearch,
+        // 20..23:SwitchScene(0..3), 30..32:Filter(NotInCur/UnmountedAll/All),
+        // 40..49:LeftSlotBody(0..9), 50..59:LeftSlotEdit(0..9), 60..69:LeftSlotRemove(0..9),
+        // 70:RightCardAction(pid), 71:RightCardEdit(pid)
+        int kind = 0;
         std::wstring pid;
         D2D1_RECT_F rect{};
     };
 
+    static constexpr float kTopBarH     = 58.0f;
+    static constexpr float kFooterH     = 46.0f;
+    static constexpr float kLeftPaneX   = 18.0f;
+    static constexpr float kLeftPaneW   = 296.0f;
+    static constexpr float kRightPaneX  = 328.0f;
+    static constexpr float kSlotH       = 36.0f;
+    static constexpr float kSlotGap     = 4.0f;
+    static constexpr float kSlotStride  = kSlotH + kSlotGap;
+    static constexpr UINT_PTR kTimerAnim       = 1401;
+    static constexpr UINT_PTR kTimerUndoExpire = 1402;
+    static constexpr const wchar_t* kSearchProp = L"PP_ScenePickerSearch";
+
     HINSTANCE hInst = nullptr;
     AppState* state = nullptr;
     StorageManager* storage = nullptr;
+    DarkPopupMenu* popupMenu = nullptr;
     int sceneIndex = 0;
     MutatedFn onMutated = nullptr;
     void* mutatedCtx = nullptr;
     HWND hwnd = nullptr;
+    HWND hSearchEdit = nullptr;
+    HFONT hSearchFont = nullptr;
+    HBRUSH hSearchBrush = nullptr;
+    WNDPROC origSearchProc = nullptr;
+
     ComPtr<ID2D1HwndRenderTarget> rt;
     ComPtr<ID2D1SolidColorBrush> brush;
     ComPtr<IDWriteTextFormat> fmtHeading;
+    ComPtr<IDWriteTextFormat> fmtTab;
     ComPtr<IDWriteTextFormat> fmtTitle;
     ComPtr<IDWriteTextFormat> fmtBody;
     ComPtr<IDWriteTextFormat> fmtBadge;
     ComPtr<IDWriteTextFormat> fmtBtn;
 
-    std::vector<std::wstring> orderedIds;
+    PickerFilter pickerFilter = PickerFilter::NotInCurrent;
+    std::wstring pickerQuery;
+    bool searchFocused = false;
+    float searchFocusAnim = 0.0f;
+    float clearSearchAnim = 0.0f;
+    int targetSlot = -1; // -1 = auto first empty, 0..9 = explicit slot target from left deck
+
+    std::vector<size_t> filteredIndices;
+    bool filterDirty = true;
     std::vector<Zone> zones;
     DarkViewportScrollbar scrollbar;
+
     float dpiScale = 1.0f;
     float scrollY = 0.0f;
     float scrollTargetY = 0.0f;
     float maxScrollY = 0.0f;
     float viewportH = 300.0f;
+
+    float leftScrollY = 0.0f;
+    float leftScrollTargetY = 0.0f;
+    float leftMaxScrollY = 0.0f;
+    float leftSlotsTopDip = 104.0f;
+    D2D1_RECT_F leftSlotsVp{};
+
     int hoverZoneIdx = -1;
     int pressedKind = 0;
     std::wstring pressedPid;
@@ -2054,64 +2136,148 @@ private:
     bool trackingLeave = false;
     bool done = false;
 
-    std::wstring animCheckPid;
-    float animCheckVal = 1.0f;
-    float animCheckTarget = 1.0f;
+    // Left 10-slot transactional drag-to-reorder state (mirrors DockWindow!)
+    int pressedSlot = -1;
+    bool isSlotDragging = false;
+    std::array<std::wstring, 10> slotDragOrigSlots{};
+    float slotDragStartY = 0.0f;
+    float slotDragGrabOffsetY = 0.0f;
+    float slotDragCurY = 0.0f;
+    std::array<Spring1D, 10> slotShiftSpring{};
+    Spring1D dragLiftSpring = Spring1D::Snappy(0.0f);
+
+    // 5-second inline undo for Clear Scene
+    bool undoClearActive = false;
+    int undoClearSceneIdx = -1;
+    std::array<std::wstring, 10> undoClearSlots{};
+    ULONGLONG undoClearExpireTick = 0;
+
+    // Unified sliding indicators & micro-shake state
+    Spring1D scenePillXSpring = Spring1D::Snappy(21.0f);
+    Spring1D scenePillWSpring = Spring1D::Snappy(110.0f);
+    bool scenePillInit = false;
+    D2D1_COLOR_F sceneAccCol = Rgba(Theme::AccentCyan);
+    D2D1_COLOR_F sceneAccTarget = Rgba(Theme::AccentCyan);
+
+    Spring1D filterPillXSpring = Spring1D::Snappy(328.0f);
+    Spring1D filterPillWSpring = Spring1D::Snappy(108.0f);
+    bool filterPillInit = false;
+    D2D1_COLOR_F filterAccCol = Rgba(Theme::AccentCyan);
+    D2D1_COLOR_F filterAccTarget = Rgba(Theme::AccentCyan);
+
     ULONGLONG fullShakeTick = 0;
+    ULONGLONG lockedShakeTick = 0;
     LARGE_INTEGER qpcFreq{};
     LARGE_INTEGER lastAnimQpc{};
     bool animActive = false;
 
-    static constexpr UINT_PTR kTimerAnim = 1401;
+    ScenePromptsDialog(HINSTANCE inst, AppState* st, StorageManager* sm, DarkPopupMenu* menu,
+                       int sc, MutatedFn cb, void* ctx)
+        : hInst(inst), state(st), storage(sm), popupMenu(menu), sceneIndex(sc), onMutated(cb), mutatedCtx(ctx) {
+        for (auto& sp : slotShiftSpring) sp = Spring1D::Settle(0.0f);
+        uint32_t acc = Theme::SceneTextAccent(sceneIndex);
+        sceneAccCol = sceneAccTarget = Rgba(acc);
+        filterAccCol = filterAccTarget = Rgba(acc);
+    }
+
+    ~ScenePromptsDialog() {
+        DetachSearchControl();
+        if (hSearchFont) DeleteObject(hSearchFont);
+        if (hSearchBrush) DeleteObject(hSearchBrush);
+    }
+
+    void DetachSearchControl() {
+        if (hSearchEdit && IsWindow(hSearchEdit) && origSearchProc) {
+            SetWindowLongPtrW(hSearchEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(origSearchProc));
+            RemovePropW(hSearchEdit, kSearchProp);
+        }
+        origSearchProc = nullptr;
+    }
+
+    void NotifyMutated() {
+        filterDirty = true;
+        if (onMutated) onMutated(mutatedCtx);
+    }
+
+    void EnsureFiltered() {
+        if (!filterDirty || !state) return;
+        filteredIndices = FilterVaultCandidates(*state, sceneIndex, pickerFilter, pickerQuery);
+        filterDirty = false;
+    }
+
+    static std::wstring FormatSlot2(int idx) {
+        wchar_t b[8]{};
+        wsprintfW(b, L"%02d", idx + 1);
+        return b;
+    }
+
+    D2D1_RECT_F LeftSlotRectDip(int i) const {
+        float top = leftSlotsTopDip + (float)i * kSlotStride - leftScrollY;
+        float rightInset = (leftMaxScrollY > 0.5f) ? 10.0f : 8.0f;
+        return D2D1::RectF(kLeftPaneX + 8.0f, top, kLeftPaneX + kLeftPaneW - rightInset, top + kSlotH);
+    }
+
+    void SnapAllAnims() {
+        scrollY = scrollTargetY;
+        leftScrollY = leftScrollTargetY;
+        scrollbar.hoverAnim = (scrollbar.hovered || scrollbar.dragging) ? 1.0f : 0.0f;
+        searchFocusAnim = searchFocused ? 1.0f : 0.0f;
+        clearSearchAnim = pickerQuery.empty() ? 0.0f : 1.0f;
+        scenePillXSpring.Snap(scenePillXSpring.target);
+        scenePillWSpring.Snap(scenePillWSpring.target);
+        sceneAccCol = sceneAccTarget;
+        filterPillXSpring.Snap(filterPillXSpring.target);
+        filterPillWSpring.Snap(filterPillWSpring.target);
+        filterAccCol = filterAccTarget;
+        dragLiftSpring.Snap(isSlotDragging ? 1.0f : 0.0f);
+        for (auto& sp : slotShiftSpring) sp.Snap(0.0f);
+        fullShakeTick = 0;
+        lockedShakeTick = 0;
+    }
 
     void EnsureAnimTimer() {
         if (!StartWindowAnimTimer(hwnd, kTimerAnim, animActive, qpcFreq, lastAnimQpc)) {
-            scrollY = scrollTargetY;
-            scrollbar.hoverAnim = (scrollbar.hovered || scrollbar.dragging) ? 1.0f : 0.0f;
-            animCheckPid.clear();
-            fullShakeTick = 0;
+            SnapAllAnims();
             if (hwnd && IsWindow(hwnd)) InvalidateRect(hwnd, nullptr, FALSE);
         }
     }
 
-    [[gnu::noinline]] void OnAnimTick() {
-        float dt = StepDeltaQpc(qpcFreq, lastAnimQpc);
-        bool mScr = Motion::ExpApproach(scrollY, scrollTargetY, 20.0f, dt, 0.25f);
-        bool mSb  = scrollbar.StepAnim(dt);
-        bool mChk = !animCheckPid.empty() && Motion::ExpApproach(animCheckVal, animCheckTarget, 22.0f, dt);
-        if (!mChk) animCheckPid.clear();
-        bool mShk = (!Motion::IsReducedMotion() && fullShakeTick != 0 && (GetTickCount64() - fullShakeTick) < 270);
-        if (!mShk) fullShakeTick = 0;
-        InvalidateRect(hwnd, nullptr, FALSE);
-        if (!mScr && !mSb && !mChk && !mShk) {
+    void StopAnimTimer() {
+        if (animActive && hwnd && IsWindow(hwnd)) {
             KillTimer(hwnd, kTimerAnim);
             animActive = false;
         }
     }
 
-    ScenePromptsDialog(HINSTANCE inst, AppState* st, StorageManager* sm, int sc, MutatedFn cb, void* ctx)
-        : hInst(inst), state(st), storage(sm), sceneIndex(sc), onMutated(cb), mutatedCtx(ctx) {
-        RebuildStableOrder();
-    }
-
-    void NotifyMutated() {
-        if (onMutated) onMutated(mutatedCtx);
-    }
-
-    [[gnu::noinline]] void RebuildStableOrder() {
-        orderedIds.clear();
-        if (!state) return;
-        const auto& sl = state->scenes[(size_t)sceneIndex].slots;
-        for (int i = 0; i < 10; ++i) {
-            if (!sl[(size_t)i].empty() && state->FindById(sl[(size_t)i])) {
-                orderedIds.push_back(sl[(size_t)i]);
-            }
+    [[gnu::noinline]] void OnAnimTick() {
+        float dt = StepDeltaQpc(qpcFreq, lastAnimQpc);
+        bool moving = false;
+        moving |= Motion::ExpApproach(scrollY, scrollTargetY, 20.0f, dt, 0.25f);
+        moving |= Motion::ExpApproach(leftScrollY, leftScrollTargetY, 20.0f, dt, 0.25f);
+        moving |= scrollbar.StepAnim(dt);
+        moving |= Motion::ExpApproach(searchFocusAnim, searchFocused ? 1.0f : 0.0f, 22.0f, dt);
+        moving |= Motion::ExpApproach(clearSearchAnim, pickerQuery.empty() ? 0.0f : 1.0f, 22.0f, dt);
+        moving |= scenePillXSpring.Step(dt, 0.15f, 1.0f);
+        moving |= scenePillWSpring.Step(dt, 0.15f, 1.0f);
+        moving |= Motion::ApproachColorRgb(sceneAccCol, sceneAccTarget, 18.0f, dt);
+        moving |= filterPillXSpring.Step(dt, 0.15f, 1.0f);
+        moving |= filterPillWSpring.Step(dt, 0.15f, 1.0f);
+        moving |= Motion::ApproachColorRgb(filterAccCol, filterAccTarget, 18.0f, dt);
+        moving |= dragLiftSpring.Step(dt);
+        for (auto& sp : slotShiftSpring) {
+            moving |= sp.Step(dt, 0.15f, 1.2f);
         }
-        for (const auto& it : state->vault) {
-            if (state->FindSlotOfIdInScene(sceneIndex, it.id) < 0) {
-                orderedIds.push_back(it.id);
-            }
+        ULONGLONG now = GetTickCount64();
+        if (!Motion::IsReducedMotion() && fullShakeTick != 0) {
+            if (now - fullShakeTick < 270) moving = true;
+            else fullShakeTick = 0;
         }
+        if (!Motion::IsReducedMotion() && lockedShakeTick != 0) {
+            if (now - lockedShakeTick < 270) moving = true;
+            else lockedShakeTick = 0;
+        }
+        InvalidateRect(hwnd, nullptr, FALSE);
+        if (!moving) StopAnimTimer();
     }
 
     ID2D1SolidColorBrush* Br(const D2D1_COLOR_F& c) {
@@ -2123,12 +2289,109 @@ private:
         EnsureSoftwareHwndRT(hwnd, dpiScale, rt, brush);
         if (!fmtHeading) {
             auto& eng = D2DEngine::Instance();
-            fmtHeading = eng.CreateFormat(15.0f, DWRITE_FONT_WEIGHT_BOLD);
-            fmtTitle   = eng.CreateFormat(13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+            fmtHeading = eng.CreateFormat(13.0f, DWRITE_FONT_WEIGHT_BOLD);
+            fmtTab     = eng.CreateFormat(12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, true, DWRITE_TEXT_ALIGNMENT_CENTER);
+            fmtTitle   = eng.CreateFormat(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
             fmtBody    = eng.CreateFormat(11.5f, DWRITE_FONT_WEIGHT_NORMAL);
-            fmtBadge   = eng.CreateFormat(11.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, true, DWRITE_TEXT_ALIGNMENT_CENTER);
-            fmtBtn     = eng.CreateFormat(12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, true, DWRITE_TEXT_ALIGNMENT_CENTER);
+            fmtBadge   = eng.CreateFormat(10.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, true, DWRITE_TEXT_ALIGNMENT_CENTER);
+            fmtBtn     = eng.CreateFormat(11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, true, DWRITE_TEXT_ALIGNMENT_CENTER);
         }
+    }
+
+    void RebuildSearchFont() {
+        HFONT nf = CreateUiInputFont(12.5f, dpiScale);
+        if (nf) {
+            if (hSearchEdit) SendMessageW(hSearchEdit, WM_SETFONT, (WPARAM)nf, TRUE);
+            if (hSearchFont) DeleteObject(hSearchFont);
+            hSearchFont = nf;
+        }
+    }
+
+    void UpdateSearchCueBanner() {
+        if (!hSearchEdit || !IsWindow(hSearchEdit) || !state) return;
+        std::wstring cue;
+        if (targetSlot >= 0 && targetSlot < 10) {
+            cue = UiText(L"搜索要放入「" + state->scenes[(size_t)sceneIndex].name + L" · 槽位 " + FormatSlot2(targetSlot) + L"」的 Prompt...");
+        } else {
+            cue = UiText(L"搜索词舱标题或正文（加入「" + state->scenes[(size_t)sceneIndex].name + L"」）");
+        }
+        SendMessageW(hSearchEdit, 0x1501 /*EM_SETCUEBANNER*/, TRUE, reinterpret_cast<LPARAM>(cue.c_str()));
+    }
+
+    void LayoutSearchControl() {
+        if (!hwnd || !hSearchEdit) return;
+        RECT crc{};
+        GetClientRect(hwnd, &crc);
+        float cw = (float)(crc.right - crc.left) / dpiScale;
+        float searchR = cw - 134.0f;
+        float sx = kRightPaneX + 8.0f;
+        float sy = kTopBarH + 14.0f;
+        float sw = std::max(80.0f, (searchR - kRightPaneX) - 34.0f);
+        SetWindowPos(hSearchEdit, nullptr,
+                     (int)std::round(sx * dpiScale), (int)std::round(sy * dpiScale),
+                     (int)std::round(sw * dpiScale), (int)std::round(21.0f * dpiScale),
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    void SetupSearchControl() {
+        dpiScale = GetDpiScaleForWindow(hwnd);
+        if (!hSearchBrush) hSearchBrush = CreateSolidBrush(RGB(27, 31, 43));
+        hSearchEdit = CreateWindowExW(
+            0, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            0, 0, 180, 22,
+            hwnd, (HMENU)4001, hInst, nullptr
+        );
+        if (hSearchEdit) {
+            SetPropW(hSearchEdit, kSearchProp, this);
+            origSearchProc = reinterpret_cast<WNDPROC>(
+                SetWindowLongPtrW(hSearchEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(SearchSubProc)));
+        }
+        RebuildSearchFont();
+        UpdateSearchCueBanner();
+        LayoutSearchControl();
+    }
+
+    void ClearSearchQuery() {
+        pickerQuery.clear();
+        scrollY = scrollTargetY = 0.0f;
+        filterDirty = true;
+        if (hSearchEdit && IsWindow(hSearchEdit)) {
+            SetWindowTextW(hSearchEdit, L"");
+            SetFocus(hSearchEdit);
+        }
+        if (Motion::IsReducedMotion()) clearSearchAnim = 0.0f;
+        else EnsureAnimTimer();
+        if (hwnd) InvalidateRect(hwnd, nullptr, FALSE);
+    }
+
+    [[gnu::noinline]] void CancelSlotDrag(bool rollback) {
+        bool wasDragging = isSlotDragging;
+        isSlotDragging = false;
+        pressedSlot = -1;
+        dragLiftSpring.Snap(0.0f);
+        if (hwnd && GetCapture() == hwnd) ReleaseCapture();
+        if (rollback && wasDragging && state) {
+            state->scenes[(size_t)sceneIndex].slots = slotDragOrigSlots;
+            for (auto& sp : slotShiftSpring) sp.Snap(0.0f);
+        }
+    }
+
+    void SwitchScene(int nextIdx) {
+        if (nextIdx < 0 || nextIdx >= kMaxScenes || nextIdx == sceneIndex) return;
+        CancelSlotDrag(true);
+        if (popupMenu && popupMenu->IsOpenFor(MenuOwner::Vault)) popupMenu->Close();
+        sceneIndex = nextIdx;
+        targetSlot = -1;
+        scrollY = scrollTargetY = 0.0f;
+        leftScrollY = leftScrollTargetY = 0.0f;
+        for (auto& sp : slotShiftSpring) sp.Snap(0.0f);
+        filterDirty = true;
+        statusText.clear();
+        statusIsErr = false;
+        UpdateSearchCueBanner();
+        if (!Motion::IsReducedMotion()) EnsureAnimTimer();
+        if (hwnd) InvalidateRect(hwnd, nullptr, FALSE);
     }
 
     [[gnu::noinline]] int AddZone(int kind, const D2D1_RECT_F& r, const std::wstring& pid = L"") {
@@ -2137,7 +2400,7 @@ private:
         return idx;
     }
 
-    [[gnu::noinline]] int AddClippedZone(int kind, const D2D1_RECT_F& r, const D2D1_RECT_F& clip, const std::wstring& pid) {
+    [[gnu::noinline]] int AddClippedZone(int kind, const D2D1_RECT_F& r, const D2D1_RECT_F& clip, const std::wstring& pid = L"") {
         D2D1_RECT_F cr = D2D1::RectF(
             std::max(r.left, clip.left), std::max(r.top, clip.top),
             std::min(r.right, clip.right), std::min(r.bottom, clip.bottom));
@@ -2145,148 +2408,541 @@ private:
         return AddZone(kind, cr, pid);
     }
 
-    void DrawBtn(const D2D1_RECT_F& r, const wchar_t* txt, int zIdx, uint32_t bg, uint32_t bgHov, uint32_t fg, float rimA = 0.14f) {
+    void DrawBtn(const D2D1_RECT_F& r, const wchar_t* txt, int zIdx, uint32_t bg, uint32_t bgHov, uint32_t fg, float rimA = 0.14f, float alpha = 1.0f) {
         bool isPressed = (zIdx >= 0 && zIdx < (int)zones.size() &&
                           zones[(size_t)zIdx].kind == pressedKind &&
                           zones[(size_t)zIdx].pid == pressedPid);
-        DrawDarkPillButton(rt.Get(), brush.Get(), fmtBtn.Get(), r, txt, zIdx == hoverZoneIdx, bg, bgHov, fg, rimA, isPressed);
+        DrawDarkPillButton(rt.Get(), brush.Get(), fmtBtn.Get(), r, txt, zIdx == hoverZoneIdx, bg, bgHov, fg, rimA, isPressed, alpha);
     }
 
     [[gnu::noinline]] void OnPaint() {
         PAINTSTRUCT ps{};
         BeginPaint(hwnd, &ps);
         EnsureResources();
-        if (rt && brush) {
+        if (rt && brush && state) {
             RECT crc{};
             GetClientRect(hwnd, &crc);
             float cw = (float)(crc.right - crc.left) / dpiScale;
             float ch = (float)(crc.bottom - crc.top) / dpiScale;
-            zones.clear();
-
             rt->BeginDraw();
-            rt->Clear(Rgba(0x10131B, 1.0f));
-
-            // Top bar
-            rt->FillRectangle(D2D1::RectF(0, 0, cw, 56.0f), Br(Rgba(0x141822, 1.0f)));
-            rt->DrawLine(D2D1::Point2F(0, 56.0f), D2D1::Point2F(cw, 56.0f), Br(Rgba(0xFFFFFF, 0.07f)), 1.0f);
-
-            uint32_t accTop = Theme::AccentCyan, accBot = Theme::AccentIndigo;
-            Theme::SceneAccentColors(sceneIndex, accTop, accBot);
-            uint32_t txtAcc = Theme::SceneTextAccent(sceneIndex);
-            rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(24.0f, 28.0f), 4.0f, 4.0f), Br(Rgba(accTop, 0.96f)));
-
-            std::wstring hd = L"配置场景「" + state->scenes[(size_t)sceneIndex].name + L"」提示词";
-            DrawUiTextHex(rt.Get(), brush.Get(), fmtHeading.Get(), D2D1::RectF(36.0f, 12.0f, cw - 224.0f, 44.0f), hd.c_str(), Theme::TextPrimary, 0.98f);
-
-            int mountedCnt = state->CountMountedInScene(sceneIndex);
-            wchar_t cntBuf[32]{};
-            wsprintfW(cntBuf, L"已选 %d / 10", mountedCnt);
-            float cntShake = Motion::RejectShakeOffset(fullShakeTick, GetTickCount64(), 260, 4.0f);
-            D2D1_RECT_F cntPill = D2D1::RectF(cw - 216.0f + cntShake, 16.0f, cw - 134.0f + cntShake, 40.0f);
-            bool isFull = (mountedCnt >= 10);
-            FillRRHex(rt.Get(), brush.Get(), cntPill, 6.0f, isFull ? 0xF59E0B : accTop, 0.14f);
-            DrawUiTextHex(rt.Get(), brush.Get(), fmtBadge.Get(), cntPill, cntBuf, isFull ? 0xFCD34D : txtAcc, 0.96f);
-
-            D2D1_RECT_F rcNew = D2D1::RectF(cw - 126.0f, 13.0f, cw - 18.0f, 43.0f);
-            int zNew = AddZone(1, rcNew);
-            DrawBtn(rcNew, L"+ 新建 Prompt", zNew, 0x366EF0, 0x4B82F8, 0xFFFFFF, 0.25f);
-
-            // Inline hint / status bar (plus quick '立即启用' button if this scene is currently hidden on dock)
-            bool sceneHidden = !state->scenes[(size_t)sceneIndex].enabled;
-            const wchar_t* tipRaw = statusText.empty()
-                ? (sceneHidden
-                    ? L"此场景当前未在贴边面板显示，配置后可点击右侧「立即启用」"
-                    : L"勾选加入此场景，取消勾选仅移出场景、不删词舱内容")
-                : statusText.c_str();
-            uint32_t tipCol = statusText.empty() ? (sceneHidden ? 0xFBBF24 : Theme::TextMuted) : (statusIsErr ? Theme::DangerRed : Theme::CopyGreen);
-            float tipRight = sceneHidden ? (cw - 104.0f) : (cw - 18.0f);
-            DrawUiTextHex(rt.Get(), brush.Get(), fmtBody.Get(), D2D1::RectF(18.0f, 62.0f, tipRight, 84.0f), tipRaw, tipCol, 0.95f);
-            if (sceneHidden) {
-                D2D1_RECT_F rcEn = D2D1::RectF(cw - 96.0f, 61.0f, cw - 18.0f, 83.0f);
-                int zEn = AddZone(3, rcEn);
-                DrawBtn(rcEn, L"立即启用", zEn, 0x1E3A5F, 0x284D7E, Theme::AccentCyan, 0.30f);
-            }
-
-            // Scrollable checklist viewport
-            float listTop = 88.0f;
-            float listBot = ch - 52.0f;
-            D2D1_RECT_F vp = D2D1::RectF(0.0f, listTop, cw, listBot);
-            viewportH = std::max(60.0f, vp.bottom - vp.top);
-            scrollbar.SetViewport(vp);
-
-            float stride = 58.0f;
-            float totalH = (float)orderedIds.size() * stride + 8.0f;
-            maxScrollY = std::max(0.0f, totalH - viewportH);
-            scrollTargetY = std::clamp(scrollTargetY, 0.0f, maxScrollY);
-            scrollY = std::clamp(scrollY, 0.0f, maxScrollY);
-
-            rt->PushAxisAlignedClip(vp, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-            float y = listTop - scrollY;
-            for (const auto& pid : orderedIds) {
-                const PromptItem* item = state->FindById(pid);
-                if (!item) continue;
-                D2D1_RECT_F card = D2D1::RectF(18.0f, y, cw - 20.0f, y + 52.0f);
-                if (card.bottom >= listTop && card.top <= listBot) {
-                    int slotIdx = state->FindSlotOfIdInScene(sceneIndex, item->id);
-                    bool checked = (slotIdx >= 0);
-
-                    D2D1_RECT_F chkZoneR = D2D1::RectF(card.left, card.top, card.right - 68.0f, card.bottom);
-                    D2D1_RECT_F editBtnR = D2D1::RectF(card.right - 60.0f, card.top + 13.0f, card.right - 8.0f, card.bottom - 13.0f);
-                    int zChk = AddClippedZone(10, chkZoneR, vp, item->id);
-                    int zEd  = AddClippedZone(11, editBtnR, vp, item->id);
-                    bool rowHov = (zChk == hoverZoneIdx);
-
-                    FillRMRimHex(rt.Get(), brush.Get(), card, 8.0f,
-                                 rowHov ? 0x222838 : (checked ? 0x1E2434 : Theme::CardBg), 0.96f,
-                                 checked ? txtAcc : 0xFFFFFF, checked ? 0.34f : (rowHov ? 0.16f : 0.08f), 0xFFFFFF, 0.03f);
-
-                    D2D1_RECT_F cb = D2D1::RectF(card.left + 12.0f, card.top + 18.0f, card.left + 28.0f, card.top + 34.0f);
-                    float cProg = (animCheckPid == item->id) ? animCheckVal : (checked ? 1.0f : 0.0f);
-                    DrawDarkCheckbox(rt.Get(), brush.Get(), cb, checked, rowHov, txtAcc, false, cProg);
-
-                    float textLeft = cb.right + 10.0f;
-                    if (checked) {
-                        D2D1_RECT_F sBadge = D2D1::RectF(textLeft, card.top + 8.0f, textLeft + 30.0f, card.top + 25.0f);
-                        FillRRHex(rt.Get(), brush.Get(), sBadge, 4.0f, accTop, 0.16f);
-                        wchar_t sb[8]{};
-                        wsprintfW(sb, L"%02d", slotIdx + 1);
-                        DrawTextHex(rt.Get(), brush.Get(), fmtBadge.Get(), sBadge, sb, 2, txtAcc, 0.96f);
-                        textLeft = sBadge.right + 7.0f;
-                    }
-
-                    DrawTextHex(rt.Get(), brush.Get(), fmtTitle.Get(),
-                                D2D1::RectF(textLeft, card.top + 6.0f, editBtnR.left - 10.0f, card.top + 27.0f),
-                                item->title.c_str(), (UINT32)item->title.size(), Theme::TextPrimary, checked ? 0.98f : (isFull ? 0.56f : 0.88f));
-                    std::wstring prev = CollapseWhitespaceSingleLine(item->content, 78);
-                    DrawTextHex(rt.Get(), brush.Get(), fmtBody.Get(),
-                                D2D1::RectF(cb.right + 10.0f, card.top + 29.0f, editBtnR.left - 10.0f, card.bottom - 5.0f),
-                                prev.c_str(), (UINT32)prev.size(), Theme::TextSecondary, checked ? 0.78f : (isFull ? 0.48f : 0.78f));
-
-                    DrawBtn(editBtnR, L"编辑", zEd, 0x222736, 0x2D3448, Theme::TextSecondary, 0.10f);
-                }
-                y += stride;
-            }
-            if (orderedIds.empty()) {
-                DrawUiTextHex(rt.Get(), brush.Get(), fmtBody.Get(), D2D1::RectF(24.0f, listTop + 28.0f, cw - 24.0f, listTop + 58.0f),
-                              L"词舱暂无条目，点击右上角「+ 新建 Prompt」立即添加", Theme::TextMuted, 0.92f);
-            }
-            rt->PopAxisAlignedClip();
-            scrollbar.Draw(rt.Get(), brush.Get(), scrollY, maxScrollY, viewportH);
-
-            // Bottom footer bar
-            rt->DrawLine(D2D1::Point2F(0, listBot), D2D1::Point2F(cw, listBot), Br(Rgba(0xFFFFFF, 0.07f)), 1.0f);
-            DrawUiTextHex(rt.Get(), brush.Get(), fmtBody.Get(), D2D1::RectF(18.0f, listBot + 14.0f, cw - 120.0f, ch - 10.0f),
-                          L"勾选与编辑实时保存，贴边面板同步生效", Theme::TextMuted, 0.88f);
-            D2D1_RECT_F rcDone = D2D1::RectF(cw - 102.0f, listBot + 10.0f, cw - 18.0f, ch - 10.0f);
-            int zDone = AddZone(2, rcDone);
-            DrawBtn(rcDone, L"完成", zDone, 0x222736, 0x2D3448, Theme::TextPrimary, 0.16f);
-
+            PaintContent(rt.Get(), brush.Get(), cw, ch);
             if (rt->EndDraw() == D2DERR_RECREATE_TARGET) {
                 brush.Reset();
                 rt.Reset();
             }
         }
         EndPaint(hwnd, &ps);
+    }
+
+    [[gnu::noinline]] void PaintContent(ID2D1RenderTarget* rtPtr, ID2D1SolidColorBrush* brPtr, float cw, float ch) {
+            struct RtWrap { ID2D1RenderTarget* p; ID2D1RenderTarget* Get() const { return p; } ID2D1RenderTarget* operator->() const { return p; } } rt{ rtPtr };
+            struct BrWrap { ID2D1SolidColorBrush* p; ID2D1SolidColorBrush* Get() const { return p; } ID2D1SolidColorBrush* operator->() const { return p; } } brush{ brPtr };
+            auto Br = [&](const D2D1_COLOR_F& c) -> ID2D1SolidColorBrush* { brush.p->SetColor(c); return brush.p; };
+            auto DrawBtn = [&](const D2D1_RECT_F& r, const wchar_t* txt, int zIdx, uint32_t bg, uint32_t bgHov, uint32_t fg, float rimA = 0.14f, float alpha = 1.0f) {
+                bool isPressed = (zIdx >= 0 && zIdx < (int)zones.size() &&
+                                  zones[(size_t)zIdx].kind == pressedKind &&
+                                  zones[(size_t)zIdx].pid == pressedPid);
+                DrawDarkPillButton(rt.p, brush.p, fmtBtn.Get(), r, txt, zIdx == hoverZoneIdx, bg, bgHov, fg, rimA, isPressed, alpha);
+            };
+            zones.clear();
+            ULONGLONG nowTick = GetTickCount64();
+
+            rt->Clear(Rgba(0x0F1219, 1.0f));
+
+            // === Top Bar: 4-Scene Segmented Switcher + Quick Scene Controls ===
+            rt->FillRectangle(D2D1::RectF(0, 0, cw, kTopBarH), Br(Rgba(0x141822, 1.0f)));
+            rt->DrawLine(D2D1::Point2F(0, kTopBarH), D2D1::Point2F(cw, kTopBarH), Br(Rgba(0xFFFFFF, 0.07f)), 1.0f);
+
+            const auto& curSc = state->scenes[(size_t)sceneIndex];
+            uint32_t curAccTop = Theme::AccentCyan, curAccBot = Theme::AccentIndigo;
+            Theme::SceneAccentColors(sceneIndex, curAccTop, curAccBot);
+            (void)curAccBot;
+            uint32_t curTxtAcc = Theme::SceneTextAccent(sceneIndex);
+
+            float rightToolsW = 212.0f;
+            D2D1_RECT_F segBg = D2D1::RectF(18.0f, 12.0f, std::max(260.0f, cw - rightToolsW - 26.0f), 46.0f);
+            FillRMRimHex(rt.Get(), brush.Get(), segBg, 8.0f, 0x0D0F15, 1.0f, 0xFFFFFF, 0.08f);
+
+            float tabGap = 4.0f;
+            float innerW = (segBg.right - segBg.left) - 6.0f - tabGap * (float)(kMaxScenes - 1);
+            float tabW = std::max(44.0f, innerW / (float)kMaxScenes);
+            D2D1_RECT_F scTabs[kMaxScenes]{};
+            int scZones[kMaxScenes]{};
+            for (int s = 0; s < kMaxScenes; ++s) {
+                float lx = segBg.left + 3.0f + (float)s * (tabW + tabGap);
+                float rx = (s == kMaxScenes - 1) ? (segBg.right - 3.0f) : (lx + tabW);
+                scTabs[s] = D2D1::RectF(lx, segBg.top + 3.0f, rx, segBg.bottom - 3.0f);
+                scZones[s] = AddZone(20 + s, scTabs[s]);
+            }
+
+            D2D1_RECT_F selScR = scTabs[sceneIndex];
+            if (!scenePillInit || Motion::IsReducedMotion()) {
+                scenePillXSpring.Snap(selScR.left);
+                scenePillWSpring.Snap(selScR.right - selScR.left);
+                sceneAccCol = sceneAccTarget = Rgba(curTxtAcc);
+                scenePillInit = true;
+            } else {
+                scenePillXSpring.target = selScR.left;
+                scenePillWSpring.target = selScR.right - selScR.left;
+                sceneAccTarget = Rgba(curTxtAcc);
+            }
+
+            D2D1_RECT_F slideSc = D2D1::RectF(scenePillXSpring.value, selScR.top,
+                                              scenePillXSpring.value + scenePillWSpring.value, selScR.bottom);
+            FillRMRim(rt.Get(), brush.Get(), slideSc, 6.0f, Rgba(0x202A40, 1.0f),
+                      D2D1::ColorF(sceneAccCol.r, sceneAccCol.g, sceneAccCol.b, 0.50f), Rgba(0xFFFFFF, 0.05f));
+
+            for (int s = 0; s < kMaxScenes; ++s) {
+                bool isSel = (s == sceneIndex);
+                bool isHov = (scZones[s] == hoverZoneIdx);
+                if (!isSel && isHov) {
+                    FillRRHex(rt.Get(), brush.Get(), scTabs[s], 6.0f, 0xFFFFFF, 0.05f);
+                }
+                uint32_t sTop = Theme::AccentCyan, sBot = Theme::AccentIndigo;
+                Theme::SceneAccentColors(s, sTop, sBot);
+                (void)sBot;
+                uint32_t sTxt = Theme::SceneTextAccent(s);
+                bool sEn = state->scenes[(size_t)s].enabled;
+                float cy = (scTabs[s].top + scTabs[s].bottom) * 0.5f;
+                rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(scTabs[s].left + 11.0f, cy), 3.1f, 3.1f),
+                                Br(Rgba(sTop, sEn ? 0.96f : 0.34f)));
+                wchar_t lbl[48]{};
+                _snwprintf_s(lbl, _countof(lbl), _TRUNCATE, L"%ls %d", state->scenes[(size_t)s].name.c_str(), state->CountMountedInScene(s));
+                DrawUiTextHex(rt.Get(), brush.Get(), fmtTab.Get(),
+                              D2D1::RectF(scTabs[s].left + 16.0f, scTabs[s].top, scTabs[s].right - 3.0f, scTabs[s].bottom),
+                              lbl, isSel ? sTxt : (sEn ? Theme::TextSecondary : Theme::TextMuted),
+                              isSel ? 1.0f : (isHov ? 0.96f : (sEn ? 0.86f : 0.62f)));
+            }
+
+            // Top-right scene actions: Enable/Hide | Rename | Clear
+            float lockShake = Motion::RejectShakeOffset(lockedShakeTick, nowTick, 260, 3.8f);
+            D2D1_RECT_F rcToggleEn = D2D1::RectF(cw - 224.0f + lockShake, 15.0f, cw - 144.0f + lockShake, 43.0f);
+            D2D1_RECT_F rcRename   = D2D1::RectF(cw - 138.0f, 15.0f, cw - 80.0f, 43.0f);
+            D2D1_RECT_F rcClear    = D2D1::RectF(cw - 74.0f,  15.0f, cw - 18.0f, 43.0f);
+            int mountedCnt = state->CountMountedInScene(sceneIndex);
+            int zTogEn = AddZone(3, rcToggleEn);
+            int zRen   = AddZone(4, rcRename);
+            int zClr   = (mountedCnt > 0) ? AddZone(5, rcClear) : -2;
+            if (curSc.enabled) {
+                DrawBtn(rcToggleEn, L"已启用", zTogEn, 0x16324A, 0x1E4262, Theme::AccentCyan, 0.28f);
+            } else {
+                DrawBtn(rcToggleEn, L"立即启用", zTogEn, 0x3D2B14, 0x52391A, 0xFCD34D, 0.34f);
+            }
+            DrawBtn(rcRename, L"重命名", zRen, 0x222736, 0x2D3448, Theme::TextSecondary, 0.12f);
+            DrawBtn(rcClear,  L"清空",   zClr, 0x222736, 0x3A1E26, mountedCnt > 0 ? Theme::DangerRed : Theme::TextMuted,
+                    mountedCnt > 0 ? 0.14f : 0.06f, mountedCnt > 0 ? 1.0f : 0.45f);
+
+            // === Main Split Workspace ===
+            float wsTop = kTopBarH + 8.0f;
+            float wsBot = ch - kFooterH - 6.0f;
+
+            // --- LEFT PANE: 10 Fixed Muscle-Memory Slots (1:1 Dock Mirror!) ---
+            D2D1_RECT_F leftBox = D2D1::RectF(kLeftPaneX, wsTop, kLeftPaneX + kLeftPaneW, wsBot);
+            FillRMRimHex(rt.Get(), brush.Get(), leftBox, 11.0f, 0x131722, 0.98f, curAccTop, 0.32f, 0xFFFFFF, 0.05f);
+
+            // Left sub-header
+            DrawUiTextHex(rt.Get(), brush.Get(), fmtHeading.Get(),
+                          D2D1::RectF(leftBox.left + 12.0f, leftBox.top + 8.0f, leftBox.left + 116.0f, leftBox.top + 32.0f),
+                          L"贴边 10 槽位", Theme::TextPrimary, 0.96f);
+
+            float fullShake = Motion::RejectShakeOffset(fullShakeTick, nowTick, 260, 3.8f);
+            D2D1_RECT_F cntPill = D2D1::RectF(leftBox.left + 110.0f + fullShake, leftBox.top + 10.0f,
+                                              leftBox.left + 164.0f + fullShake, leftBox.top + 30.0f);
+            bool isFull = (mountedCnt >= 10);
+            wchar_t cntBuf[24]{};
+            wsprintfW(cntBuf, L"%d / 10", mountedCnt);
+            FillRRHex(rt.Get(), brush.Get(), cntPill, 5.0f, isFull ? 0xF59E0B : curAccTop, 0.16f);
+            DrawUiTextHex(rt.Get(), brush.Get(), fmtBadge.Get(), cntPill, cntBuf, isFull ? 0xFCD34D : curTxtAcc, 0.96f);
+
+            if (targetSlot >= 0 && targetSlot < 10) {
+                D2D1_RECT_F tgtPill = D2D1::RectF(leftBox.right - 98.0f, leftBox.top + 9.0f, leftBox.right - 10.0f, leftBox.top + 31.0f);
+                int zClrTgt = AddZone(8, tgtPill);
+                std::wstring tl = L"目标 " + FormatSlot2(targetSlot) + L" ×";
+                DrawBtn(tgtPill, tl.c_str(), zClrTgt, 0x1E3A5F, 0x284D7E, Theme::AccentCyan, 0.35f);
+            } else {
+                DrawUiTextHex(rt.Get(), brush.Get(), fmtBody.Get(),
+                              D2D1::RectF(leftBox.left + 170.0f, leftBox.top + 9.0f, leftBox.right - 10.0f, leftBox.top + 31.0f),
+                              L"拖拽排序 · 右键", Theme::TextMuted, 0.82f);
+            }
+
+            // Left 10-slot scrollable viewport
+            leftSlotsTopDip = leftBox.top + 38.0f;
+            leftSlotsVp = D2D1::RectF(leftBox.left + 2.0f, leftSlotsTopDip - 2.0f, leftBox.right - 2.0f, leftBox.bottom - 6.0f);
+            float leftVpH = std::max(60.0f, leftSlotsVp.bottom - leftSlotsVp.top);
+            float leftFullH = 10.0f * kSlotH + 9.0f * kSlotGap + 4.0f;
+            leftMaxScrollY = std::max(0.0f, leftFullH - leftVpH);
+            leftScrollTargetY = std::clamp(leftScrollTargetY, 0.0f, leftMaxScrollY);
+            leftScrollY = std::clamp(leftScrollY, 0.0f, leftMaxScrollY);
+
+            rt->PushAxisAlignedClip(leftSlotsVp, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            const auto& slots = state->scenes[(size_t)sceneIndex].slots;
+            int passes = isSlotDragging ? 2 : 1;
+            for (int pass = 0; pass < passes; ++pass) {
+                for (int i = 0; i < 10; ++i) {
+                    bool isDragged = (isSlotDragging && i == pressedSlot);
+                    if (pass == 0 && isDragged) {
+                        D2D1_RECT_F sr = LeftSlotRectDip(i);
+                        if (sr.bottom >= leftSlotsVp.top && sr.top <= leftSlotsVp.bottom) {
+                            FillRMRimHex(rt.Get(), brush.Get(), sr, 7.5f, 0x0C0F16, 0.78f,
+                                         Theme::AccentCyan, 0.32f + 0.16f * dragLiftSpring.value, Theme::AccentIndigo, 0.18f);
+                            std::wstring s2 = FormatSlot2(i);
+                            DrawTextHex(rt.Get(), brush.Get(), fmtBadge.Get(),
+                                        D2D1::RectF(sr.left + 6.0f, sr.top + 7.0f, sr.left + 30.0f, sr.bottom - 7.0f),
+                                        s2.c_str(), 2, Theme::AccentCyan, 0.65f);
+                        }
+                        continue;
+                    }
+                    if (pass == 1 && !isDragged) continue;
+
+                    D2D1_RECT_F baseR = LeftSlotRectDip(i);
+                    float yOff = (pass == 1) ? (slotDragCurY - baseR.top) : slotShiftSpring[(size_t)i].value;
+                    D2D1_RECT_F card = D2D1::RectF(baseR.left, baseR.top + yOff, baseR.right, baseR.bottom + yOff);
+                    if (card.bottom < leftSlotsVp.top - 4.0f || card.top > leftSlotsVp.bottom + 4.0f) continue;
+
+                    const PromptItem* item = state->FindById(slots[(size_t)i]);
+                    bool isTarget = (i == targetSlot);
+                    int zCard = (pass == 0) ? AddClippedZone(40 + i, card, leftSlotsVp) : -2;
+                    bool cardHov = (zCard >= 0 && zCard == hoverZoneIdx && !isSlotDragging);
+                    std::wstring idxStr = FormatSlot2(i);
+
+                    if (pass == 1) {
+                        float lift = std::clamp(dragLiftSpring.value, 0.0f, 1.0f);
+                        float ex = Motion::IsReducedMotion() ? 2.0f : (2.2f * lift);
+                        card.left -= ex;
+                        card.right += ex;
+                        D2D1_RECT_F sh = D2D1::RectF(card.left - 3.0f * lift, card.top + 4.0f * lift,
+                                                     card.right + 3.0f * lift, card.bottom + 5.0f * lift);
+                        FillRRHex(rt.Get(), brush.Get(), sh, 8.5f, 0x000000, 0.42f * lift);
+                    }
+
+                    if (item) {
+                        int zEd  = -2;
+                        int zRem = -2;
+                        D2D1_RECT_F rRem = D2D1::RectF(card.right - 26.0f, card.top + 7.0f, card.right - 5.0f, card.bottom - 7.0f);
+                        D2D1_RECT_F rEd  = D2D1::RectF(card.right - 64.0f, card.top + 7.0f, card.right - 30.0f, card.bottom - 7.0f);
+                        if (pass == 0) {
+                            zEd  = AddClippedZone(50 + i, rEd,  leftSlotsVp, item->id);
+                            zRem = AddClippedZone(60 + i, rRem, leftSlotsVp, item->id);
+                        }
+                        bool anyHov = cardHov || (zEd >= 0 && zEd == hoverZoneIdx) || (zRem >= 0 && zRem == hoverZoneIdx);
+
+                        uint32_t bg = (pass == 1) ? 0x26314A : (isTarget ? 0x1E304C : (anyHov ? Theme::CardHoverBg : Theme::CardBg));
+                        uint32_t rimH = (pass == 1 || isTarget) ? Theme::AccentCyan : (anyHov ? Theme::AccentBlue : 0xFFFFFF);
+                        float rimA = (pass == 1) ? 0.85f : (isTarget ? 0.78f : (anyHov ? 0.40f : 0.08f));
+                        FillRMRimHex(rt.Get(), brush.Get(), card, 7.5f, bg, 0.96f, rimH, rimA, 0xFFFFFF, 0.03f, (pass == 1 || isTarget) ? 1.3f : 1.0f);
+
+                        D2D1_RECT_F idxBox = D2D1::RectF(card.left + 7.0f, card.top + 8.0f, card.left + 30.0f, card.bottom - 8.0f);
+                        FillRRHex(rt.Get(), brush.Get(), idxBox, 4.5f, (isTarget || anyHov || pass == 1) ? curAccTop : 0xFFFFFF,
+                                  (isTarget || anyHov || pass == 1) ? 0.16f : 0.06f);
+                        DrawTextHex(rt.Get(), brush.Get(), fmtBadge.Get(), idxBox, idxStr.c_str(), 2,
+                                    (isTarget || anyHov || pass == 1) ? curTxtAcc : Theme::TextSecondary, 0.96f);
+
+                        float txtRight = (pass == 0 && (anyHov || isTarget)) ? (rEd.left - 5.0f) : (card.right - 10.0f);
+                        DrawTextHex(rt.Get(), brush.Get(), fmtTitle.Get(),
+                                    D2D1::RectF(idxBox.right + 7.0f, card.top, txtRight, card.bottom),
+                                    item->title.c_str(), (UINT32)item->title.size(), Theme::TextPrimary, 0.97f);
+
+                        if (pass == 0 && (anyHov || isTarget)) {
+                            DrawBtn(rEd,  L"改", zEd,  0x222736, 0x2E374D, Theme::TextSecondary, 0.10f);
+                            DrawBtn(rRem, L"×",  zRem, 0x222736, 0x4A1D28, Theme::DangerRed,     0.10f);
+                        }
+                    } else {
+                        uint32_t bg = isTarget ? 0x162942 : (cardHov ? Theme::CardBg : Theme::CardEmptyBg);
+                        uint32_t rimH = isTarget ? Theme::AccentCyan : (cardHov ? Theme::AccentBlue : 0xFFFFFF);
+                        float rimA = isTarget ? 0.78f : (cardHov ? 0.30f : 0.04f);
+                        FillRMRimHex(rt.Get(), brush.Get(), card, 7.5f, bg, isTarget ? 0.96f : (cardHov ? 0.88f : 0.56f),
+                                     rimH, rimA, 0xFFFFFF, 0.02f, isTarget ? 1.3f : 1.0f);
+
+                        D2D1_RECT_F idxBox = D2D1::RectF(card.left + 7.0f, card.top + 8.0f, card.left + 30.0f, card.bottom - 8.0f);
+                        DrawTextHex(rt.Get(), brush.Get(), fmtBadge.Get(), idxBox, idxStr.c_str(), 2,
+                                    isTarget ? Theme::AccentCyan : Theme::TextMuted, isTarget ? 0.98f : (cardHov ? 0.86f : 0.48f));
+                        std::wstring eLbl = isTarget
+                            ? (L"正在为槽位 " + idxStr + L" 选词 →")
+                            : (cardHov ? L"+ 点击指定此槽位" : L"+ 空槽位");
+                        DrawUiTextHex(rt.Get(), brush.Get(), fmtBody.Get(),
+                                      D2D1::RectF(idxBox.right + 7.0f, card.top, card.right - 8.0f, card.bottom),
+                                      eLbl.c_str(), isTarget ? Theme::AccentCyan : (cardHov ? Theme::TextSecondary : Theme::TextMuted),
+                                      isTarget ? 0.98f : (cardHov ? 0.92f : 0.54f));
+                    }
+                }
+            }
+            if (leftMaxScrollY > 0.5f) {
+                float thumbH = std::clamp(leftVpH * (leftVpH / std::max(1.0f, leftFullH)), 24.0f, leftVpH - 8.0f);
+                float prog = std::clamp(leftScrollY / leftMaxScrollY, 0.0f, 1.0f);
+                float tTop = leftSlotsVp.top + 4.0f + prog * std::max(0.0f, leftVpH - 8.0f - thumbH);
+                FillRRHex(rt.Get(), brush.Get(), D2D1::RectF(leftBox.right - 6.5f, tTop, leftBox.right - 3.5f, tTop + thumbH),
+                          1.5f, curAccTop, 0.45f);
+            }
+            rt->PopAxisAlignedClip();
+
+            // --- RIGHT PANE: Search + 3-Option Filter Bar + Filterable Vault Picker ---
+            D2D1_RECT_F searchBox = D2D1::RectF(kRightPaneX, wsTop, cw - 134.0f, wsTop + 32.0f);
+            DrawInputBox(rt.Get(), brush.Get(), searchBox, 7.5f, searchFocusAnim, false);
+
+            if (!pickerQuery.empty() || clearSearchAnim > 0.02f) {
+                D2D1_RECT_F rcClr = D2D1::RectF(searchBox.right - 26.0f, searchBox.top + 4.0f, searchBox.right - 4.0f, searchBox.bottom - 4.0f);
+                int zClrQ = !pickerQuery.empty() ? AddZone(7, rcClr) : -2;
+                float a = !pickerQuery.empty() ? std::max(clearSearchAnim, Motion::IsReducedMotion() ? 1.0f : 0.0f) : clearSearchAnim;
+                if (zClrQ >= 0 && zClrQ == hoverZoneIdx) FillRRHex(rt.Get(), brush.Get(), rcClr, 5.0f, 0xFFFFFF, 0.10f * a);
+                DrawTextHex(rt.Get(), brush.Get(), fmtTab.Get(), rcClr, L"\x00D7", 1,
+                            (zClrQ >= 0 && zClrQ == hoverZoneIdx) ? Theme::TextPrimary : Theme::TextMuted, 0.92f * a);
+            }
+
+            D2D1_RECT_F rcNew = D2D1::RectF(cw - 126.0f, wsTop, cw - 18.0f, wsTop + 32.0f);
+            int zNew = AddZone(1, rcNew);
+            DrawBtn(rcNew, L"+ 新建 Prompt", zNew, 0x366EF0, 0x4B82F8, 0xFFFFFF, 0.25f);
+
+            // 3-Option Filter Bar: 未入本场景 N | 未分配 M | 全部 K
+            int cntNotInCur = 0, cntUnmounted = 0, cntAll = 0;
+            CountFilterBuckets(*state, sceneIndex, cntNotInCur, cntUnmounted, cntAll);
+            float filterTop = wsTop + 40.0f;
+            float filterBot = filterTop + 26.0f;
+
+            struct FPill {
+                PickerFilter f;
+                int kind;
+                std::wstring label;
+                uint32_t acc;
+                float w;
+                D2D1_RECT_F rect{};
+                int zIdx = -1;
+            };
+            wchar_t b0[32]{}, b1[32]{}, b2[32]{};
+            wsprintfW(b0, L"未入本场景 %d", cntNotInCur);
+            wsprintfW(b1, L"未分配 %d", cntUnmounted);
+            wsprintfW(b2, L"全部 %d", cntAll);
+            FPill fpills[3] = {
+                { PickerFilter::NotInCurrent, 30, UiText(b0), curTxtAcc,          106.0f },
+                { PickerFilter::UnmountedAll, 31, UiText(b1), Theme::AccentCyan,   86.0f },
+                { PickerFilter::All,          32, UiText(b2), Theme::AccentBlue,   74.0f }
+            };
+            float fGap = 6.0f;
+            float fx = kRightPaneX;
+            float selFX = fx, selFW = fpills[0].w;
+            uint32_t selFAcc = curTxtAcc;
+            bool selFHov = false;
+            for (int k = 0; k < 3; ++k) {
+                fpills[k].rect = D2D1::RectF(fx, filterTop, fx + fpills[k].w, filterBot);
+                fpills[k].zIdx = AddZone(fpills[k].kind, fpills[k].rect);
+                bool sel = (pickerFilter == fpills[k].f);
+                if (sel) {
+                    selFX = fpills[k].rect.left;
+                    selFW = fpills[k].w;
+                    selFAcc = fpills[k].acc;
+                    selFHov = (fpills[k].zIdx == hoverZoneIdx);
+                } else {
+                    bool hov = (fpills[k].zIdx == hoverZoneIdx);
+                    FillRMRimHex(rt.Get(), brush.Get(), fpills[k].rect, 6.0f, hov ? 0x222838 : 0x151923, 1.0f,
+                                 0xFFFFFF, hov ? 0.16f : 0.07f, 0xFFFFFF, 0.03f);
+                }
+                fx += fpills[k].w + fGap;
+            }
+            if (!filterPillInit || Motion::IsReducedMotion()) {
+                filterPillXSpring.Snap(selFX);
+                filterPillWSpring.Snap(selFW);
+                filterAccCol = filterAccTarget = Rgba(selFAcc);
+                filterPillInit = true;
+            } else {
+                filterPillXSpring.target = selFX;
+                filterPillWSpring.target = selFW;
+                filterAccTarget = Rgba(selFAcc);
+            }
+            D2D1_RECT_F fSlide = D2D1::RectF(filterPillXSpring.value, filterTop,
+                                             filterPillXSpring.value + filterPillWSpring.value, filterBot);
+            FillRMRim(rt.Get(), brush.Get(), fSlide, 6.0f, Rgba(selFHov ? 0x283552 : 0x202A40, 1.0f),
+                      D2D1::ColorF(filterAccCol.r, filterAccCol.g, filterAccCol.b, 0.48f), Rgba(0xFFFFFF, 0.05f));
+            for (int k = 0; k < 3; ++k) {
+                bool sel = (pickerFilter == fpills[k].f);
+                bool hov = (fpills[k].zIdx == hoverZoneIdx);
+                DrawTextHex(rt.Get(), brush.Get(), fmtBadge.Get(), fpills[k].rect,
+                            fpills[k].label.c_str(), (UINT32)fpills[k].label.size(),
+                            sel ? fpills[k].acc : Theme::TextSecondary, (sel || hov) ? 1.0f : 0.88f);
+            }
+            if (targetSlot >= 0 && fx + 96.0f <= cw - 18.0f) {
+                std::wstring th = L"点选放入槽位 " + FormatSlot2(targetSlot);
+                DrawUiTextHex(rt.Get(), brush.Get(), fmtBody.Get(),
+                              D2D1::RectF(fx + 6.0f, filterTop + 4.0f, cw - 18.0f, filterBot),
+                              th.c_str(), Theme::AccentCyan, 0.90f);
+            }
+
+            // Candidate list viewport
+            float listTop = filterBot + 8.0f;
+            float listBot = wsBot;
+            D2D1_RECT_F vp = D2D1::RectF(kRightPaneX - 2.0f, listTop, cw - 6.0f, listBot);
+            viewportH = std::max(60.0f, vp.bottom - vp.top);
+            scrollbar.SetViewport(vp);
+
+            EnsureFiltered();
+            float cardH = 58.0f;
+            float stride = 64.0f;
+            float totalH = (float)filteredIndices.size() * stride + 6.0f;
+            maxScrollY = std::max(0.0f, totalH - viewportH);
+            scrollTargetY = std::clamp(scrollTargetY, 0.0f, maxScrollY);
+            scrollY = std::clamp(scrollY, 0.0f, maxScrollY);
+
+            rt->PushAxisAlignedClip(vp, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            float cardRight = cw - (maxScrollY > 0.5f ? 22.0f : 18.0f);
+            float y = listTop - scrollY;
+            for (size_t vi : filteredIndices) {
+                if (vi >= state->vault.size()) continue;
+                const auto& item = state->vault[vi];
+                D2D1_RECT_F card = D2D1::RectF(kRightPaneX, y, cardRight, y + cardH);
+                if (card.bottom >= listTop && card.top <= listBot) {
+                    int inCurSlot = state->FindSlotOfIdInScene(sceneIndex, item.id);
+                    bool inCur = (inCurSlot >= 0);
+
+                    D2D1_RECT_F rAct  = D2D1::RectF(card.right - 68.0f,  card.top + 16.0f, card.right - 8.0f,  card.bottom - 16.0f);
+                    D2D1_RECT_F rEdit = D2D1::RectF(card.right - 114.0f, card.top + 16.0f, card.right - 74.0f, card.bottom - 16.0f);
+                    int zCard = AddClippedZone(70, card,  vp, item.id);
+                    int zEdit = AddClippedZone(71, rEdit, vp, item.id);
+                    int zAct  = AddClippedZone(70, rAct,  vp, item.id);
+                    bool rowHov = (zCard == hoverZoneIdx) || (zAct == hoverZoneIdx);
+
+                    FillRMRimHex(rt.Get(), brush.Get(), card, 8.0f,
+                                 rowHov ? 0x222838 : (inCur ? 0x1A2132 : Theme::CardBg), 0.96f,
+                                 inCur ? curTxtAcc : 0xFFFFFF, inCur ? 0.36f : (rowHov ? 0.18f : 0.08f), 0xFFFFFF, 0.03f);
+
+                    // Scene membership badges on top-left (shows exactly which scenes contain this prompt!)
+                    float bx = card.left + 10.0f;
+                    float maxBadgeRight = rEdit.left - 80.0f;
+                    int shownBadges = 0;
+                    int hiddenBadges = 0;
+
+                    auto drawSceneChip = [&](int scIdx, int slIdx, bool isCurrent) {
+                        uint32_t acc = Theme::SceneTextAccent(scIdx);
+                        bool en = state->scenes[(size_t)scIdx].enabled;
+                        std::wstring tag = isCurrent
+                            ? (L"本场景 · " + FormatSlot2(slIdx))
+                            : (state->scenes[(size_t)scIdx].name + L" · " + FormatSlot2(slIdx));
+                        float chipW = isCurrent ? 70.0f : std::clamp(38.0f + (float)VisualWidthUnits(state->scenes[(size_t)scIdx].name) * 5.2f, 54.0f, 76.0f);
+                        if (shownBadges < 2 && bx + chipW <= maxBadgeRight) {
+                            D2D1_RECT_F chip = D2D1::RectF(bx, card.top + 8.0f, bx + chipW, card.top + 26.0f);
+                            FillRRHex(rt.Get(), brush.Get(), chip, 4.5f, acc, isCurrent ? 0.20f : (en ? 0.14f : 0.09f));
+                            DrawUiTextHex(rt.Get(), brush.Get(), fmtBadge.Get(), chip, tag.c_str(), acc, en ? 0.96f : 0.72f);
+                            bx = chip.right + 4.0f;
+                            ++shownBadges;
+                        } else {
+                            ++hiddenBadges;
+                        }
+                    };
+
+                    if (inCur) drawSceneChip(sceneIndex, inCurSlot, true);
+                    for (int s = 0; s < kMaxScenes; ++s) {
+                        if (s == sceneIndex) continue;
+                        int osl = state->FindSlotOfIdInScene(s, item.id);
+                        if (osl >= 0) drawSceneChip(s, osl, false);
+                    }
+                    if (hiddenBadges > 0 && bx + 32.0f <= maxBadgeRight) {
+                        wchar_t hb[16]{};
+                        wsprintfW(hb, L"+%d", hiddenBadges);
+                        D2D1_RECT_F chip = D2D1::RectF(bx, card.top + 8.0f, bx + 28.0f, card.top + 26.0f);
+                        FillRRHex(rt.Get(), brush.Get(), chip, 4.5f, Theme::AccentIndigo, 0.14f);
+                        DrawTextHex(rt.Get(), brush.Get(), fmtBadge.Get(), chip, hb, (UINT32)wcslen(hb), 0xA5B4FC, 0.92f);
+                        bx = chip.right + 4.0f;
+                    }
+                    if (shownBadges == 0 && hiddenBadges == 0) {
+                        D2D1_RECT_F chip = D2D1::RectF(bx, card.top + 8.0f, bx + 48.0f, card.top + 26.0f);
+                        FillRRHex(rt.Get(), brush.Get(), chip, 4.5f, 0xFFFFFF, 0.05f);
+                        DrawUiTextHex(rt.Get(), brush.Get(), fmtBadge.Get(), chip, L"未分配", Theme::TextMuted, 0.90f);
+                        bx = chip.right + 5.0f;
+                    }
+
+                    // Prompt title + context preview
+                    DrawTextHex(rt.Get(), brush.Get(), fmtTitle.Get(),
+                                D2D1::RectF(bx + 3.0f, card.top + 6.0f, rEdit.left - 8.0f, card.top + 28.0f),
+                                item.title.c_str(), (UINT32)item.title.size(), Theme::TextPrimary, 0.97f);
+                    std::wstring prev = BuildSearchPreviewSnippet(item.content, pickerQuery, 76);
+                    DrawTextHex(rt.Get(), brush.Get(), fmtBody.Get(),
+                                D2D1::RectF(card.left + 10.0f, card.top + 31.0f, rEdit.left - 8.0f, card.bottom - 7.0f),
+                                prev.c_str(), (UINT32)prev.size(), Theme::TextSecondary, 0.78f);
+
+                    DrawBtn(rEdit, L"编辑", zEdit, 0x222736, 0x2D3448, Theme::TextSecondary, 0.10f);
+
+                    if (inCur) {
+                        if (targetSlot >= 0 && targetSlot != inCurSlot) {
+                            std::wstring mvLbl = L"移至 " + FormatSlot2(targetSlot);
+                            DrawBtn(rAct, mvLbl.c_str(), zAct, 0x1E3A5F, 0x284D7E, Theme::AccentCyan, 0.28f);
+                        } else {
+                            DrawBtn(rAct, L"移出", zAct, 0x242938, 0x4A1D28, Theme::TextSecondary, 0.12f);
+                        }
+                    } else if (targetSlot >= 0) {
+                        std::wstring putLbl = L"放入 " + FormatSlot2(targetSlot);
+                        DrawBtn(rAct, putLbl.c_str(), zAct, 0x1E3A5F, 0x284D7E, Theme::AccentCyan, 0.30f);
+                    } else {
+                        DrawBtn(rAct, L"+ 加入", zAct, isFull ? 0x1C2130 : 0x1E3354, isFull ? 0x242A3C : 0x2A4774,
+                                isFull ? Theme::TextMuted : Theme::AccentCyan, isFull ? 0.08f : 0.24f);
+                    }
+                }
+                y += stride;
+            }
+
+            if (filteredIndices.empty()) {
+                std::wstring emptyMsg;
+                if (!pickerQuery.empty()) {
+                    emptyMsg = UiText(L"未找到包含「" + CollapseWhitespaceSingleLine(pickerQuery, 18) + L"」的 Prompt");
+                } else if (pickerFilter == PickerFilter::UnmountedAll) {
+                    emptyMsg = UiText(L"所有词舱 Prompt 均已分配到场景中");
+                } else if (pickerFilter == PickerFilter::NotInCurrent) {
+                    emptyMsg = UiText(L"词舱全部 Prompt 均已加入「" + curSc.name + L"」");
+                } else {
+                    emptyMsg = UiText(L"词舱暂无条目，点击右上角「+ 新建 Prompt」立即添加");
+                }
+                DrawTextHex(rt.Get(), brush.Get(), fmtBody.Get(),
+                            D2D1::RectF(kRightPaneX + 6.0f, listTop + 20.0f, cardRight, listTop + 46.0f),
+                            emptyMsg.c_str(), (UINT32)emptyMsg.size(), Theme::TextMuted, 0.94f);
+                float ebx = kRightPaneX + 6.0f, ebt = listTop + 52.0f, ebb = listTop + 80.0f;
+                if (!pickerQuery.empty()) {
+                    D2D1_RECT_F r1 = D2D1::RectF(ebx, ebt, ebx + 82.0f, ebb);
+                    DrawBtn(r1, L"清空搜索", AddClippedZone(7, r1, vp), 0x222736, 0x2D3448, Theme::TextSecondary, 0.12f);
+                    ebx += 90.0f;
+                    if (pickerFilter != PickerFilter::All) {
+                        D2D1_RECT_F r2 = D2D1::RectF(ebx, ebt, ebx + 92.0f, ebb);
+                        DrawBtn(r2, L"搜全部词舱", AddClippedZone(32, r2, vp), 0x222736, 0x2D3448, Theme::TextPrimary, 0.14f);
+                        ebx += 100.0f;
+                    }
+                    D2D1_RECT_F r3 = D2D1::RectF(ebx, ebt, ebx + 118.0f, ebb);
+                    DrawBtn(r3, L"+ 新建此 Prompt", AddClippedZone(9, r3, vp), 0x1E3354, 0x284570, Theme::AccentCyan, 0.24f);
+                } else if (pickerFilter == PickerFilter::UnmountedAll) {
+                    D2D1_RECT_F r1 = D2D1::RectF(ebx, ebt, ebx + 112.0f, ebb);
+                    DrawBtn(r1, L"看未入本场景", AddClippedZone(30, r1, vp), 0x1E3354, 0x284570, Theme::AccentCyan, 0.24f);
+                    ebx += 120.0f;
+                    D2D1_RECT_F r2 = D2D1::RectF(ebx, ebt, ebx + 84.0f, ebb);
+                    DrawBtn(r2, L"查看全部", AddClippedZone(32, r2, vp), 0x222736, 0x2D3448, Theme::TextPrimary, 0.12f);
+                } else if (pickerFilter == PickerFilter::NotInCurrent) {
+                    D2D1_RECT_F r1 = D2D1::RectF(ebx, ebt, ebx + 110.0f, ebb);
+                    DrawBtn(r1, L"+ 新建 Prompt", AddClippedZone(1, r1, vp), 0x366EF0, 0x4B82F8, 0xFFFFFF, 0.25f);
+                    ebx += 118.0f;
+                    D2D1_RECT_F r2 = D2D1::RectF(ebx, ebt, ebx + 84.0f, ebb);
+                    DrawBtn(r2, L"查看全部", AddClippedZone(32, r2, vp), 0x222736, 0x2D3448, Theme::TextPrimary, 0.12f);
+                }
+            }
+
+            rt->PopAxisAlignedClip();
+            scrollbar.Draw(rt.Get(), brush.Get(), scrollY, maxScrollY, viewportH);
+
+            // === Bottom Footer Bar ===
+            float footTop = ch - kFooterH;
+            rt->DrawLine(D2D1::Point2F(0, footTop), D2D1::Point2F(cw, footTop), Br(Rgba(0xFFFFFF, 0.07f)), 1.0f);
+
+            bool showUndo = (undoClearActive && nowTick < undoClearExpireTick);
+            float statusRight = showUndo ? (cw - 200.0f) : (cw - 114.0f);
+            const wchar_t* footRaw = statusText.empty()
+                ? (!curSc.enabled
+                    ? L"此场景当前未在贴边面板显示，编排后点右上角「立即启用」即可生效"
+                    : L"左侧 10 槽位与贴边面板 1:1 实时同步，所有调整即时保存")
+                : statusText.c_str();
+            uint32_t footCol = statusText.empty()
+                ? (!curSc.enabled ? 0xFBBF24 : Theme::TextMuted)
+                : (statusIsErr ? Theme::DangerRed : Theme::CopyGreen);
+            DrawUiTextHex(rt.Get(), brush.Get(), fmtBody.Get(),
+                          D2D1::RectF(18.0f, footTop + 13.0f, statusRight, ch - 10.0f), footRaw, footCol, 0.94f);
+
+            if (showUndo) {
+                D2D1_RECT_F rcUndo = D2D1::RectF(cw - 190.0f, footTop + 9.0f, cw - 110.0f, ch - 9.0f);
+                DrawBtn(rcUndo, L"撤销清空", AddZone(6, rcUndo), 0x1E3A5F, 0x284D7E, Theme::AccentCyan, 0.30f);
+            }
+            D2D1_RECT_F rcDone = D2D1::RectF(cw - 102.0f, footTop + 9.0f, cw - 18.0f, ch - 9.0f);
+            DrawBtn(rcDone, L"完成", AddZone(2, rcDone), 0x222736, 0x2D3448, Theme::TextPrimary, 0.16f);
     }
 
     int HitZone(float x, float y) const {
@@ -2297,83 +2953,199 @@ private:
         return -1;
     }
 
-    [[gnu::noinline]] void HandleTogglePrompt(const std::wstring& pid) {
+    bool CommitCandidate(AppState& candidate, const std::wstring& okMsg) {
+        if (!storage->Save(candidate)) {
+            statusText = UiText(storage->readOnlyRecoveryMode
+                ? L"只读保护模式：无法保存，请先恢复备份"
+                : L"保存失败：无法写入数据文件");
+            statusIsErr = true;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return false;
+        }
+        *state = std::move(candidate);
+        statusText = UiText(okMsg);
+        statusIsErr = false;
+        NotifyMutated();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return true;
+    }
+
+    [[gnu::noinline]] void HandleRightCardAction(const std::wstring& pid) {
         if (!state || !storage) return;
         int curSlot = state->FindSlotOfIdInScene(sceneIndex, pid);
         AppState candidate = *state;
-        int assignedSlot = -1;
+        wchar_t msg[128]{};
+        if (targetSlot >= 0 && targetSlot < 10) {
+            int dst = targetSlot;
+            candidate.AssignToSlotInScene(sceneIndex, dst, pid);
+            _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"已放入「%ls · 槽位 %02d」",
+                         state->scenes[(size_t)sceneIndex].name.c_str(), dst + 1);
+            if (CommitCandidate(candidate, msg)) {
+                targetSlot = -1;
+                UpdateSearchCueBanner();
+            }
+            return;
+        }
         if (curSlot >= 0) {
             candidate.RemoveFromScene(sceneIndex, pid);
+            _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"已从「%ls」移出（词舱数据已保留）",
+                         state->scenes[(size_t)sceneIndex].name.c_str());
+            CommitCandidate(candidate, msg);
         } else {
-            assignedSlot = candidate.AssignToSceneFirstEmpty(sceneIndex, pid);
-            if (assignedSlot < 0) {
-                statusText = UiText(L"该场景已满 10 格，请先取消勾选 1 条后再添加");
+            int assigned = candidate.AssignToSceneFirstEmpty(sceneIndex, pid);
+            if (assigned < 0) {
+                statusText = UiText(L"该场景已满 10 格，可先点左侧某槽位进行替换或移出");
                 statusIsErr = true;
                 fullShakeTick = GetTickCount64();
                 if (!Motion::IsReducedMotion()) EnsureAnimTimer();
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return;
             }
+            _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"已加入「%ls · 槽位 %02d」",
+                         state->scenes[(size_t)sceneIndex].name.c_str(), assigned + 1);
+            CommitCandidate(candidate, msg);
         }
-        if (!storage->Save(candidate)) {
-            statusText = UiText(storage->readOnlyRecoveryMode
-                ? L"只读保护模式：无法保存，请先恢复备份"
-                : L"保存失败：无法写入数据文件");
-            statusIsErr = true;
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return;
-        }
-        *state = std::move(candidate);
-        if (!Motion::IsReducedMotion()) {
-            animCheckPid = pid;
-            animCheckVal = (curSlot >= 0) ? 1.0f : 0.0f;
-            animCheckTarget = (curSlot >= 0) ? 0.0f : 1.0f;
-            EnsureAnimTimer();
-        }
-        wchar_t msg[128]{};
-        if (curSlot >= 0) {
-            _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"已从「%ls」移出（词舱数据已保留）", state->scenes[(size_t)sceneIndex].name.c_str());
-        } else {
-            _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"已装配到「%ls · 槽位 %02d」", state->scenes[(size_t)sceneIndex].name.c_str(), assignedSlot + 1);
-        }
-        statusText = UiText(msg);
-        statusIsErr = false;
-        NotifyMutated();
-        InvalidateRect(hwnd, nullptr, FALSE);
     }
 
-    [[gnu::noinline]] void HandleEnableSceneNow() {
-        if (!state || !storage || state->scenes[(size_t)sceneIndex].enabled) return;
+    [[gnu::noinline]] void HandleRemoveSlot(int slIdx) {
+        if (!state || !storage || slIdx < 0 || slIdx >= 10) return;
+        if (state->scenes[(size_t)sceneIndex].slots[(size_t)slIdx].empty()) return;
         AppState candidate = *state;
-        candidate.SetSceneEnabled(sceneIndex, true);
-        if (!storage->Save(candidate)) {
-            statusText = UiText(storage->readOnlyRecoveryMode
-                ? L"只读保护模式：无法保存，请先恢复备份"
-                : L"保存失败：无法写入数据文件");
+        candidate.scenes[(size_t)sceneIndex].slots[(size_t)slIdx].clear();
+        wchar_t msg[128]{};
+        _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"已将槽位 %02d 移出「%ls」（词舱已保留）",
+                     slIdx + 1, state->scenes[(size_t)sceneIndex].name.c_str());
+        if (CommitCandidate(candidate, msg) && targetSlot == slIdx) {
+            targetSlot = -1;
+            UpdateSearchCueBanner();
+        }
+    }
+
+    [[gnu::noinline]] void HandleSwapSlots(int a, int b) {
+        if (!state || !storage || a < 0 || a >= 10 || b < 0 || b >= 10 || a == b) return;
+        AppState candidate = *state;
+        auto& sl = candidate.scenes[(size_t)sceneIndex].slots;
+        std::swap(sl[(size_t)a], sl[(size_t)b]);
+        if (CommitCandidate(candidate, L"已调整槽位顺序")) {
+            if (!Motion::IsReducedMotion()) {
+                float delta = (float)(a - b) * kSlotStride;
+                slotShiftSpring[(size_t)b].value += delta;
+                slotShiftSpring[(size_t)b].target = 0.0f;
+                slotShiftSpring[(size_t)a].value -= delta;
+                slotShiftSpring[(size_t)a].target = 0.0f;
+                EnsureAnimTimer();
+            }
+        }
+    }
+
+    [[gnu::noinline]] void HandleToggleSceneEnabled() {
+        if (!state || !storage) return;
+        AppState candidate = *state;
+        bool wasEn = candidate.scenes[(size_t)sceneIndex].enabled;
+        if (!candidate.ToggleSceneEnabled(sceneIndex)) {
+            lockedShakeTick = GetTickCount64();
+            statusText = UiText(L"至少需保留 1 个启用场景");
             statusIsErr = true;
+            if (!Motion::IsReducedMotion()) EnsureAnimTimer();
             InvalidateRect(hwnd, nullptr, FALSE);
             return;
         }
-        *state = std::move(candidate);
-        statusText = UiText(L"已启用场景「" + state->scenes[(size_t)sceneIndex].name + L"」，贴边面板已同步显示");
+        std::wstring scName = candidate.scenes[(size_t)sceneIndex].name;
+        CommitCandidate(candidate, wasEn
+            ? (L"已隐藏场景「" + scName + L"」（槽位编排已完整保留）")
+            : (L"已启用场景「" + scName + L"」，贴边面板已同步显示"));
+    }
+
+    [[gnu::noinline]] void HandleRenameScene() {
+        if (!state || !storage) return;
+        int sc = sceneIndex;
+        bool ok = SceneRenameDialog::Show(hInst, hwnd, sc, state->scenes[(size_t)sc].name,
+            [this, sc](const std::wstring& newName, std::wstring& outErr) -> bool {
+                AppState candidate = *state;
+                candidate.scenes[(size_t)sc].name = newName;
+                if (!storage->Save(candidate)) {
+                    outErr = storage->readOnlyRecoveryMode
+                        ? L"只读保护模式：请先恢复备份或导入 data.json"
+                        : L"保存失败：无法写入数据文件";
+                    return false;
+                }
+                *state = std::move(candidate);
+                return true;
+            });
+        if (!ok) return;
+        statusText = UiText(L"已更新场景名称为「" + state->scenes[(size_t)sc].name + L"」");
         statusIsErr = false;
+        UpdateSearchCueBanner();
         NotifyMutated();
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
-    [[gnu::noinline]] void HandleNewPrompt() {
+    [[gnu::noinline]] void HandleClearScene() {
         if (!state || !storage) return;
-        bool wasFull = (state->CountMountedInScene(sceneIndex) >= 10);
-        wchar_t hdBuf[96]{};
-        if (wasFull) {
+        int mounted = state->CountMountedInScene(sceneIndex);
+        if (mounted == 0) return;
+        std::wstring scName = state->scenes[(size_t)sceneIndex].name;
+        wchar_t body[256]{};
+        _snwprintf_s(body, _countof(body), _TRUNCATE,
+                      L"确定要清空场景「%ls」的 %d 个已装配槽位吗？\n\n"
+                      L"所有 Prompt 正文、使用次数与其他场景编排都会完整保留在词舱中，不会删除任何条目。",
+                      scName.c_str(), mounted);
+        if (!DarkConfirmDialog::Show(hInst, hwnd, L"清空「" + scName + L"」槽位", body, L"确认清空", L"取消", true)) return;
+
+        auto prevSlots = state->scenes[(size_t)sceneIndex].slots;
+        AppState candidate = *state;
+        candidate.ClearSceneSlots(sceneIndex);
+        if (CommitCandidate(candidate, L"已清空「" + scName + L"」全部槽位（词舱已保留）")) {
+            undoClearActive = true;
+            undoClearSceneIdx = sceneIndex;
+            undoClearSlots = prevSlots;
+            undoClearExpireTick = GetTickCount64() + 5000;
+            targetSlot = -1;
+            UpdateSearchCueBanner();
+            if (hwnd) SetTimer(hwnd, kTimerUndoExpire, 5050, nullptr);
+        }
+    }
+
+    [[gnu::noinline]] void HandleUndoClear() {
+        if (!undoClearActive || !state || !storage || GetTickCount64() > undoClearExpireTick) {
+            undoClearActive = false;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return;
+        }
+        int sc = undoClearSceneIdx;
+        if (sc < 0 || sc >= kMaxScenes) return;
+        if (state->CountMountedInScene(sc) > 0) {
+            undoClearActive = false;
+            statusText = UiText(L"该场景已重新编排，未覆盖现有槽位");
+            statusIsErr = false;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return;
+        }
+        AppState candidate = *state;
+        candidate.scenes[(size_t)sc].slots = undoClearSlots;
+        candidate.SanitizeSlots();
+        undoClearActive = false;
+        if (hwnd) KillTimer(hwnd, kTimerUndoExpire);
+        CommitCandidate(candidate, L"已恢复「" + state->scenes[(size_t)sc].name + L"」原有槽位");
+    }
+
+    [[gnu::noinline]] void HandleNewPrompt(int explicitSlot = -1, const std::wstring& initTitle = L"") {
+        if (!state || !storage) return;
+        int effSlot = (explicitSlot >= 0 && explicitSlot < 10) ? explicitSlot : targetSlot;
+        bool wasFull = (effSlot < 0 && state->CountMountedInScene(sceneIndex) >= 10);
+        wchar_t hdBuf[128]{};
+        if (effSlot >= 0) {
+            _snwprintf_s(hdBuf, _countof(hdBuf), _TRUNCATE, L"新建 Prompt 并放入「%ls · 槽位 %02d」",
+                         state->scenes[(size_t)sceneIndex].name.c_str(), effSlot + 1);
+        } else if (wasFull) {
             wcscpy_s(hdBuf, L"新建 Prompt 到词舱（当前场景已满）");
         } else {
-            _snwprintf_s(hdBuf, _countof(hdBuf), _TRUNCATE, L"新建 Prompt 并加入「%ls」", state->scenes[(size_t)sceneIndex].name.c_str());
+            _snwprintf_s(hdBuf, _countof(hdBuf), _TRUNCATE, L"新建 Prompt 并加入「%ls」",
+                         state->scenes[(size_t)sceneIndex].name.c_str());
         }
         int mountedSlot = -1;
-        std::wstring createdId;
-        auto res = PromptEditorDialog::Show(hInst, hwnd, hdBuf, L"", L"",
-            [this, &mountedSlot, &createdId](const std::wstring& title, const std::wstring& content, std::wstring& outErr) -> bool {
+        auto res = PromptEditorDialog::Show(hInst, hwnd, hdBuf, initTitle, L"",
+            [this, effSlot, &mountedSlot](const std::wstring& title, const std::wstring& content, std::wstring& outErr) -> bool {
                 AppState candidate = *state;
                 PromptItem item{};
                 item.id = GeneratePromptId(&candidate);
@@ -2381,30 +3153,40 @@ private:
                 item.content = content;
                 item.createdAt = NowUnixSeconds();
                 candidate.vault.insert(candidate.vault.begin(), item);
-                mountedSlot = candidate.AssignToSceneFirstEmpty(sceneIndex, item.id);
+                if (effSlot >= 0 && effSlot < 10) {
+                    candidate.AssignToSlotInScene(sceneIndex, effSlot, item.id);
+                    mountedSlot = effSlot;
+                } else {
+                    mountedSlot = candidate.AssignToSceneFirstEmpty(sceneIndex, item.id);
+                }
                 if (!storage->Save(candidate)) {
                     outErr = storage->readOnlyRecoveryMode
                         ? L"只读保护模式：请先恢复备份或导入 data.json"
                         : L"保存失败：无法写入数据文件";
                     return false;
                 }
-                createdId = item.id;
                 *state = std::move(candidate);
                 return true;
             });
         if (!res.accepted) return;
-        orderedIds.insert(orderedIds.begin(), createdId);
-        scrollY = 0.0f;
-        scrollTargetY = 0.0f;
-        if (mountedSlot >= 0) {
-            wchar_t mb[64]{};
-            wsprintfW(mb, L"已新建并放入槽位 %02d", mountedSlot + 1);
-            statusText = UiText(mb);
-            statusIsErr = false;
-        } else {
-            statusText = UiText(L"已存入词舱，取消勾选任意条目后即可加入此场景");
-            statusIsErr = false;
+        if (!pickerQuery.empty()) {
+            pickerQuery.clear();
+            if (hSearchEdit && IsWindow(hSearchEdit)) SetWindowTextW(hSearchEdit, L"");
         }
+        if (effSlot >= 0 && targetSlot == effSlot) {
+            targetSlot = -1;
+            UpdateSearchCueBanner();
+        }
+        scrollY = scrollTargetY = 0.0f;
+        if (mountedSlot >= 0) {
+            wchar_t mb[96]{};
+            _snwprintf_s(mb, _countof(mb), _TRUNCATE, L"已新建并放入「%ls · 槽位 %02d」",
+                         state->scenes[(size_t)sceneIndex].name.c_str(), mountedSlot + 1);
+            statusText = UiText(mb);
+        } else {
+            statusText = UiText(L"已存入词舱，移出或指定左侧槽位后即可加入");
+        }
+        statusIsErr = false;
         NotifyMutated();
         InvalidateRect(hwnd, nullptr, FALSE);
     }
@@ -2436,12 +3218,111 @@ private:
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
+    [[gnu::noinline]] void ShowSlotContextMenu(int slIdx, POINT screenPt) {
+        if (!popupMenu || !state || slIdx < 0 || slIdx >= 10) return;
+        const std::wstring pid = state->scenes[(size_t)sceneIndex].slots[(size_t)slIdx];
+        const PromptItem* cur = state->FindById(pid);
+        std::wstring s2 = FormatSlot2(slIdx);
+        std::vector<DarkMenuItem> items;
+        if (cur) {
+            items.push_back(DarkMenuItem::Header(state->scenes[(size_t)sceneIndex].name + L" · 槽位 " + s2 + L" · " + cur->title));
+            items.push_back(DarkMenuItem::Action(1, L"编辑此 Prompt..."));
+            items.push_back(DarkMenuItem::Action(2, L"新建并替换此格..."));
+            items.push_back(DarkMenuItem::Action(3, L"从右侧挑选替换此格"));
+            items.push_back(DarkMenuItem::Separator());
+            if (slIdx > 0) items.push_back(DarkMenuItem::Action(4, L"上移一格"));
+            if (slIdx < 9) items.push_back(DarkMenuItem::Action(5, L"下移一格"));
+            items.push_back(DarkMenuItem::Separator());
+            items.push_back(DarkMenuItem::Action(6, L"移出此场景（保留在词舱）", L"", false, true));
+        } else {
+            items.push_back(DarkMenuItem::Header(state->scenes[(size_t)sceneIndex].name + L" · 空槽位 " + s2));
+            items.push_back(DarkMenuItem::Action(2, L"+ 新建 Prompt 放入此格..."));
+            items.push_back(DarkMenuItem::Action(3, L"设为右侧选词目标槽位"));
+        }
+        popupMenu->ShowAt(screenPt, items, [this, slIdx, pid](int cmd) {
+            if (cmd == 1 && !pid.empty()) HandleEditPrompt(pid);
+            else if (cmd == 2) HandleNewPrompt(slIdx);
+            else if (cmd == 3) {
+                targetSlot = slIdx;
+                UpdateSearchCueBanner();
+                if (hSearchEdit && IsWindow(hSearchEdit)) SetFocus(hSearchEdit);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            } else if (cmd == 4 && slIdx > 0) HandleSwapSlots(slIdx, slIdx - 1);
+            else if (cmd == 5 && slIdx < 9) HandleSwapSlots(slIdx, slIdx + 1);
+            else if (cmd == 6) HandleRemoveSlot(slIdx);
+        }, 232.0f, MenuOwner::Vault);
+    }
+
+    bool HandleShortcutKey(WPARAM vk, bool fromSearchEdit) {
+        bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool alt  = (GetKeyState(VK_MENU) & 0x8000) != 0;
+        if (popupMenu && popupMenu->IsOpenFor(MenuOwner::Vault)) {
+            if (popupMenu->HandleForwardedKey(vk)) return true;
+        }
+        if (ctrl && !alt && vk == 'F') {
+            if (hSearchEdit && IsWindow(hSearchEdit)) {
+                SetFocus(hSearchEdit);
+                SendMessageW(hSearchEdit, EM_SETSEL, 0, -1);
+            }
+            return true;
+        }
+        if (ctrl && !alt && vk == 'N') {
+            HandleNewPrompt();
+            return true;
+        }
+        if (ctrl && !alt && vk == 'A' && fromSearchEdit && hSearchEdit) {
+            SendMessageW(hSearchEdit, EM_SETSEL, 0, -1);
+            return true;
+        }
+        if (vk == VK_ESCAPE) {
+            if (isSlotDragging || pressedSlot >= 0) {
+                CancelSlotDrag(true);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return true;
+            }
+            if (!pickerQuery.empty()) {
+                ClearSearchQuery();
+                return true;
+            }
+            if (targetSlot >= 0) {
+                targetSlot = -1;
+                UpdateSearchCueBanner();
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return true;
+            }
+            done = true;
+            DestroyWindow(hwnd);
+            return true;
+        }
+        return false;
+    }
+
+    static LRESULT CALLBACK SearchSubProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+        auto* self = static_cast<ScenePromptsDialog*>(GetPropW(h, kSearchProp));
+        if (!self || !self->origSearchProc) return DefWindowProcW(h, msg, wp, lp);
+        WNDPROC orig = self->origSearchProc;
+        if (msg == WM_NCDESTROY) {
+            RemovePropW(h, kSearchProp);
+            SetWindowLongPtrW(h, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(orig));
+            self->origSearchProc = nullptr;
+            return CallWindowProcW(orig, h, msg, wp, lp);
+        }
+        if (msg == WM_KEYDOWN) {
+            if (self->HandleShortcutKey(wp, true)) return 0;
+        }
+        if (msg == WM_CHAR && (wp == VK_RETURN || wp == VK_ESCAPE)) return 0;
+        return CallWindowProcW(orig, h, msg, wp, lp);
+    }
+
     [[gnu::noinline]] void RunModal(HWND parent) {
-        std::wstring cap = UiText(L"配置场景「" + state->scenes[(size_t)sceneIndex].name + L"」提示词");
+        std::wstring cap = UiText(L"编辑场景台面 -- 词舱 PromptPod");
         hwnd = CreateDarkModalWindow(hInst, L"PromptPod_ScenePromptsDlg", DlgWndProc, cap.c_str(),
                                      WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_CLIPCHILDREN,
-                                     parent, 560.0f, 492.0f, dpiScale, this);
+                                     parent, 800.0f, 560.0f, dpiScale, this);
         if (!hwnd) return;
+        // Enable double-click support on dialog class
+        SetClassLongPtrW(hwnd, GCL_STYLE, GetClassLongPtrW(hwnd, GCL_STYLE) | CS_DBLCLKS);
+        SetupSearchControl();
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
 
@@ -2452,14 +3333,13 @@ private:
             BOOL gm = GetMessageW(&msg, nullptr, 0, 0);
             if (gm == 0) { gotQuit = true; quitCode = msg.wParam; break; }
             if (gm < 0) break;
-            if ((msg.hwnd == hwnd || IsChild(hwnd, msg.hwnd)) && msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
-                done = true;
-                DestroyWindow(hwnd);
-                continue;
+            if ((msg.hwnd == hwnd || IsChild(hwnd, msg.hwnd)) && msg.message == WM_KEYDOWN) {
+                if (msg.hwnd != hSearchEdit && HandleShortcutKey(msg.wParam, false)) continue;
             }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        if (popupMenu && popupMenu->IsOpenFor(MenuOwner::Vault)) popupMenu->Close();
         EndDarkModalWindow(hwnd, parent, gotQuit, quitCode);
     }
 
@@ -2475,15 +3355,30 @@ private:
 
         switch (msg) {
             case WM_ERASEBKGND: return 1;
+            case WM_CTLCOLOREDIT:
+                SetTextColor((HDC)wp, RGB(241, 245, 249));
+                SetBkColor((HDC)wp, RGB(27, 31, 43));
+                return (LRESULT)self->hSearchBrush;
+            case WM_SETTINGCHANGE:
+                Motion::RefreshSystemReducedMotion();
+                if (Motion::IsReducedMotion()) {
+                    self->SnapAllAnims();
+                    self->StopAnimTimer();
+                    InvalidateRect(h, nullptr, FALSE);
+                }
+                return 0;
             case WM_GETMINMAXINFO: {
                 auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
                 float sc = GetDpiScaleForWindow(h);
-                mmi->ptMinTrackSize.x = (LONG)(460.0f * sc);
-                mmi->ptMinTrackSize.y = (LONG)(360.0f * sc);
+                mmi->ptMinTrackSize.x = (LONG)(680.0f * sc);
+                mmi->ptMinTrackSize.y = (LONG)(460.0f * sc);
                 return 0;
             }
             case WM_SIZE:
                 if (self->rt) self->rt->Resize(D2D1::SizeU(LOWORD(lp), HIWORD(lp)));
+                self->scenePillInit = false;
+                self->filterPillInit = false;
+                self->LayoutSearchControl();
                 InvalidateRect(h, nullptr, FALSE);
                 return 0;
             case WM_DPICHANGED: {
@@ -2491,33 +3386,101 @@ private:
                 self->brush.Reset(); self->rt.Reset();
                 auto* sug = reinterpret_cast<RECT*>(lp);
                 SetWindowPos(h, nullptr, sug->left, sug->top, sug->right - sug->left, sug->bottom - sug->top, SWP_NOZORDER | SWP_NOACTIVATE);
+                self->RebuildSearchFont();
+                self->LayoutSearchControl();
                 InvalidateRect(h, nullptr, FALSE);
                 return 0;
             }
+            case WM_COMMAND:
+                if (LOWORD(wp) == 4001) {
+                    WORD code = HIWORD(wp);
+                    if (code == EN_SETFOCUS) {
+                        self->searchFocused = true;
+                        if (Motion::IsReducedMotion()) self->searchFocusAnim = 1.0f; else self->EnsureAnimTimer();
+                        InvalidateRect(h, nullptr, FALSE);
+                    } else if (code == EN_KILLFOCUS) {
+                        self->searchFocused = false;
+                        if (Motion::IsReducedMotion()) self->searchFocusAnim = 0.0f; else self->EnsureAnimTimer();
+                        InvalidateRect(h, nullptr, FALSE);
+                    } else if (code == EN_CHANGE) {
+                        int len = GetWindowTextLengthW(self->hSearchEdit);
+                        std::wstring q((size_t)len + 1, L'\0');
+                        if (len > 0) GetWindowTextW(self->hSearchEdit, q.data(), len + 1);
+                        q.resize((size_t)len);
+                        self->pickerQuery = q;
+                        self->scrollY = self->scrollTargetY = 0.0f;
+                        self->filterDirty = true;
+                        if (Motion::IsReducedMotion()) self->clearSearchAnim = q.empty() ? 0.0f : 1.0f;
+                        else self->EnsureAnimTimer();
+                        InvalidateRect(h, nullptr, FALSE);
+                    }
+                }
+                return 0;
             case WM_TIMER:
                 if (wp == kTimerAnim) self->OnAnimTick();
+                else if (wp == kTimerUndoExpire) {
+                    KillTimer(h, kTimerUndoExpire);
+                    self->undoClearActive = false;
+                    InvalidateRect(h, nullptr, FALSE);
+                }
                 return 0;
             case WM_PAINT: self->OnPaint(); return 0;
             case WM_MOUSEWHEEL: {
-                if (self->scrollbar.dragging) return 0;
+                if (self->scrollbar.dragging || self->isSlotDragging || self->pressedSlot >= 0) return 0;
                 short delta = GET_WHEEL_DELTA_WPARAM(wp);
-                self->scrollTargetY = std::clamp(self->scrollTargetY - (float)delta * 0.45f, 0.0f, self->maxScrollY);
-                if (Motion::IsReducedMotion()) {
-                    self->scrollY = self->scrollTargetY;
+                POINT cpt{ (short)LOWORD(lp), (short)HIWORD(lp) };
+                ScreenToClient(h, &cpt);
+                float cx = (float)cpt.x / self->dpiScale;
+                if (cx < kRightPaneX - 4.0f && self->leftMaxScrollY > 0.5f) {
+                    self->leftScrollTargetY = std::clamp(self->leftScrollTargetY - (float)delta * 0.35f, 0.0f, self->leftMaxScrollY);
+                    if (Motion::IsReducedMotion()) self->leftScrollY = self->leftScrollTargetY;
+                    else { Motion::ExpApproach(self->leftScrollY, self->leftScrollTargetY, 20.0f, 0.016f, 0.25f); self->EnsureAnimTimer(); }
                 } else {
-                    Motion::ExpApproach(self->scrollY, self->scrollTargetY, 20.0f, 0.016f, 0.25f);
-                    self->EnsureAnimTimer();
+                    self->scrollTargetY = std::clamp(self->scrollTargetY - (float)delta * 0.45f, 0.0f, self->maxScrollY);
+                    if (Motion::IsReducedMotion()) self->scrollY = self->scrollTargetY;
+                    else { Motion::ExpApproach(self->scrollY, self->scrollTargetY, 20.0f, 0.016f, 0.25f); self->EnsureAnimTimer(); }
                 }
                 InvalidateRect(h, nullptr, FALSE);
                 return 0;
             }
             case WM_SETCURSOR:
                 if (LOWORD(lp) == HTCLIENT) {
-                    SetCursor(LoadCursorW(nullptr, self->hoverZoneIdx >= 0 ? IDC_HAND : IDC_ARROW));
+                    if (self->isSlotDragging) SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+                    else SetCursor(LoadCursorW(nullptr, self->hoverZoneIdx >= 0 ? IDC_HAND : IDC_ARROW));
                     return TRUE;
                 }
                 break;
+            case WM_RBUTTONUP: {
+                float x = (float)(short)LOWORD(lp) / self->dpiScale;
+                float y = (float)(short)HIWORD(lp) / self->dpiScale;
+                POINT spt{ (short)LOWORD(lp), (short)HIWORD(lp) };
+                ClientToScreen(h, &spt);
+                if (x >= self->leftSlotsVp.left && x <= self->leftSlotsVp.right &&
+                    y >= self->leftSlotsVp.top && y <= self->leftSlotsVp.bottom) {
+                    for (int i = 0; i < 10; ++i) {
+                        D2D1_RECT_F sr = self->LeftSlotRectDip(i);
+                        if (x >= sr.left && x <= sr.right && y >= sr.top && y <= sr.bottom) {
+                            self->ShowSlotContextMenu(i, spt);
+                            return 0;
+                        }
+                    }
+                }
+                return 0;
+            }
+            case WM_LBUTTONDBLCLK: {
+                float x = (float)(short)LOWORD(lp) / self->dpiScale;
+                float y = (float)(short)HIWORD(lp) / self->dpiScale;
+                int hz = self->HitZone(x, y);
+                if (hz >= 0 && self->zones[(size_t)hz].kind >= 40 && self->zones[(size_t)hz].kind < 50) {
+                    int sl = self->zones[(size_t)hz].kind - 40;
+                    const std::wstring& pid = self->state->scenes[(size_t)self->sceneIndex].slots[(size_t)sl];
+                    if (self->state->FindById(pid)) self->HandleEditPrompt(pid);
+                    else self->HandleNewPrompt(sl);
+                }
+                return 0;
+            }
             case WM_LBUTTONDOWN: {
+                if (self->popupMenu && self->popupMenu->IsOpen()) self->popupMenu->Close(true);
                 float x = (float)(short)LOWORD(lp) / self->dpiScale;
                 float y = (float)(short)HIWORD(lp) / self->dpiScale;
                 self->pressedKind = 0; self->pressedPid.clear();
@@ -2529,7 +3492,23 @@ private:
                 }
                 int hz = self->HitZone(x, y);
                 if (hz >= 0) {
-                    self->pressedKind = self->zones[(size_t)hz].kind;
+                    int k = self->zones[(size_t)hz].kind;
+                    if (k >= 40 && k < 50) {
+                        int sl = k - 40;
+                        if (self->state->FindById(self->state->scenes[(size_t)self->sceneIndex].slots[(size_t)sl]) != nullptr) {
+                            self->pressedSlot = sl;
+                            self->isSlotDragging = false;
+                            self->slotDragOrigSlots = self->state->scenes[(size_t)self->sceneIndex].slots;
+                            self->slotDragStartY = y;
+                            D2D1_RECT_F sr = self->LeftSlotRectDip(sl);
+                            self->slotDragGrabOffsetY = y - sr.top;
+                            self->slotDragCurY = sr.top;
+                            SetCapture(h);
+                            InvalidateRect(h, nullptr, FALSE);
+                            return 0;
+                        }
+                    }
+                    self->pressedKind = k;
                     self->pressedPid = self->zones[(size_t)hz].pid;
                     SetCapture(h);
                     InvalidateRect(h, nullptr, FALSE);
@@ -2543,6 +3522,51 @@ private:
                 }
                 float x = (float)(short)LOWORD(lp) / self->dpiScale;
                 float y = (float)(short)HIWORD(lp) / self->dpiScale;
+
+                if (self->pressedSlot >= 0) {
+                    if (!self->isSlotDragging && std::fabs(y - self->slotDragStartY) >= 5.0f) {
+                        self->isSlotDragging = true;
+                        self->targetSlot = -1;
+                        self->UpdateSearchCueBanner();
+                        self->dragLiftSpring.Snap(Motion::IsReducedMotion() ? 1.0f : 0.0f);
+                        self->dragLiftSpring.target = 1.0f;
+                        if (!Motion::IsReducedMotion()) self->EnsureAnimTimer();
+                    }
+                    if (self->isSlotDragging) {
+                        SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+                        float firstTop = self->leftSlotsTopDip - self->leftScrollY;
+                        float lastTop = firstTop + 9.0f * kSlotStride;
+                        self->slotDragCurY = std::clamp(y - self->slotDragGrabOffsetY, firstTop - 4.0f, lastTop + 4.0f);
+                        float dragMidY = self->slotDragCurY + kSlotH * 0.5f;
+                        auto& sl = self->state->scenes[(size_t)self->sceneIndex].slots;
+                        while (self->pressedSlot < 9) {
+                            float nextMidY = firstTop + (float)(self->pressedSlot + 1) * kSlotStride + kSlotH * 0.5f;
+                            if (dragMidY > nextMidY - 4.0f) {
+                                std::swap(sl[(size_t)self->pressedSlot], sl[(size_t)(self->pressedSlot + 1)]);
+                                if (!Motion::IsReducedMotion()) {
+                                    self->slotShiftSpring[(size_t)self->pressedSlot].value += kSlotStride;
+                                    self->slotShiftSpring[(size_t)self->pressedSlot].target = 0.0f;
+                                }
+                                self->pressedSlot += 1;
+                            } else break;
+                        }
+                        while (self->pressedSlot > 0) {
+                            float prevMidY = firstTop + (float)(self->pressedSlot - 1) * kSlotStride + kSlotH * 0.5f;
+                            if (dragMidY < prevMidY + 4.0f) {
+                                std::swap(sl[(size_t)self->pressedSlot], sl[(size_t)(self->pressedSlot - 1)]);
+                                if (!Motion::IsReducedMotion()) {
+                                    self->slotShiftSpring[(size_t)self->pressedSlot].value -= kSlotStride;
+                                    self->slotShiftSpring[(size_t)self->pressedSlot].target = 0.0f;
+                                }
+                                self->pressedSlot -= 1;
+                            } else break;
+                        }
+                        if (!Motion::IsReducedMotion()) self->EnsureAnimTimer();
+                        InvalidateRect(h, nullptr, FALSE);
+                        return 0;
+                    }
+                }
+
                 bool sbRedraw = false;
                 if (self->scrollbar.OnMouseMove(x, y, self->scrollY, self->maxScrollY, self->viewportH, sbRedraw)) {
                     if (self->scrollbar.dragging) self->scrollTargetY = self->scrollY;
@@ -2580,6 +3604,51 @@ private:
                     InvalidateRect(h, nullptr, FALSE);
                     return 0;
                 }
+                if (self->pressedSlot >= 0) {
+                    int finSlot = self->pressedSlot;
+                    bool wasDrag = self->isSlotDragging;
+                    self->pressedSlot = -1;
+                    self->isSlotDragging = false;
+                    if (GetCapture() == h) ReleaseCapture();
+                    if (wasDrag) {
+                        self->dragLiftSpring.target = 0.0f;
+                        if (!self->storage->Save(*self->state)) {
+                            self->state->scenes[(size_t)self->sceneIndex].slots = self->slotDragOrigSlots;
+                            for (auto& sp : self->slotShiftSpring) sp.Snap(0.0f);
+                            self->statusText = UiText(self->storage->readOnlyRecoveryMode
+                                ? L"只读保护模式：无法保存槽位顺序"
+                                : L"保存失败：无法写入数据文件");
+                            self->statusIsErr = true;
+                        } else {
+                            if (!Motion::IsReducedMotion() && finSlot >= 0 && finSlot < 10) {
+                                float landingTop = self->LeftSlotRectDip(finSlot).top;
+                                float dropDelta = self->slotDragCurY - landingTop;
+                                if (std::fabs(dropDelta) > 0.4f) {
+                                    self->slotShiftSpring[(size_t)finSlot].Snap(dropDelta);
+                                    self->slotShiftSpring[(size_t)finSlot].target = 0.0f;
+                                }
+                            }
+                            self->statusText = UiText(L"已调整槽位顺序，贴边面板已同步");
+                            self->statusIsErr = false;
+                            self->NotifyMutated();
+                        }
+                        if (!Motion::IsReducedMotion()) self->EnsureAnimTimer();
+                        InvalidateRect(h, nullptr, FALSE);
+                    } else {
+                        float x = (float)(short)LOWORD(lp) / self->dpiScale;
+                        float y = (float)(short)HIWORD(lp) / self->dpiScale;
+                        int hz = self->HitZone(x, y);
+                        if (hz >= 0 && self->zones[(size_t)hz].kind == (40 + finSlot)) {
+                            self->targetSlot = (self->targetSlot == finSlot) ? -1 : finSlot;
+                            self->UpdateSearchCueBanner();
+                            if (self->targetSlot >= 0 && self->hSearchEdit && IsWindow(self->hSearchEdit)) {
+                                SetFocus(self->hSearchEdit);
+                            }
+                        }
+                        InvalidateRect(h, nullptr, FALSE);
+                    }
+                    return 0;
+                }
                 int downK = self->pressedKind;
                 std::wstring downPid = self->pressedPid;
                 self->pressedKind = 0; self->pressedPid.clear();
@@ -2592,18 +3661,65 @@ private:
                 if (hz >= 0 && self->zones[(size_t)hz].kind == downK && self->zones[(size_t)hz].pid == downPid) {
                     if (downK == 1) self->HandleNewPrompt();
                     else if (downK == 2) { self->done = true; DestroyWindow(h); }
-                    else if (downK == 3) self->HandleEnableSceneNow();
-                    else if (downK == 10) self->HandleTogglePrompt(downPid);
-                    else if (downK == 11) self->HandleEditPrompt(downPid);
+                    else if (downK == 3) self->HandleToggleSceneEnabled();
+                    else if (downK == 4) self->HandleRenameScene();
+                    else if (downK == 5) self->HandleClearScene();
+                    else if (downK == 6) self->HandleUndoClear();
+                    else if (downK == 7) self->ClearSearchQuery();
+                    else if (downK == 8) {
+                        self->targetSlot = -1;
+                        self->UpdateSearchCueBanner();
+                        InvalidateRect(h, nullptr, FALSE);
+                    } else if (downK == 9) {
+                        self->HandleNewPrompt(-1, CollapseWhitespaceSingleLine(self->pickerQuery, 24));
+                    } else if (downK >= 20 && downK < 20 + kMaxScenes) {
+                        self->SwitchScene(downK - 20);
+                    } else if (downK >= 30 && downK <= 32) {
+                        PickerFilter nextF = (downK == 30) ? PickerFilter::NotInCurrent
+                                           : (downK == 31 ? PickerFilter::UnmountedAll : PickerFilter::All);
+                        if (nextF != self->pickerFilter) {
+                            self->pickerFilter = nextF;
+                            self->scrollY = self->scrollTargetY = 0.0f;
+                            self->filterDirty = true;
+                            if (!Motion::IsReducedMotion()) self->EnsureAnimTimer();
+                            InvalidateRect(h, nullptr, FALSE);
+                        }
+                    } else if (downK >= 40 && downK < 50) {
+                        int sl = downK - 40;
+                        self->targetSlot = (self->targetSlot == sl) ? -1 : sl;
+                        self->UpdateSearchCueBanner();
+                        if (self->targetSlot >= 0 && self->hSearchEdit && IsWindow(self->hSearchEdit)) {
+                            SetFocus(self->hSearchEdit);
+                        }
+                        InvalidateRect(h, nullptr, FALSE);
+                    } else if (downK >= 50 && downK < 60) {
+                        self->HandleEditPrompt(downPid);
+                    } else if (downK >= 60 && downK < 70) {
+                        self->HandleRemoveSlot(downK - 60);
+                    } else if (downK == 70) {
+                        self->HandleRightCardAction(downPid);
+                    } else if (downK == 71) {
+                        self->HandleEditPrompt(downPid);
+                    }
                 }
                 return 0;
             }
             case WM_CAPTURECHANGED:
+            case WM_CANCELMODE:
+                if (self->pressedSlot >= 0 || self->isSlotDragging) {
+                    self->CancelSlotDrag(true);
+                    InvalidateRect(h, nullptr, FALSE);
+                }
                 if (self->pressedKind != 0) { self->pressedKind = 0; self->pressedPid.clear(); InvalidateRect(h, nullptr, FALSE); }
                 self->scrollbar.dragging = false;
                 return 0;
             case WM_CLOSE: self->done = true; DestroyWindow(h); return 0;
-            case WM_DESTROY: self->done = true; return 0;
+            case WM_DESTROY:
+                self->StopAnimTimer();
+                KillTimer(h, kTimerUndoExpire);
+                self->DetachSearchControl();
+                self->done = true;
+                return 0;
             case WM_NCDESTROY: SetWindowLongPtrW(h, GWLP_USERDATA, 0); self->hwnd = nullptr; return 0;
         }
         return DefWindowProcW(h, msg, wp, lp);
@@ -3974,7 +5090,7 @@ public:
         if (editorModalOpen || !state || !storage || sceneIdx < 0 || sceneIdx >= kMaxScenes) return false;
         HWND parent = (hwnd && IsWindowVisible(hwnd)) ? hwnd : nullptr;
         editorModalOpen = true;
-        ScenePromptsDialog::Show(hInst, parent, state, storage, sceneIdx, [](void* ctx) {
+        ScenePromptsDialog::Show(hInst, parent, state, storage, popupMenu, sceneIdx, [](void* ctx) {
             auto* self = static_cast<VaultWindow*>(ctx);
             self->InvalidateCaches();
             if (self->onStateChanged) self->onStateChanged();
@@ -5167,7 +6283,7 @@ private:
                     float ca = (effFilter >= 0) ? std::max(cfgBtnAlpha, Motion::IsReducedMotion() ? 1.0f : 0.0f) : cfgBtnAlpha;
                     D2D1_RECT_F rcCfg = D2D1::RectF(cw - 104.0f, contentTop, cw - 20.0f, contentTop + 26.0f);
                     int zCfg = (effFilter >= 0) ? AddZone(54 + effFilter, rcCfg) : -2;
-                    DrawPillButton(rcCfg, L"\x914D\x7F6E\x63D0\x793A\x8BCD", zCfg, 0x1B263B, 0x253554, Theme::AccentCyan, 0.22f, ca);
+                    DrawPillButton(rcCfg, L"\x7F16\x8F91\x53F0\x9762", zCfg, 0x1B263B, 0x253554, Theme::AccentCyan, 0.22f, ca);
                 }
                 contentTop += 34.0f;
             } else {
@@ -5383,7 +6499,7 @@ private:
                     }
                     DrawClippedPresetBtn(bx, bt, bx + 128.0f, bb, 17, L"+ 新建此 Prompt", 6, listViewport);
                 } else if (effFilter >= 0) {
-                    DrawClippedPresetBtn(bx, bt, bx + 132.0f, bb, 54 + effFilter, L"配置此场景提示词", 6, listViewport);
+                    DrawClippedPresetBtn(bx, bt, bx + 132.0f, bb, 54 + effFilter, L"编辑此场景台面", 6, listViewport);
                     bx += 142.0f;
                     DrawClippedPresetBtn(bx, bt, bx + 114.0f, bb, 3, L"+ 新建并加入", 1, listViewport);
                 } else if (effFilter == -2) {
@@ -5695,7 +6811,7 @@ private:
                                           D2D1::RectF(itemCard.left + 150.0f, itemCard.top + 1.0f, itemCard.right - 168.0f, itemCard.bottom),
                                           mBuf, isEn ? Theme::TextSecondary : Theme::TextMuted, 0.88f);
 
-                            DrawClippedPresetBtn(itemCard.right - 160.0f, itemCard.top + 5.0f, itemCard.right - 74.0f, itemCard.bottom - 5.0f, 54 + s, L"配置提示词", 6, settingsViewport);
+                            DrawClippedPresetBtn(itemCard.right - 160.0f, itemCard.top + 5.0f, itemCard.right - 74.0f, itemCard.bottom - 5.0f, 54 + s, L"编辑台面", 6, settingsViewport);
                             DrawClippedPresetBtn(itemCard.right - 68.0f,  itemCard.top + 5.0f, itemCard.right - 8.0f,  itemCard.bottom - 5.0f, 60 + s, L"重命名",    0, settingsViewport);
                         }
                         ry += sceneRowH;
