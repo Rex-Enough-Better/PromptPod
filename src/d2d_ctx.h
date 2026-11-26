@@ -588,15 +588,32 @@ inline float GetDpiScaleForPoint(POINT pt, HWND fallbackHwnd = nullptr) {
 }
 
 // Reliable foreground activation for windows launched from WS_EX_NOACTIVATE popups or System Tray
-// under Windows ForegroundLockTimeout (200s): tries standard SetForegroundWindow first, then
-// safely borrows foreground thread input (guarded against hung windows), and guarantees top Z-order
+// under Windows ForegroundLockTimeout (200s): defends against STARTF_USESHOWWINDOW (e.g. SW_HIDE /
+// SW_SHOWMINNOACTIVE passed by hidden launchers such as WScript.Shell.Run ..., 0) swallowing the
+// process's very first ShowWindow() call, tries standard SetForegroundWindow first, then safely
+// borrows foreground thread input (guarded against hung windows), and guarantees top Z-order
 // even when the previous foreground window is UIPI-elevated.
 [[gnu::noinline]] inline bool BringWindowToForegroundReliable(HWND hwnd, bool keepTopmost = false) {
     if (!hwnd || !IsWindow(hwnd)) return false;
-    ShowWindow(hwnd, IsIconic(hwnd) ? SW_RESTORE : SW_SHOWNORMAL);
 
-    // Tier 0: Fast path when OS already allows foreground transfer
-    if (SetForegroundWindow(hwnd) && GetForegroundWindow() == hwnd) {
+    // Windows ignores nCmdShow on a process's VERY FIRST ShowWindow() on an overlapped window when
+    // launched with STARTF_USESHOWWINDOW (e.g. SW_HIDE or SW_SHOWMINIMIZED); DockWindow / DarkPopupMenu
+    // use SW_SHOWNOACTIVATE on WS_POPUP windows and never consume that flag. Calling ShowWindow() once
+    // clears STARTF_USESHOWWINDOW, so re-asserting immediately whenever still hidden/minimized/unexpectedly
+    // zoomed guarantees the window is genuinely visible on the very first open.
+    bool wasZoomedBefore = (IsZoomed(hwnd) != FALSE);
+    ShowWindow(hwnd, IsIconic(hwnd) ? SW_RESTORE : SW_SHOWNORMAL);
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || (!wasZoomedBefore && IsZoomed(hwnd))) {
+        ShowWindow(hwnd, IsIconic(hwnd) ? SW_RESTORE : SW_SHOWNORMAL);
+    }
+    if (!IsWindowVisible(hwnd)) {
+        SetWindowPos(hwnd, keepTopmost ? HWND_TOPMOST : HWND_TOP, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    }
+
+    // Tier 0: Fast path when OS already allows foreground transfer (only accept when genuinely visible & un-minimized)
+    if (IsWindowVisible(hwnd) && !IsIconic(hwnd) &&
+        SetForegroundWindow(hwnd) && GetForegroundWindow() == hwnd) {
         BringWindowToTop(hwnd);
         return true;
     }
@@ -617,7 +634,7 @@ inline float GetDpiScaleForPoint(POINT pt, HWND fallbackHwnd = nullptr) {
         }
     }
 
-    if (GetForegroundWindow() == hwnd) {
+    if (IsWindowVisible(hwnd) && !IsIconic(hwnd) && GetForegroundWindow() == hwnd) {
         return true;
     }
 
@@ -631,7 +648,7 @@ inline float GetDpiScaleForPoint(POINT pt, HWND fallbackHwnd = nullptr) {
     }
     BringWindowToTop(hwnd);
     SetForegroundWindow(hwnd);
-    return GetForegroundWindow() == hwnd;
+    return IsWindowVisible(hwnd) && !IsIconic(hwnd) && (GetForegroundWindow() == hwnd);
 }
 
 } // namespace pp

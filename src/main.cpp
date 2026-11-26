@@ -2937,7 +2937,79 @@ inline int RunHeadlessSelfTest(const std::wstring& testRootDir) {
         if (r16Err != 0) return r16Err;
     }
 
+    // 17. v0.15.1 Regression: STARTF_USESHOWWINDOW (SW_HIDE / SW_SHOWMINNOACTIVE) must NEVER swallow
+    // the very first BringWindowToForegroundReliable() on an overlapped window after SW_SHOWNOACTIVATE popups!
+    {
+        wchar_t selfExe[MAX_PATH * 4]{};
+        DWORD nExe = GetModuleFileNameW(nullptr, selfExe, _countof(selfExe));
+        if (nExe == 0 || nExe >= _countof(selfExe)) return 330;
+
+        const WORD hostileSwModes[2] = { SW_HIDE, SW_SHOWMINNOACTIVE };
+        for (int mi = 0; mi < 2; ++mi) {
+            std::wstring cl = L"\"";
+            cl += selfExe;
+            cl += L"\" --self-test-startup-show";
+            std::vector<wchar_t> clBuf(cl.begin(), cl.end());
+            clBuf.push_back(L'\0');
+
+            STARTUPINFOW si{};
+            si.cb = sizeof(si);
+            si.dwFlags = STARTF_USESHOWWINDOW;
+            si.wShowWindow = hostileSwModes[mi];
+            PROCESS_INFORMATION pi{};
+            if (!CreateProcessW(selfExe, clBuf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+                return 331 + mi;
+            }
+            DWORD waitRes = WaitForSingleObject(pi.hProcess, 8000);
+            DWORD exitCode = 999;
+            if (waitRes == WAIT_OBJECT_0) {
+                GetExitCodeProcess(pi.hProcess, &exitCode);
+            } else {
+                TerminateProcess(pi.hProcess, 998);
+            }
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            if (exitCode != 0) return 333 + mi;
+        }
+    }
+
     return 0;
+}
+
+inline int RunStartupShowSelfTestChild(HINSTANCE hInst) {
+    // Reproduce exact PromptPod startup sequence: WS_POPUP Dock + DarkPopupMenu with SW_SHOWNOACTIVATE
+    // (which do NOT consume STARTF_USESHOWWINDOW), followed by first-ever overlapped VaultWindow open.
+    HWND dock = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        L"STATIC", L"", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, hInst, nullptr);
+    if (!dock) return 11;
+    ShowWindow(dock, SW_SHOWNOACTIVATE);
+    SetWindowPos(dock, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+
+    HWND menu = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        L"STATIC", L"", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, hInst, nullptr);
+    if (!menu) { DestroyWindow(dock); return 12; }
+    ShowWindow(menu, SW_SHOWNOACTIVATE);
+    SetWindowPos(menu, HWND_TOPMOST, 0, 0, 10, 10, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    ShowWindow(menu, SW_HIDE);
+
+    HWND vault = CreateWindowExW(
+        0, L"STATIC", L"PP_SelfTest_StartupShow",
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+        -30000, -30000, 320, 220, nullptr, nullptr, hInst, nullptr);
+    if (!vault) { DestroyWindow(menu); DestroyWindow(dock); return 13; }
+
+    BringWindowToForegroundReliable(vault, false);
+    BOOL vis = IsWindowVisible(vault);
+    BOOL iconic = IsIconic(vault);
+    BOOL zoomed = IsZoomed(vault);
+
+    DestroyWindow(vault);
+    DestroyWindow(menu);
+    DestroyWindow(dock);
+    return (vis && !iconic && !zoomed) ? 0 : 14;
 }
 
 } // namespace pp
@@ -2949,6 +3021,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     bool silentAutostart = false;
     bool forceReplace = false;
     bool selfTest = false;
+    bool selfTestStartupShow = false;
     std::wstring selfTestDir;
     std::wstring customDataDir;
     DWORD waitPid = 0;
@@ -2966,6 +3039,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
             } else if (arg == L"--self-test") {
                 selfTest = true;
                 if (i + 1 < argc) selfTestDir = argv[++i];
+            } else if (arg == L"--self-test-startup-show") {
+                selfTestStartupShow = true;
             } else if (arg == L"--wait-pid") {
                 if (i + 1 < argc) waitPid = (DWORD)wcstoul(argv[++i], nullptr, 10);
             } else if (arg == L"--cleanup-old") {
@@ -2973,6 +3048,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
             }
         }
         LocalFree(argv);
+    }
+
+    if (selfTestStartupShow) {
+        return pp::RunStartupShowSelfTestChild(hInstance);
     }
 
     if (selfTest) {

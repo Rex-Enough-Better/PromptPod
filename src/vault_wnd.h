@@ -5666,8 +5666,9 @@ public:
         UpdateSearchVisibility();
         bool fgOk = BringWindowToForegroundReliable(hwnd, false);
         DiagLogger::Instance().LogFmt("INFO", "VAULT",
-            L"Open(tab=%d, targetSlot=%d, created=%d, fgOk=%d)",
-            activeTab, assignTargetSlot, createdNew ? 1 : 0, fgOk ? 1 : 0);
+            L"Open(tab=%d, targetSlot=%d, created=%d, fgOk=%d, vis=%d, iconic=%d)",
+            activeTab, assignTargetSlot, createdNew ? 1 : 0, fgOk ? 1 : 0,
+            IsWindowVisible(hwnd) ? 1 : 0, IsIconic(hwnd) ? 1 : 0);
         if (activeTab == 0 && hSearchEdit && IsWindow(hSearchEdit)) {
             SetFocus(hSearchEdit);
         }
