@@ -226,13 +226,14 @@ inline std::wstring BuildSanitizedDiagnostics(const AppState& st, const StorageM
         L"- App: PromptPod v%ls\n"
         L"- OS: %ls\n"
         L"- Display: %d monitor(s), primary=%dx%d, virtual=%dx%d, DPI=%d%%\n"
-        L"- Dock: edge=%ls, hoverBubble=%ls, autoStart=%ls, autoUpdate=%ls, multiScene=%ls(count=%d,active=%d)\n"
+        L"- Dock: edge=%ls, hoverBubble=%ls, autoPaste=%ls, autoStart=%ls, autoUpdate=%ls, multiScene=%ls(count=%d,active=%d)\n"
         L"- VaultStats: %u items (%d / 10 slots mounted), storage=%ls, readOnlyRecovery=%ls",
         APP_VERSION_W,
         osStr.c_str(),
         monCount, priW, priH, vW, vH, dpiPct,
         edgeLabel,
         st.showHoverBubble ? L"on" : L"off",
+        st.autoPasteOnClick ? L"on" : L"off",
         AutoStart::IsEnabled() ? L"on" : L"off",
         st.autoCheckUpdates ? L"on" : L"off",
         st.IsMultiSceneActive() ? L"on" : L"off",

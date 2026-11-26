@@ -71,6 +71,130 @@ inline bool CopyTextToClipboard(HWND owner, const std::wstring& text) {
     return false;
 }
 
+// Native zero-extra-DLL auto-paste helper: safely validates foreground target (UIPI, shell, own-process, modifiers)
+// and synthesizes a layout-aware Ctrl+V via SendInput after clipboard copy succeeds.
+namespace AutoPaste {
+    enum class TargetCheck : int {
+        Ready = 0,
+        NoForeground = 1,
+        OwnProcess = 2,
+        DesktopOrShell = 3,
+        ModifierHeld = 4,
+        ElevatedBlocked = 5
+    };
+
+    inline bool IsDesktopOrShellWindow(HWND h) {
+        if (!h) return true;
+        wchar_t cls[64]{};
+        if (GetClassNameW(h, cls, _countof(cls)) <= 0) return false;
+        return wcscmp(cls, L"Progman") == 0 ||
+               wcscmp(cls, L"WorkerW") == 0 ||
+               wcscmp(cls, L"Shell_TrayWnd") == 0 ||
+               wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0 ||
+               wcscmp(cls, L"NotifyIconOverflowWindow") == 0 ||
+               wcscmp(cls, L"TopLevelWindowForOverflowXamlIsland") == 0 ||
+               wcscmp(cls, L"XamlExplorerHostIslandWindow") == 0 ||
+               wcscmp(cls, L"Shell_InputSwitchTopLevelWindow") == 0;
+    }
+
+    inline bool IsCurrentProcessElevated() {
+        static int cached = -1;
+        if (cached >= 0) return cached != 0;
+        cached = 0;
+        HANDLE hTok = nullptr;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hTok) && hTok) {
+            TOKEN_ELEVATION elev{};
+            DWORD cb = 0;
+            if (GetTokenInformation(hTok, TokenElevation, &elev, sizeof(elev), &cb) && elev.TokenIsElevated != 0) {
+                cached = 1;
+            }
+            CloseHandle(hTok);
+        }
+        return cached != 0;
+    }
+
+    [[gnu::noinline]] inline bool IsTargetBlockedByUipi(HWND fg) {
+        if (!fg || IsCurrentProcessElevated()) return false;
+        DWORD fgPid = 0;
+        GetWindowThreadProcessId(fg, &fgPid);
+        if (fgPid == 0 || fgPid == GetCurrentProcessId()) return false;
+
+        HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, fgPid);
+        if (!hProc) {
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        bool blocked = false;
+        HANDLE hTok = nullptr;
+        if (OpenProcessToken(hProc, TOKEN_QUERY, &hTok) && hTok) {
+            TOKEN_ELEVATION elev{};
+            DWORD cb = 0;
+            if (GetTokenInformation(hTok, TokenElevation, &elev, sizeof(elev), &cb)) {
+                blocked = (elev.TokenIsElevated != 0);
+            }
+            CloseHandle(hTok);
+        } else if (GetLastError() == ERROR_ACCESS_DENIED) {
+            blocked = true;
+        }
+        CloseHandle(hProc);
+        return blocked;
+    }
+
+    inline bool AreBlockingModifiersHeld() {
+        // Skip auto-paste if Shift / Alt / Win is held (avoids Ctrl+Shift+V / Ctrl+Alt+V / menu-bar activation,
+        // and naturally gives users a Shift+Click "copy only" escape hatch!)
+        return ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) ||
+               ((GetAsyncKeyState(VK_MENU)  & 0x8000) != 0) ||
+               ((GetAsyncKeyState(VK_LWIN)  & 0x8000) != 0) ||
+               ((GetAsyncKeyState(VK_RWIN)  & 0x8000) != 0);
+    }
+
+    [[gnu::noinline]] inline TargetCheck CheckForegroundTarget(HWND fg) {
+        if (!fg || !IsWindow(fg)) return TargetCheck::NoForeground;
+        DWORD fgPid = 0;
+        GetWindowThreadProcessId(fg, &fgPid);
+        if (fgPid != 0 && fgPid == GetCurrentProcessId()) return TargetCheck::OwnProcess;
+        if (IsDesktopOrShellWindow(fg)) return TargetCheck::DesktopOrShell;
+        if (AreBlockingModifiersHeld()) return TargetCheck::ModifierHeld;
+        if (IsTargetBlockedByUipi(fg)) return TargetCheck::ElevatedBlocked;
+        return TargetCheck::Ready;
+    }
+
+    [[gnu::noinline]] inline bool SendCtrlV() {
+        bool ctrlAlreadyDown = ((GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0) ||
+                               ((GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0);
+        WORD ctrlScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC);
+        WORD vScan    = (WORD)MapVirtualKeyW('V', MAPVK_VK_TO_VSC);
+
+        INPUT inputs[4]{};
+        UINT count = 0;
+        if (!ctrlAlreadyDown) {
+            inputs[count].type = INPUT_KEYBOARD;
+            inputs[count].ki.wVk = VK_CONTROL;
+            inputs[count].ki.wScan = ctrlScan;
+            ++count;
+        }
+        inputs[count].type = INPUT_KEYBOARD;
+        inputs[count].ki.wVk = 'V';
+        inputs[count].ki.wScan = vScan;
+        ++count;
+
+        inputs[count].type = INPUT_KEYBOARD;
+        inputs[count].ki.wVk = 'V';
+        inputs[count].ki.wScan = vScan;
+        inputs[count].ki.dwFlags = KEYEVENTF_KEYUP;
+        ++count;
+
+        if (!ctrlAlreadyDown) {
+            inputs[count].type = INPUT_KEYBOARD;
+            inputs[count].ki.wVk = VK_CONTROL;
+            inputs[count].ki.wScan = ctrlScan;
+            inputs[count].ki.dwFlags = KEYEVENTF_KEYUP;
+            ++count;
+        }
+        return SendInput(count, inputs, sizeof(INPUT)) == count;
+    }
+}
+
 // Manage Windows current-user startup registry entry (no admin UAC required)
 namespace AutoStart {
     static constexpr const wchar_t* kRunSubKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";

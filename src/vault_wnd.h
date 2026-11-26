@@ -5093,6 +5093,7 @@ public:
     Spring1D rankEnterSpring = Spring1D::Fluid(1.0f);
 
     Spring1D swBubbleSpring = Spring1D::Snappy(1.0f);
+    Spring1D swAutoPasteSpring = Spring1D::Snappy(0.0f);
     Spring1D swAutoStartSpring = Spring1D::Snappy(0.0f);
     Spring1D swAutoUpdSpring = Spring1D::Snappy(1.0f);
     bool settingsAnimInit = false;
@@ -5143,7 +5144,7 @@ public:
     struct HitZone {
         // 1:Tab0, 2:Tab1, 7:Tab2(Settings), 3:New, 4:Import, 5:Export, 6:ClearAssign, 8:ClearSearch,
         // 10:Copy, 11:SlotAssign, 12:Edit, 13:Delete, 14:Duplicate, 15:CardMore, 16:DisableAutoStart, 17:NewFromSearch,
-        // 20:ToggleHoverBubble, 21:ToggleAutoStart, 22:ResetDockEdge, 23:OpenDataDir, 24:OpenLog,
+        // 19:ToggleAutoPaste, 20:ToggleHoverBubble, 21:ToggleAutoStart, 22:ResetDockEdge, 23:OpenDataDir, 24:OpenLog,
         // 25:CheckUpdate, 26:InstallUpdate, 27:OpenReleasesPage, 28:ToggleAutoUpdate,
         // 29:OpenGitHubHome, 30:OpenXHome, 31:OpenFeedback, 32:RestoreFromBackup,
         // 33:EdgeRight, 34:EdgeLeft, 35:UndoDelete, 36:EdgeFloat,
@@ -5224,10 +5225,12 @@ public:
         if (!state) return;
         bool autoOn = (AutoStart::GetStatus() == AutoStart::Status::EnabledCurrent);
         float tBub = state->showHoverBubble ? 1.0f : 0.0f;
+        float tPst = state->autoPasteOnClick ? 1.0f : 0.0f;
         float tAut = autoOn ? 1.0f : 0.0f;
         float tUpd = state->autoCheckUpdates ? 1.0f : 0.0f;
         if (snap || !settingsAnimInit || Motion::IsReducedMotion()) {
             swBubbleSpring.Snap(tBub);
+            swAutoPasteSpring.Snap(tPst);
             swAutoStartSpring.Snap(tAut);
             swAutoUpdSpring.Snap(tUpd);
             for (int s = 0; s < kMaxScenes; ++s) {
@@ -5236,6 +5239,7 @@ public:
             settingsAnimInit = true;
         } else {
             swBubbleSpring.target = tBub;
+            swAutoPasteSpring.target = tPst;
             swAutoStartSpring.target = tAut;
             swAutoUpdSpring.target = tUpd;
         }
@@ -5471,6 +5475,7 @@ public:
 
         if (activeTab == 2 && state) {
             moving |= swBubbleSpring.Step(dt);
+            moving |= swAutoPasteSpring.Step(dt);
             moving |= swAutoStartSpring.Step(dt);
             moving |= swAutoUpdSpring.Step(dt);
             moving |= edgePillXSpring.Step(dt, 0.15f, 1.0f);
@@ -6020,6 +6025,7 @@ public:
             imported.floatX = state->floatX;
             imported.floatY = state->floatY;
             imported.showHoverBubble = state->showHoverBubble;
+            imported.autoPasteOnClick = state->autoPasteOnClick;
             imported.autoCheckUpdates = state->autoCheckUpdates;
             imported.lastUpdateCheckAt = state->lastUpdateCheckAt;
             imported.onboardingCompleted = state->onboardingCompleted;
@@ -7273,7 +7279,7 @@ private:
             // Pre-compute exact section heights for accurate scrollbar metrics
             float sceneRowH = 44.0f;
             float rowSceneMgrH = 72.0f + (float)kMaxScenes * sceneRowH + 10.0f; // Header + 4 multi-select scene rows
-            float sec1H = 74.0f + 64.0f + 66.0f + rowSceneMgrH; // 贴边面板 (3 rows + 4-scene multi-select & prompt manager)
+            float sec1H = 74.0f + 64.0f + 70.0f + 66.0f + rowSceneMgrH; // 贴边面板 (4 rows + 4-scene multi-select & prompt manager)
             float sec2H = rowAutoStartH + 66.0f + rowUpdateH; // 启动与更新 (3 rows)
             float sec3H = 68.0f + 72.0f; // 数据与备份 (2 rows)
             float sec4H = 62.0f + 68.0f + 74.0f; // 帮助与反馈 (3 rows: 快速上手 / 意见反馈 / 内置提示词致谢)
@@ -7342,7 +7348,14 @@ private:
                 ry += 64.0f;
                 DrawRowDivider(g, ry, settingsViewport);
 
-                // Row 1.3: 点击托盘图标 (continuous sliding segmented indicator)
+                // Row 1.3: 点击后自动粘贴 (full-row clickable spring toggle)
+                DrawToggleRow(g, ry, 70.0f, 19, swAutoPasteSpring.value, settingsViewport);
+                DrawRowText(g, ry, 70.0f, 82.0f, settingsViewport, L"点击后自动粘贴",
+                            L"点击贴边 Prompt 后自动发送 Ctrl+V 直接上屏，省去手动粘贴（按住 Shift 点击仅复制）");
+                ry += 70.0f;
+                DrawRowDivider(g, ry, settingsViewport);
+
+                // Row 1.4: 点击托盘图标 (continuous sliding segmented indicator)
                 DrawRowText(g, ry, 66.0f, 206.0f, settingsViewport, L"点击托盘图标",
                             L"左键点击右下角托盘图标时的默认操作");
                 if (ry + 66.0f >= settingsViewport.top && ry <= settingsViewport.bottom) {
@@ -7787,6 +7800,21 @@ private:
                     if (!Motion::IsReducedMotion()) EnsureAnimTimer();
                     InvalidateRect(hwnd, nullptr, FALSE);
                 }
+                break;
+            }
+            case 19: {
+                AppState candidate = *state;
+                candidate.autoPasteOnClick = !candidate.autoPasteOnClick;
+                if (!storage->Save(candidate)) {
+                    ShowToast(L"保存设置失败：当前处于只读保护或文件不可写", true);
+                } else {
+                    *state = std::move(candidate);
+                    if (onStateChanged) onStateChanged();
+                    ShowToast(state->autoPasteOnClick ? L"已开启点击后自动粘贴" : L"已关闭点击后自动粘贴", false);
+                }
+                SyncSettingsSprings(false);
+                EnsureAnimTimer();
+                InvalidateRect(hwnd, nullptr, FALSE);
                 break;
             }
             case 20: {

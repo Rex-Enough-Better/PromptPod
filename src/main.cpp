@@ -344,13 +344,14 @@ private:
         items.push_back(DarkMenuItem::Action(6, L"\x6253\x5F00\x8BBE\x7F6E..."));
         items.push_back(DarkMenuItem::Separator());
         items.push_back(DarkMenuItem::Action(7, L"\x60AC\x505C\x9884\x89C8\x6B63\x6587", L"", bubbleOn));
+        items.push_back(DarkMenuItem::Action(8, L"\x70B9\x51FB\x540E\x81EA\x52A8\x7C98\x8D34", L"", state.autoPasteOnClick));
         items.push_back(DarkMenuItem::Action(5, L"\x9762\x677F\x5F52\x4F4D"));
         items.push_back(DarkMenuItem::Separator());
         items.push_back(DarkMenuItem::Action(10, updateLabel, updateHint));
         items.push_back(DarkMenuItem::Separator());
         items.push_back(DarkMenuItem::Action(9, L"\x9000\x51FA\x8BCD\x8231 PromptPod", L"", false, true));
 
-        popupMenu.ShowAt(pt, items, [this, isFloating, dockExpanded](int cmd) {
+        popupMenu.ShowAt(pt, items, [this, isFloating, dockExpanded, menuOwner](int cmd) {
             switch (cmd) {
                 case 1:
                     if (isFloating) dockWnd.ExpandAndReveal(0);
@@ -374,6 +375,22 @@ private:
                     dockWnd.Refresh();
                     vaultWnd.RefreshIfOpen();
                     break;
+                case 8: {
+                    AppState candidate = state;
+                    candidate.autoPasteOnClick = !candidate.autoPasteOnClick;
+                    if (!storage.Save(candidate)) {
+                        if (menuOwner == MenuOwner::Dock) {
+                            dockWnd.ShowDockToast(L"保存失败：处于只读保护，请右键打开设置", true, 3200);
+                        } else {
+                            vaultWnd.ShowExternalToast(L"保存设置失败：当前处于只读保护或配置文件不可写", true);
+                        }
+                    } else {
+                        state = std::move(candidate);
+                    }
+                    dockWnd.Refresh();
+                    vaultWnd.RefreshIfOpen();
+                    break;
+                }
                 case 5:
                     dockWnd.ResetToEdgeDefault();
                     vaultWnd.RefreshIfOpen();
@@ -2760,6 +2777,164 @@ inline int RunHeadlessSelfTest(const std::wstring& testRootDir) {
         DiagLogger::Instance().Init(sm.dataDir);
         Motion::SetReducedMotionOverride(-1);
         if (r15Err != 0) return r15Err;
+    }
+
+    // 16. v0.15.0 Regression: optional click-to-auto-paste (default off, persistence, safe guards, settle-window fg check & cancellation)
+    {
+        // 16a. Default false, JSON round-trip, legacy JSON fallback to false
+        StorageManager sm16;
+        sm16.Init(testDir + L"\\r16_case");
+        AppState st16{};
+        if (!sm16.LoadOrSeed(st16) || st16.autoPasteOnClick != false) return 310;
+        st16.onboardingCompleted = true;
+        st16.autoPasteOnClick = true;
+        if (!sm16.Save(st16)) return 311;
+        AppState st16Reload{};
+        if (!sm16.LoadOrSeed(st16Reload) || st16Reload.autoPasteOnClick != true) return 312;
+        AppState st16Legacy{};
+        std::string v4NoKey = "{\"schemaVersion\":4,\"dockEdge\":2,\"dockRatioMilli\":3200,\"showHoverBubble\":true,\"scenes\":[{\"name\":\"通用\",\"enabled\":true,\"slots\":[\"p1\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\"]}],\"vault\":[{\"id\":\"p1\",\"title\":\"T\",\"content\":\"Body\",\"useCount\":0,\"createdAt\":1,\"lastUsedAt\":0}]}";
+        if (!ParseStateFromJson(v4NoKey, st16Legacy) || st16Legacy.autoPasteOnClick != false) return 313;
+
+        // Verify diagnostics string reflects autoPaste state without leaking prompt contents
+        std::wstring diag16 = BuildSanitizedDiagnostics(st16Reload, sm16, false);
+        if (diag16.find(L"autoPaste=on") == std::wstring::npos) return 314;
+
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        int r16Err = 0;
+        if (!D2DEngine::Instance().Init()) {
+            r16Err = 315;
+        } else {
+            DockWindow dock16;
+            dock16.monitorProvider = makeFixedMon(RECT{ 0, 0, 1920, 1080 }, RECT{ 0, 0, 1920, 1040 });
+            std::wstring clip16;
+            dock16.clipboardWriter = [&](const std::wstring& txt) -> bool {
+                clip16 = txt;
+                return true;
+            };
+            HWND simFg = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(0x5001));
+            AutoPaste::TargetCheck simChk = AutoPaste::TargetCheck::Ready;
+            int pasteCount = 0;
+            bool pasteShouldOk = true;
+            dock16.foregroundProvider = [&]() -> HWND { return simFg; };
+            dock16.pasteTargetChecker = [&](HWND) -> AutoPaste::TargetCheck { return simChk; };
+            dock16.pasteInjector = [&]() -> bool {
+                ++pasteCount;
+                return pasteShouldOk;
+            };
+
+            if (!dock16.Init(GetModuleHandleW(nullptr), &st16Reload, &sm16, nullptr, nullptr, nullptr, false)) {
+                r16Err = 316;
+            } else {
+                // Real CheckForegroundTarget checks (nullptr & own HWND must NEVER be Ready)
+                if (AutoPaste::CheckForegroundTarget(nullptr) != AutoPaste::TargetCheck::NoForeground ||
+                    AutoPaste::CheckForegroundTarget(dock16.hwnd) != AutoPaste::TargetCheck::OwnProcess) {
+                    r16Err = 317;
+                }
+
+                dock16.expandSpring.Snap(1.0f);
+                dock16.Refresh();
+
+                // 16b. autoPasteOnClick == false -> copy only, never schedules/invokes paste
+                if (r16Err == 0) {
+                    st16Reload.autoPasteOnClick = false;
+                    pasteCount = 0;
+                    clip16.clear();
+                    dock16.TriggerSlotCopy(0);
+                    if (clip16.empty() || dock16.pendingAutoPaste || dock16.copiedSlotWasAutoPasted || pasteCount != 0) {
+                        r16Err = 318;
+                    }
+                }
+
+                // 16c. autoPasteOnClick == true & Ready -> schedules settle timer, then injects Ctrl+V once and marks copiedSlotWasAutoPasted
+                if (r16Err == 0) {
+                    st16Reload.autoPasteOnClick = true;
+                    simFg = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(0x5001));
+                    simChk = AutoPaste::TargetCheck::Ready;
+                    pasteCount = 0;
+                    clip16.clear();
+                    dock16.TriggerSlotCopy(0);
+                    if (clip16.empty() || !dock16.pendingAutoPaste || pasteCount != 0 || dock16.copiedSlotWasAutoPasted) {
+                        r16Err = 319;
+                    } else {
+                        SendMessageW(dock16.hwnd, WM_TIMER, DockWindow::kTimerAutoPaste, 0);
+                        if (dock16.pendingAutoPaste || pasteCount != 1 || !dock16.copiedSlotWasAutoPasted) {
+                            r16Err = 320;
+                        }
+                    }
+                }
+
+                // 16d. Foreground changes during 35 ms settle window -> MUST abort paste cleanly
+                if (r16Err == 0) {
+                    simFg = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(0x5001));
+                    simChk = AutoPaste::TargetCheck::Ready;
+                    pasteCount = 0;
+                    dock16.TriggerSlotCopy(0);
+                    simFg = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(0x5002));
+                    SendMessageW(dock16.hwnd, WM_TIMER, DockWindow::kTimerAutoPaste, 0);
+                    if (pasteCount != 0 || dock16.copiedSlotWasAutoPasted || dock16.pendingAutoPaste) {
+                        r16Err = 321;
+                    }
+                }
+
+                // 16e. UIPI ElevatedBlocked -> copy only, no paste, shows helpful dock toast & skips immediate auto-retract
+                if (r16Err == 0) {
+                    simFg = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(0x5003));
+                    simChk = AutoPaste::TargetCheck::ElevatedBlocked;
+                    pasteCount = 0;
+                    dock16.ClearDockToast();
+                    dock16.pendingAutoRetract = false;
+                    dock16.TriggerSlotCopy(0);
+                    if (dock16.pendingAutoPaste || pasteCount != 0 || dock16.copiedSlotWasAutoPasted ||
+                        !dock16.IsDockToastActive() || dock16.pendingAutoRetract) {
+                        r16Err = 322;
+                    }
+                    dock16.ClearDockToast();
+                }
+
+                // 16f. ModifierHeld (Shift+Click escape hatch) & Onboarding active -> copy only, never auto-paste
+                if (r16Err == 0) {
+                    simChk = AutoPaste::TargetCheck::ModifierHeld;
+                    pasteCount = 0;
+                    dock16.TriggerSlotCopy(0);
+                    if (dock16.pendingAutoPaste || pasteCount != 0 || dock16.copiedSlotWasAutoPasted) {
+                        r16Err = 323;
+                    }
+                }
+                if (r16Err == 0) {
+                    simChk = AutoPaste::TargetCheck::Ready;
+                    dock16.StartOnboarding(true);
+                    pasteCount = 0;
+                    dock16.TriggerSlotCopy(0);
+                    if (dock16.pendingAutoPaste || pasteCount != 0 || dock16.copiedSlotWasAutoPasted) {
+                        r16Err = 324;
+                    }
+                    dock16.FinishOnboarding(false);
+                }
+
+                // 16g. Scene switch / ClearSceneTransientState invalidates pending auto-paste generation
+                if (r16Err == 0) {
+                    dock16.expandSpring.Snap(1.0f);
+                    simFg = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(0x5001));
+                    simChk = AutoPaste::TargetCheck::Ready;
+                    pasteCount = 0;
+                    dock16.TriggerSlotCopy(0);
+                    if (!dock16.pendingAutoPaste) {
+                        r16Err = 325;
+                    } else {
+                        dock16.ClearSceneTransientState();
+                        SendMessageW(dock16.hwnd, WM_TIMER, DockWindow::kTimerAutoPaste, 0);
+                        if (pasteCount != 0 || dock16.pendingAutoPaste) {
+                            r16Err = 326;
+                        }
+                    }
+                }
+
+                DestroyWindow(dock16.hwnd);
+            }
+        }
+        CoUninitialize();
+        DiagLogger::Instance().Init(sm.dataDir);
+        if (r16Err != 0) return r16Err;
     }
 
     return 0;

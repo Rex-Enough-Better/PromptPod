@@ -657,14 +657,20 @@ public:
     static constexpr ULONGLONG kCapsuleBreathDurationMs = 1900;
     static constexpr ULONGLONG kOnboardPulseDurationMs = 2400;
 
-    // Copy flash feedback state (green success / red failure)
+    // Copy flash feedback state (green success / red failure) & async auto-paste state
     int copiedSlot = -1;
     ULONGLONG copiedTick = 0;
+    bool copiedSlotWasAutoPasted = false;
     int copyFailedSlot = -1;
     ULONGLONG copyFailedTick = 0;
     bool pendingAutoRetract = false;
     uint64_t retractGen = 0;
     uint64_t pendingAutoRetractGen = 0;
+    bool pendingAutoPaste = false;
+    uint64_t pasteGen = 0;
+    uint64_t pendingPasteGen = 0;
+    HWND pendingPasteTargetFg = nullptr;
+    int pendingPasteSlot = -1;
 
     // Transactional dragging state (preview during WM_MOUSEMOVE -> commit on WM_LBUTTONUP / rollback on cancel)
     bool isDragging = false;
@@ -735,6 +741,9 @@ public:
     std::function<bool(HWND, HWND)> aboveInZOrderProvider;
     std::function<bool(HWND)> swpTopmostProvider;
     std::function<BOOL(POINT*)> cursorPosProvider;
+    std::function<HWND()> foregroundProvider;
+    std::function<AutoPaste::TargetCheck(HWND)> pasteTargetChecker;
+    std::function<bool()> pasteInjector;
 
     struct ScopedSelfPresent {
         int& depth;
@@ -755,6 +764,7 @@ public:
     static constexpr UINT_PTR kTimerDockToast   = 5010;
     static constexpr UINT_PTR kTimerCopyClear   = 5011;
     static constexpr UINT_PTR kTimerBubbleHideGrace = 5012;
+    static constexpr UINT_PTR kTimerAutoPaste   = 5013;
 
     bool Init(HINSTANCE inst, AppState* st, StorageManager* stor, DarkPopupMenu* menu, VaultWindow* vault,
               std::function<void(POINT)> appMenuCb, bool showInitial = true) {
@@ -936,8 +946,17 @@ public:
         else hoverBubble.HideSmooth();
     }
 
+    void CancelPendingAutoPaste() {
+        if (hwnd) KillTimer(hwnd, kTimerAutoPaste);
+        pendingAutoPaste = false;
+        pendingPasteTargetFg = nullptr;
+        pendingPasteSlot = -1;
+        ++pasteGen;
+    }
+
     void ClearSceneTransientState() {
         if (isSlotDragging || pressedSlot >= 0) CancelSlotDrag(true);
+        CancelPendingAutoPaste();
         if (hwnd) {
             KillTimer(hwnd, kTimerAutoRetract);
             KillTimer(hwnd, kTimerCopyClear);
@@ -949,6 +968,7 @@ public:
         hoverSlot = -1;
         copiedSlot = -1;
         copiedTick = 0;
+        copiedSlotWasAutoPasted = false;
         copyFailedSlot = -1;
         copyFailedTick = 0;
         slotScrollDip = 0.0f;
@@ -1069,6 +1089,7 @@ public:
     void CollapseNow() {
         if (!hwnd || !state || state->dockEdge == DockEdge::None) return;
         if (IsOnboardingActive()) FinishOnboarding(false);
+        CancelPendingAutoPaste();
         KillTimer(hwnd, kTimerHoverExpand);
         KillTimer(hwnd, kTimerAutoRetract);
         pendingAutoRetract = false;
@@ -1513,6 +1534,7 @@ private:
     }
 
     void CancelActiveInteractions() {
+        CancelPendingAutoPaste();
         KillTimer(hwnd, kTimerHoverExpand);
         KillTimer(hwnd, kTimerAutoRetract);
         pendingAutoRetract = false;
@@ -1637,6 +1659,7 @@ private:
             !breathActive && !undoToastLive && !onboardPulse) {
             if (copiedSlot >= 0 && (now - copiedTick) >= 680) {
                 copiedSlot = -1;
+                copiedSlotWasAutoPasted = false;
             }
             if (copyFailedSlot >= 0 && (now - copyFailedTick) >= 1250) {
                 copyFailedSlot = -1;
@@ -1703,7 +1726,7 @@ private:
             };
             D2D1_RECT_F sr = SlotRectDip(hoverSlot);
             int slotMidY = curWinY + (int)std::round(((sr.top + sr.bottom) * 0.5f) * dpiScale);
-            hoverBubble.ShowForSlot(hoverSlot, *item, cardScreen, slotMidY);
+            hoverBubble.ShowForSlot(hoverSlot, *item, cardScreen, slotMidY, state->autoPasteOnClick);
         } else if (bubblePendingSlot != hoverSlot || bubbleHoverDeadline == 0) {
             // Schedule 180ms hover debounce ONCE per hovered slot (never reset on every animation frame!)
             if (SetTimer(hwnd, kTimerBubbleHover, 180, nullptr) != 0) {
@@ -2262,7 +2285,8 @@ private:
                     DrawAnimatedCheckmark(rt, br, card.right - 52.0f, (card.top + card.bottom) * 0.5f,
                                           9.0f, checkProg, Rgba(Theme::CopyGreen, badgeA), 1.8f);
                     DrawUiTextHex(rt, br, fmtSlotBadge.Get(), D2D1::RectF(card.right - 46.0f, card.top, card.right - 9.0f, card.bottom),
-                                  L"\x5DF2\x590D\x5236", Theme::CopyGreen, badgeA);
+                                  copiedSlotWasAutoPasted ? L"\x5DF2\x7C98\x8D34" : L"\x5DF2\x590D\x5236",
+                                  Theme::CopyGreen, badgeA);
                 } else if (hovT > 0.15f || item->useCount > 0) {
                     if (item->useCount > 0) {
                         rightReserve = 48.0f;
@@ -2503,6 +2527,37 @@ private:
         }
     }
 
+    [[gnu::noinline]] void ExecutePendingAutoPaste(int slotIdx, HWND expectedFg) {
+        if (!state || !state->autoPasteOnClick || onboardingWnd.IsActive()) return;
+        HWND curFg = foregroundProvider ? foregroundProvider() : GetForegroundWindow();
+        if (!curFg || curFg != expectedFg) {
+            DiagLogger::Instance().LogFmt("INFO", "COPY",
+                L"Auto-paste cancelled on slot=%02d: foreground changed during settle delay", slotIdx + 1);
+            return;
+        }
+        AutoPaste::TargetCheck chk = pasteTargetChecker
+            ? pasteTargetChecker(curFg)
+            : AutoPaste::CheckForegroundTarget(curFg);
+        if (chk != AutoPaste::TargetCheck::Ready) {
+            DiagLogger::Instance().LogFmt("INFO", "COPY",
+                L"Auto-paste skipped on slot=%02d after settle (reason=%d); kept in clipboard",
+                slotIdx + 1, (int)chk);
+            return;
+        }
+        bool pasted = pasteInjector ? pasteInjector() : AutoPaste::SendCtrlV();
+        if (pasted) {
+            if (copiedSlot == slotIdx) {
+                copiedSlotWasAutoPasted = true;
+            }
+            RenderAndPresent("auto-paste-ok");
+            DiagLogger::Instance().LogFmt("INFO", "COPY", L"Auto-pasted slot=%02d via Ctrl+V", slotIdx + 1);
+        } else {
+            DiagLogger::Instance().LogFmt("WARN", "COPY",
+                L"Auto-paste SendInput failed on slot=%02d err=%lu; text kept in clipboard",
+                slotIdx + 1, (unsigned long)GetLastError());
+        }
+    }
+
     [[gnu::noinline]] void TriggerSlotCopy(int slotIdx) {
         if (slotIdx < 0 || slotIdx >= 10) return;
         HideHoverBubbleHard(false);
@@ -2512,6 +2567,7 @@ private:
         bool copied = clipboardWriter ? clipboardWriter(item->content)
                                       : CopyTextToClipboard(hwnd, item->content);
         if (copied) {
+            CancelPendingAutoPaste();
             item->useCount += 1;
             item->lastUsedAt = NowUnixSeconds();
             if (!storage->Save(*state)) {
@@ -2523,6 +2579,7 @@ private:
             copyFailedTick = 0;
             copiedSlot = slotIdx;
             copiedTick = GetTickCount64();
+            copiedSlotWasAutoPasted = false;
             if (Motion::IsReducedMotion()) {
                 SetTimer(hwnd, kTimerCopyClear, 660, nullptr);
                 RenderAndPresent("copy-ok");
@@ -2530,9 +2587,38 @@ private:
                 EnsureAnimTimer();
             }
 
+            bool uipiToastShown = false;
+            if (state->autoPasteOnClick && !onboardingWnd.IsActive()) {
+                HWND fg = foregroundProvider ? foregroundProvider() : GetForegroundWindow();
+                AutoPaste::TargetCheck chk = pasteTargetChecker
+                    ? pasteTargetChecker(fg)
+                    : AutoPaste::CheckForegroundTarget(fg);
+                if (chk == AutoPaste::TargetCheck::Ready) {
+                    uint64_t nextPGen = ++pasteGen;
+                    pendingAutoPaste = true;
+                    pendingPasteGen = nextPGen;
+                    pendingPasteTargetFg = fg;
+                    pendingPasteSlot = slotIdx;
+                    if (SetTimer(hwnd, kTimerAutoPaste, 35, nullptr) == 0) {
+                        pendingAutoPaste = false;
+                        pendingPasteTargetFg = nullptr;
+                        pendingPasteSlot = -1;
+                        ExecutePendingAutoPaste(slotIdx, fg);
+                    }
+                } else if (chk == AutoPaste::TargetCheck::ElevatedBlocked) {
+                    uipiToastShown = true;
+                    ShowDockToast(L"目标为管理员窗口，已复制请按 Ctrl+V", false, 2800);
+                    DiagLogger::Instance().LogFmt("INFO", "COPY",
+                        L"Auto-paste skipped on slot=%02d (UIPI elevated foreground); kept in clipboard", slotIdx + 1);
+                } else {
+                    DiagLogger::Instance().LogFmt("INFO", "COPY",
+                        L"Auto-paste skipped on slot=%02d (reason=%d); kept in clipboard", slotIdx + 1, (int)chk);
+                }
+            }
+
             if (onboardingWnd.IsActive()) {
                 onboardingWnd.NotifyCopied();
-            } else if (state->dockEdge != DockEdge::None) {
+            } else if (state->dockEdge != DockEdge::None && !uipiToastShown) {
                 uint64_t nextGen = ++retractGen;
                 if (SetTimer(hwnd, kTimerAutoRetract, 340, nullptr) != 0) {
                     pendingAutoRetract = true;
@@ -2545,15 +2631,18 @@ private:
             }
             std::wstring safeId = SanitizeLogField(item->id, 64);
             DiagLogger::Instance().LogFmt("INFO", "COPY",
-                L"Copied slot=%02d id=%ls uses=%llu",
-                slotIdx + 1, safeId.c_str(), (unsigned long long)item->useCount);
+                L"Copied slot=%02d id=%ls uses=%llu autoPaste=%d",
+                slotIdx + 1, safeId.c_str(), (unsigned long long)item->useCount,
+                state->autoPasteOnClick ? 1 : 0);
         } else {
             // Clipboard write failed: inline red flash (1200ms), NEVER increment useCount, NEVER auto-retract!
+            CancelPendingAutoPaste();
             KillTimer(hwnd, kTimerAutoRetract);
             pendingAutoRetract = false;
             ++retractGen;
             copiedSlot = -1;
             copiedTick = 0;
+            copiedSlotWasAutoPasted = false;
             copyFailedSlot = slotIdx;
             copyFailedTick = GetTickCount64();
             if (Motion::IsReducedMotion()) {
@@ -3272,8 +3361,12 @@ private:
                     ULONGLONG now = GetTickCount64();
                     if (self->copiedSlot >= 0) {
                         ULONGLONG el = now - self->copiedTick;
-                        if (el >= 660) self->copiedSlot = -1;
-                        else SetTimer(h, kTimerCopyClear, (UINT)(660 - el), nullptr);
+                        if (el >= 660) {
+                            self->copiedSlot = -1;
+                            self->copiedSlotWasAutoPasted = false;
+                        } else {
+                            SetTimer(h, kTimerCopyClear, (UINT)(660 - el), nullptr);
+                        }
                     }
                     if (self->copyFailedSlot >= 0) {
                         ULONGLONG el = now - self->copyFailedTick;
@@ -3368,6 +3461,7 @@ private:
             }
 
             case WM_DESTROY: {
+                self->CancelPendingAutoPaste();
                 if (self->onboardingWnd.hwnd) {
                     DestroyWindow(self->onboardingWnd.hwnd);
                     self->onboardingWnd.hwnd = nullptr;
@@ -3488,11 +3582,23 @@ private:
                     ULONGLONG now = GetTickCount64();
                     if (self->copiedSlot >= 0 && (Motion::IsReducedMotion() || (now - self->copiedTick) >= 640)) {
                         self->copiedSlot = -1;
+                        self->copiedSlotWasAutoPasted = false;
                     }
                     if (self->copyFailedSlot >= 0 && (Motion::IsReducedMotion() || (now - self->copyFailedTick) >= 1180)) {
                         self->copyFailedSlot = -1;
                     }
                     self->RenderAndPresent("copy-clear");
+                } else if (wp == kTimerAutoPaste) {
+                    KillTimer(h, kTimerAutoPaste);
+                    if (!self->pendingAutoPaste || self->pendingPasteGen != self->pasteGen) {
+                        return 0;
+                    }
+                    int slot = self->pendingPasteSlot;
+                    HWND targetFg = self->pendingPasteTargetFg;
+                    self->pendingAutoPaste = false;
+                    self->pendingPasteTargetFg = nullptr;
+                    self->pendingPasteSlot = -1;
+                    self->ExecutePendingAutoPaste(slot, targetFg);
                 }
                 return 0;
             }

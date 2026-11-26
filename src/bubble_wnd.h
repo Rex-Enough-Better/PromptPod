@@ -51,6 +51,7 @@ public:
 
     bool placeOnLeft = true;
     bool isOverflow = false;
+    bool autoPasteHint = false;
     float cardWidthDip = 340.0f;
     float cardHeightDip = 120.0f;
     float bodyDrawHeightDip = 60.0f;
@@ -164,7 +165,7 @@ public:
         StartTimer();
     }
 
-    void ShowForSlot(int slotIdx, const PromptItem& item, const RECT& dockCardScreenRect, int slotCenterY) {
+    void ShowForSlot(int slotIdx, const PromptItem& item, const RECT& dockCardScreenRect, int slotCenterY, bool autoPaste = false) {
         if (!hwnd) return;
         POINT midPt{ (dockCardScreenRect.left + dockCardScreenRect.right) / 2, slotCenterY };
         dpiScale = GetDpiScaleForPoint(midPt, hwnd);
@@ -173,6 +174,7 @@ public:
         bool reduced = Motion::IsReducedMotion();
         bool freshOpen = !IsAliveForMorph();
         bool contentChanged = (currentSlot != slotIdx || currentId != item.id || bodyText != item.content || titleText != item.title);
+        autoPasteHint = autoPaste;
 
         // Snapshot currently dominant visible content before replacing it for seamless cross-fade
         if (!freshOpen && !reduced && contentChanged && bodyLayout && currentSlot >= 0) {
@@ -477,7 +479,9 @@ private:
         }
 
         if (ovf && box.bottom - box.top > 72.0f && box.right - box.left > 160.0f) {
-            std::wstring fhStr = UiText(L"\u4EC5\u663E\u793A\u524D\u6BB5 \u00B7 \u5DE6\u952E\u590D\u5236\u5168\u6587\xFF0C\x53F3\x952E\x7F16\x8F91");
+            std::wstring fhStr = UiText(autoPasteHint
+                ? L"\u4EC5\u663E\u793A\u524D\u6BB5 \u00B7 \u5DE6\u952E\u81EA\u52A8\u7C98\u8D34\u5168\u6587\xFF0C\x53F3\x952E\x7F16\x8F91"
+                : L"\u4EC5\u663E\u793A\u524D\u6BB5 \u00B7 \u5DE6\u952E\u590D\u5236\u5168\u6587\xFF0C\x53F3\x952E\x7F16\x8F91");
             DrawTextHex(rt, br, fmtFootHint.Get(), D2D1::RectF(box.left + 12.0f, box.bottom - 26.0f, box.right - 12.0f, box.bottom - 6.0f),
                         fhStr.c_str(), (UINT32)fhStr.size(), Theme::AccentCyan, 0.88f * layerA);
         }

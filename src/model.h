@@ -244,6 +244,7 @@ struct AppState {
     int floatX = 240;
     int floatY = 180;
     bool showHoverBubble = true;
+    bool autoPasteOnClick = false;
     bool autoCheckUpdates = true;
     int64_t lastUpdateCheckAt = 0;
     bool onboardingCompleted = true;
@@ -587,7 +588,7 @@ inline std::wstring GeneratePromptId(const AppState* existing = nullptr) {
     std::string s;
     s.reserve(4096);
     int ratioMilli = (int)(st.dockRatioY * 10000.0 + 0.5);
-    char hdr[768]{};
+    char hdr[832]{};
     _snprintf_s(hdr, sizeof(hdr), _TRUNCATE,
         "{\n"
         "  \"schemaVersion\": %d,\n"
@@ -596,6 +597,7 @@ inline std::wstring GeneratePromptId(const AppState* existing = nullptr) {
         "  \"floatX\": %d,\n"
         "  \"floatY\": %d,\n"
         "  \"showHoverBubble\": %s,\n"
+        "  \"autoPasteOnClick\": %s,\n"
         "  \"autoCheckUpdates\": %s,\n"
         "  \"lastUpdateCheckAt\": %I64d,\n"
         "  \"onboardingCompleted\": %s,\n"
@@ -609,6 +611,7 @@ inline std::wstring GeneratePromptId(const AppState* existing = nullptr) {
         st.floatX,
         st.floatY,
         st.showHoverBubble ? "true" : "false",
+        st.autoPasteOnClick ? "true" : "false",
         st.autoCheckUpdates ? "true" : "false",
         (long long)st.lastUpdateCheckAt,
         st.onboardingCompleted ? "true" : "false",
@@ -960,6 +963,10 @@ inline bool ParseStateFromJson(const std::string& json, AppState& out) {
             bool b = true;
             if (!r.ParseBool(b)) return false;
             st.showHoverBubble = b;
+        } else if (key == L"autoPasteOnClick") {
+            bool b = false;
+            if (!r.ParseBool(b)) return false;
+            st.autoPasteOnClick = b;
         } else if (key == L"autoCheckUpdates") {
             bool b = true;
             if (!r.ParseBool(b)) return false;
